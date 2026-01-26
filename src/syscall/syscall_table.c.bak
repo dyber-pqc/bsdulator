@@ -1,0 +1,909 @@
+/*
+ * BSDulator - Syscall Translation Table
+ * Maps FreeBSD syscall numbers to Linux equivalents
+ * 
+ * This table is based on FreeBSD 14.x and Linux 6.x syscall tables.
+ * Some syscalls have direct mappings, others require emulation.
+ */
+
+/* _GNU_SOURCE must be defined FIRST, before any includes */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sched.h>
+#include <sys/syscall.h>
+#include <sys/resource.h>
+#include "bsdulator.h"
+#include "../runtime/freebsd_runtime.h"
+
+/* Forward declarations for emulation handlers */
+static long emul_getdtablesize(pid_t pid, uint64_t args[6]);
+static long emul_sysctl(pid_t pid, uint64_t args[6]);
+static long emul_sysctlbyname(pid_t pid, uint64_t args[6]);
+static long emul_jail(pid_t pid, uint64_t args[6]);
+static long emul_jail_attach(pid_t pid, uint64_t args[6]);
+static long emul_jail_get(pid_t pid, uint64_t args[6]);
+static long emul_jail_set(pid_t pid, uint64_t args[6]);
+static long emul_jail_remove(pid_t pid, uint64_t args[6]);
+static long emul_kqueue(pid_t pid, uint64_t args[6]);
+static long emul_kevent(pid_t pid, uint64_t args[6]);
+static long emul_issetugid(pid_t pid, uint64_t args[6]);
+static long emul_yield(pid_t pid, uint64_t args[6]);
+static long emul_rfork(pid_t pid, uint64_t args[6]);
+static long emul_cap_enter(pid_t pid, uint64_t args[6]);
+static long emul_cap_getmode(pid_t pid, uint64_t args[6]);
+static long emul_seteuid(pid_t pid, uint64_t args[6]);
+static long emul_setegid(pid_t pid, uint64_t args[6]);
+static long emul_mkfifo(pid_t pid, uint64_t args[6]);
+static long emul_thr_self(pid_t pid, uint64_t args[6]);
+static long emul_thr_exit(pid_t pid, uint64_t args[6]);
+static long emul_thr_kill(pid_t pid, uint64_t args[6]);
+static long emul_clock_gettime(pid_t pid, uint64_t args[6]);
+static long emul_sigprocmask(pid_t pid, uint64_t args[6]);
+static long emul_sigaction(pid_t pid, uint64_t args[6]);
+static long emul_cpuset_getaffinity(pid_t pid, uint64_t args[6]);
+static long emul_minherit(pid_t pid, uint64_t args[6]);
+
+/* Maximum FreeBSD syscall number */
+#define MAX_SYSCALL 600
+
+/* 
+ * Syscall translation table
+ * Format: { freebsd_nr, linux_nr, "name", type, handler, needs_arg_xlat, needs_ret_xlat }
+ */
+static syscall_entry_t syscall_table[MAX_SYSCALL];
+
+/* Table initialization flag */
+static int table_initialized = 0;
+
+/* Helper to add an entry */
+static void add_entry(int fbsd_nr, int linux_nr, const char *name, 
+                      syscall_result_t type, syscall_handler_t handler) {
+    if (fbsd_nr >= 0 && fbsd_nr < MAX_SYSCALL) {
+        syscall_table[fbsd_nr].freebsd_nr = fbsd_nr;
+        syscall_table[fbsd_nr].linux_nr = linux_nr;
+        syscall_table[fbsd_nr].name = name;
+        syscall_table[fbsd_nr].type = type;
+        syscall_table[fbsd_nr].handler = handler;
+        syscall_table[fbsd_nr].needs_arg_xlat = 0;
+        syscall_table[fbsd_nr].needs_ret_xlat = 0;
+    }
+}
+
+/* Shorthand macros */
+#define TRANS(f, l, n)    add_entry(f, l, n, SYSCALL_TRANSLATED, NULL)
+#define PASS(f, l, n)     add_entry(f, l, n, SYSCALL_PASSTHROUGH, NULL)
+#define EMUL(f, n, h)     add_entry(f, -1, n, SYSCALL_EMULATED, h)
+#define UNSUP(f, n)       add_entry(f, -1, n, SYSCALL_UNSUPPORTED, NULL)
+
+int syscall_init(void) {
+    if (table_initialized) {
+        return 0;
+    }
+    
+    BSD_TRACE("Initializing syscall translation table");
+    
+    /* Initialize FreeBSD runtime */
+    freebsd_runtime_init();
+    
+    /* Clear table */
+    memset(syscall_table, 0, sizeof(syscall_table));
+    
+    /* Mark all as unsupported initially */
+    for (int i = 0; i < MAX_SYSCALL; i++) {
+        syscall_table[i].freebsd_nr = i;
+        syscall_table[i].linux_nr = -1;
+        syscall_table[i].type = SYSCALL_UNSUPPORTED;
+    }
+    
+    /*
+     * Process control syscalls
+     */
+    TRANS(FBSD_SYS_exit, SYS_exit, "exit");
+    TRANS(FBSD_SYS_fork, SYS_fork, "fork");
+    TRANS(FBSD_SYS_vfork, SYS_vfork, "vfork");
+    TRANS(FBSD_SYS_execve, SYS_execve, "execve");
+    TRANS(FBSD_SYS_wait4, SYS_wait4, "wait4");
+    TRANS(FBSD_SYS_kill, SYS_kill, "kill");
+    TRANS(FBSD_SYS_getpid, SYS_getpid, "getpid");
+    TRANS(FBSD_SYS_getppid, SYS_getppid, "getppid");
+    TRANS(FBSD_SYS_getpgrp, SYS_getpgrp, "getpgrp");
+    TRANS(FBSD_SYS_setpgid, SYS_setpgid, "setpgid");
+    TRANS(FBSD_SYS_setsid, SYS_setsid, "setsid");
+    TRANS(FBSD_SYS_getsid, SYS_getsid, "getsid");
+    TRANS(FBSD_SYS_getpgid, SYS_getpgid, "getpgid");
+    
+    /*
+     * File I/O syscalls
+     */
+    TRANS(FBSD_SYS_read, SYS_read, "read");
+    TRANS(FBSD_SYS_write, SYS_write, "write");
+    TRANS(FBSD_SYS_open, SYS_open, "open");
+    TRANS(FBSD_SYS_close, SYS_close, "close");
+    TRANS(FBSD_SYS_link, SYS_link, "link");
+    TRANS(FBSD_SYS_unlink, SYS_unlink, "unlink");
+    TRANS(FBSD_SYS_chdir, SYS_chdir, "chdir");
+    TRANS(FBSD_SYS_fchdir, SYS_fchdir, "fchdir");
+    TRANS(FBSD_SYS_chmod, SYS_chmod, "chmod");
+    TRANS(FBSD_SYS_chown, SYS_chown, "chown");
+    TRANS(FBSD_SYS_lchown, SYS_lchown, "lchown");
+    TRANS(FBSD_SYS_fchown, SYS_fchown, "fchown");
+    TRANS(FBSD_SYS_fchmod, SYS_fchmod, "fchmod");
+    TRANS(FBSD_SYS_access, SYS_access, "access");
+    TRANS(FBSD_SYS_symlink, SYS_symlink, "symlink");
+    TRANS(FBSD_SYS_readlink, SYS_readlink, "readlink");
+    TRANS(FBSD_SYS_umask, SYS_umask, "umask");
+    TRANS(FBSD_SYS_chroot, SYS_chroot, "chroot");
+    TRANS(FBSD_SYS_rename, SYS_rename, "rename");
+    TRANS(FBSD_SYS_mkdir, SYS_mkdir, "mkdir");
+    TRANS(FBSD_SYS_rmdir, SYS_rmdir, "rmdir");
+    /* mkfifo needs emulation - uses mknod on Linux */
+    EMUL(FBSD_SYS_mkfifo, "mkfifo", emul_mkfifo);
+    TRANS(FBSD_SYS_dup, SYS_dup, "dup");
+    TRANS(FBSD_SYS_dup2, SYS_dup2, "dup2");
+    TRANS(FBSD_SYS_fcntl, SYS_fcntl, "fcntl");
+    TRANS(FBSD_SYS_flock, SYS_flock, "flock");
+    TRANS(FBSD_SYS_fsync, SYS_fsync, "fsync");
+    TRANS(FBSD_SYS_fdatasync, SYS_fdatasync, "fdatasync");
+    TRANS(FBSD_SYS_sync, SYS_sync, "sync");
+    TRANS(FBSD_SYS_readv, SYS_readv, "readv");
+    TRANS(FBSD_SYS_writev, SYS_writev, "writev");
+    TRANS(FBSD_SYS_pread, SYS_pread64, "pread");
+    TRANS(FBSD_SYS_pwrite, SYS_pwrite64, "pwrite");
+    TRANS(FBSD_SYS_preadv, SYS_preadv, "preadv");
+    TRANS(FBSD_SYS_pwritev, SYS_pwritev, "pwritev");
+    TRANS(FBSD_SYS_lseek, SYS_lseek, "lseek");
+    TRANS(FBSD_SYS_truncate, SYS_truncate, "truncate");
+    TRANS(FBSD_SYS_ftruncate, SYS_ftruncate, "ftruncate");
+    TRANS(FBSD_SYS_ioctl, SYS_ioctl, "ioctl");
+    TRANS(FBSD_SYS_select, SYS_select, "select");
+    TRANS(FBSD_SYS_pselect, SYS_pselect6, "pselect");
+    TRANS(FBSD_SYS_poll, SYS_poll, "poll");
+    TRANS(FBSD_SYS_ppoll, SYS_ppoll, "ppoll");
+    
+    /* *at syscalls */
+    TRANS(FBSD_SYS_openat, SYS_openat, "openat");
+    TRANS(FBSD_SYS_faccessat, SYS_faccessat, "faccessat");
+    TRANS(FBSD_SYS_fchmodat, SYS_fchmodat, "fchmodat");
+    TRANS(FBSD_SYS_fchownat, SYS_fchownat, "fchownat");
+    TRANS(FBSD_SYS_linkat, SYS_linkat, "linkat");
+    TRANS(FBSD_SYS_mkdirat, SYS_mkdirat, "mkdirat");
+    TRANS(FBSD_SYS_mknodat, SYS_mknodat, "mknodat");
+    TRANS(FBSD_SYS_readlinkat, SYS_readlinkat, "readlinkat");
+    TRANS(FBSD_SYS_renameat, SYS_renameat, "renameat");
+    TRANS(FBSD_SYS_symlinkat, SYS_symlinkat, "symlinkat");
+    TRANS(FBSD_SYS_unlinkat, SYS_unlinkat, "unlinkat");
+    TRANS(FBSD_SYS_futimesat, SYS_futimesat, "futimesat");
+    TRANS(FBSD_SYS_utimensat, SYS_utimensat, "utimensat");
+    
+    /* stat family */
+    TRANS(FBSD_SYS_fstat, SYS_fstat, "fstat");
+    TRANS(FBSD_SYS_fstatat, SYS_newfstatat, "fstatat");
+    TRANS(FBSD_SYS_statfs, SYS_statfs, "statfs");
+    TRANS(FBSD_SYS_fstatfs, SYS_fstatfs, "fstatfs");
+    TRANS(FBSD_SYS_getdirentries, SYS_getdents64, "getdirentries");
+    
+    /*
+     * User/group ID syscalls
+     */
+    TRANS(FBSD_SYS_getuid, SYS_getuid, "getuid");
+    TRANS(FBSD_SYS_geteuid, SYS_geteuid, "geteuid");
+    TRANS(FBSD_SYS_getgid, SYS_getgid, "getgid");
+    TRANS(FBSD_SYS_getegid, SYS_getegid, "getegid");
+    TRANS(FBSD_SYS_setuid, SYS_setuid, "setuid");
+    TRANS(FBSD_SYS_setgid, SYS_setgid, "setgid");
+    /* seteuid/setegid need emulation via setresuid/setresgid */
+    EMUL(FBSD_SYS_seteuid, "seteuid", emul_seteuid);
+    EMUL(FBSD_SYS_setegid, "setegid", emul_setegid);
+    TRANS(FBSD_SYS_setreuid, SYS_setreuid, "setreuid");
+    TRANS(FBSD_SYS_setregid, SYS_setregid, "setregid");
+    TRANS(FBSD_SYS_setresuid, SYS_setresuid, "setresuid");
+    TRANS(FBSD_SYS_setresgid, SYS_setresgid, "setresgid");
+    TRANS(FBSD_SYS_getresuid, SYS_getresuid, "getresuid");
+    TRANS(FBSD_SYS_getresgid, SYS_getresgid, "getresgid");
+    TRANS(FBSD_SYS_getgroups, SYS_getgroups, "getgroups");
+    TRANS(FBSD_SYS_setgroups, SYS_setgroups, "setgroups");
+    
+    /*
+     * Memory management syscalls
+     */
+    TRANS(FBSD_SYS_mmap, SYS_mmap, "mmap");
+    TRANS(FBSD_SYS_munmap, SYS_munmap, "munmap");
+    TRANS(FBSD_SYS_mprotect, SYS_mprotect, "mprotect");
+    TRANS(FBSD_SYS_madvise, SYS_madvise, "madvise");
+    TRANS(FBSD_SYS_msync, SYS_msync, "msync");
+    TRANS(FBSD_SYS_mlock, SYS_mlock, "mlock");
+    TRANS(FBSD_SYS_munlock, SYS_munlock, "munlock");
+    TRANS(FBSD_SYS_mlockall, SYS_mlockall, "mlockall");
+    TRANS(FBSD_SYS_munlockall, SYS_munlockall, "munlockall");
+    TRANS(FBSD_SYS_mincore, SYS_mincore, "mincore");
+    TRANS(FBSD_SYS_break, SYS_brk, "break");
+    
+    /*
+     * Socket/Network syscalls
+     */
+    TRANS(FBSD_SYS_socket, SYS_socket, "socket");
+    TRANS(FBSD_SYS_bind, SYS_bind, "bind");
+    TRANS(FBSD_SYS_listen, SYS_listen, "listen");
+    TRANS(FBSD_SYS_accept, SYS_accept, "accept");
+    TRANS(FBSD_SYS_accept4, SYS_accept4, "accept4");
+    TRANS(FBSD_SYS_connect, SYS_connect, "connect");
+    TRANS(FBSD_SYS_shutdown, SYS_shutdown, "shutdown");
+    TRANS(FBSD_SYS_socketpair, SYS_socketpair, "socketpair");
+    TRANS(FBSD_SYS_sendto, SYS_sendto, "sendto");
+    TRANS(FBSD_SYS_recvfrom, SYS_recvfrom, "recvfrom");
+    TRANS(FBSD_SYS_sendmsg, SYS_sendmsg, "sendmsg");
+    TRANS(FBSD_SYS_recvmsg, SYS_recvmsg, "recvmsg");
+    TRANS(FBSD_SYS_getsockopt, SYS_getsockopt, "getsockopt");
+    TRANS(FBSD_SYS_setsockopt, SYS_setsockopt, "setsockopt");
+    TRANS(FBSD_SYS_getsockname, SYS_getsockname, "getsockname");
+    TRANS(FBSD_SYS_getpeername, SYS_getpeername, "getpeername");
+    TRANS(FBSD_SYS_sendfile, SYS_sendfile, "sendfile");
+    
+    /*
+     * Time syscalls - clock_gettime needs clock ID translation
+     */
+    TRANS(FBSD_SYS_gettimeofday, SYS_gettimeofday, "gettimeofday");
+    TRANS(FBSD_SYS_settimeofday, SYS_settimeofday, "settimeofday");
+    EMUL(FBSD_SYS_clock_gettime, "clock_gettime", emul_clock_gettime);
+    TRANS(FBSD_SYS_clock_settime, SYS_clock_settime, "clock_settime");
+    TRANS(FBSD_SYS_clock_getres, SYS_clock_getres, "clock_getres");
+    TRANS(FBSD_SYS_clock_nanosleep, SYS_clock_nanosleep, "clock_nanosleep");
+    TRANS(FBSD_SYS_nanosleep, SYS_nanosleep, "nanosleep");
+    TRANS(FBSD_SYS_getitimer, SYS_getitimer, "getitimer");
+    TRANS(FBSD_SYS_setitimer, SYS_setitimer, "setitimer");
+    TRANS(FBSD_SYS_utimes, SYS_utimes, "utimes");
+    TRANS(FBSD_SYS_futimes, SYS_futimesat, "futimes");
+    TRANS(FBSD_SYS_futimens, SYS_utimensat, "futimens");
+    
+    /* Timer syscalls */
+    TRANS(FBSD_SYS_ktimer_create, SYS_timer_create, "timer_create");
+    TRANS(FBSD_SYS_ktimer_delete, SYS_timer_delete, "timer_delete");
+    TRANS(FBSD_SYS_ktimer_settime, SYS_timer_settime, "timer_settime");
+    TRANS(FBSD_SYS_ktimer_gettime, SYS_timer_gettime, "timer_gettime");
+    TRANS(FBSD_SYS_ktimer_getoverrun, SYS_timer_getoverrun, "timer_getoverrun");
+    TRANS(FBSD_SYS_timerfd_create, SYS_timerfd_create, "timerfd_create");
+    TRANS(FBSD_SYS_timerfd_gettime, SYS_timerfd_gettime, "timerfd_gettime");
+    TRANS(FBSD_SYS_timerfd_settime, SYS_timerfd_settime, "timerfd_settime");
+    
+    /*
+     * Signal syscalls - need emulation due to different sigset_t sizes
+     * FreeBSD sigset_t = 16 bytes (128 signals)
+     * Linux sigset_t = 8 bytes (64 signals)
+     */
+    EMUL(FBSD_SYS_sigaction, "sigaction", emul_sigaction);
+    EMUL(FBSD_SYS_sigprocmask, "sigprocmask", emul_sigprocmask);
+    TRANS(FBSD_SYS_sigpending, SYS_rt_sigpending, "sigpending");
+    TRANS(FBSD_SYS_sigsuspend, SYS_rt_sigsuspend, "sigsuspend");
+    TRANS(FBSD_SYS_sigaltstack, SYS_sigaltstack, "sigaltstack");
+    TRANS(FBSD_SYS_sigwait, SYS_rt_sigtimedwait, "sigwait");
+    TRANS(FBSD_SYS_sigtimedwait, SYS_rt_sigtimedwait, "sigtimedwait");
+    TRANS(FBSD_SYS_sigwaitinfo, SYS_rt_sigtimedwait, "sigwaitinfo");
+    TRANS(FBSD_SYS_sigqueue, SYS_rt_sigqueueinfo, "sigqueue");
+    
+    /*
+     * Resource limit syscalls
+     */
+    TRANS(FBSD_SYS_getrlimit, SYS_getrlimit, "getrlimit");
+    TRANS(FBSD_SYS_setrlimit, SYS_setrlimit, "setrlimit");
+    TRANS(FBSD_SYS_getrusage, SYS_getrusage, "getrusage");
+    TRANS(FBSD_SYS_setpriority, SYS_setpriority, "setpriority");
+    TRANS(FBSD_SYS_getpriority, SYS_getpriority, "getpriority");
+    
+    /*
+     * Scheduler syscalls
+     */
+    TRANS(FBSD_SYS_sched_setparam, SYS_sched_setparam, "sched_setparam");
+    TRANS(FBSD_SYS_sched_getparam, SYS_sched_getparam, "sched_getparam");
+    TRANS(FBSD_SYS_sched_setscheduler, SYS_sched_setscheduler, "sched_setscheduler");
+    TRANS(FBSD_SYS_sched_getscheduler, SYS_sched_getscheduler, "sched_getscheduler");
+    TRANS(FBSD_SYS_sched_yield, SYS_sched_yield, "sched_yield");
+    TRANS(FBSD_SYS_sched_get_priority_max, SYS_sched_get_priority_max, "sched_get_priority_max");
+    TRANS(FBSD_SYS_sched_get_priority_min, SYS_sched_get_priority_min, "sched_get_priority_min");
+    TRANS(FBSD_SYS_sched_rr_get_interval, SYS_sched_rr_get_interval, "sched_rr_get_interval");
+    TRANS(FBSD_SYS_sched_getcpu, SYS_getcpu, "sched_getcpu");
+    
+    /*
+     * IPC syscalls
+     */
+    TRANS(FBSD_SYS_semget, SYS_semget, "semget");
+    TRANS(FBSD_SYS_semop, SYS_semop, "semop");
+    TRANS(FBSD_SYS___semctl, SYS_semctl, "semctl");
+    TRANS(FBSD_SYS_msgget, SYS_msgget, "msgget");
+    TRANS(FBSD_SYS_msgsnd, SYS_msgsnd, "msgsnd");
+    TRANS(FBSD_SYS_msgrcv, SYS_msgrcv, "msgrcv");
+    TRANS(FBSD_SYS_msgctl, SYS_msgctl, "msgctl");
+    TRANS(FBSD_SYS_shmget, SYS_shmget, "shmget");
+    TRANS(FBSD_SYS_shmat, SYS_shmat, "shmat");
+    TRANS(FBSD_SYS_shmdt, SYS_shmdt, "shmdt");
+    TRANS(FBSD_SYS_shmctl, SYS_shmctl, "shmctl");
+    
+    /*
+     * Pipe syscalls
+     */
+    TRANS(FBSD_SYS_pipe2, SYS_pipe2, "pipe2");
+    
+    /*
+     * Threading syscalls - needed for libthr
+     */
+    EMUL(FBSD_SYS_thr_self, "thr_self", emul_thr_self);
+    EMUL(FBSD_SYS_thr_exit, "thr_exit", emul_thr_exit);
+    EMUL(FBSD_SYS_thr_kill, "thr_kill", emul_thr_kill);
+    
+    /*
+     * CPU affinity - FreeBSD syscall 487
+     */
+    EMUL(FBSD_SYS_cpuset_getaffinity, "cpuset_getaffinity", emul_cpuset_getaffinity);
+    
+    /*
+     * Memory inheritance - FreeBSD syscall 250
+     */
+    EMUL(FBSD_SYS_minherit, "minherit", emul_minherit);
+    
+    /*
+     * Misc syscalls
+     */
+    TRANS(FBSD_SYS___getcwd, SYS_getcwd, "__getcwd");
+    TRANS(FBSD_SYS_acct, SYS_acct, "acct");
+    TRANS(FBSD_SYS_mount, SYS_mount, "mount");
+    TRANS(FBSD_SYS_unmount, SYS_umount2, "unmount");
+    TRANS(FBSD_SYS_swapon, SYS_swapon, "swapon");
+    TRANS(FBSD_SYS_swapoff, SYS_swapoff, "swapoff");
+    TRANS(FBSD_SYS_reboot, SYS_reboot, "reboot");
+    TRANS(FBSD_SYS_quotactl, SYS_quotactl, "quotactl");
+    TRANS(FBSD_SYS_ptrace, SYS_ptrace, "ptrace");
+    TRANS(FBSD_SYS_getrandom, SYS_getrandom, "getrandom");
+    TRANS(FBSD_SYS_copy_file_range, SYS_copy_file_range, "copy_file_range");
+    TRANS(FBSD_SYS_close_range, SYS_close_range, "close_range");
+    TRANS(FBSD_SYS_membarrier, SYS_membarrier, "membarrier");
+    TRANS(FBSD_SYS_kcmp, SYS_kcmp, "kcmp");
+    TRANS(FBSD_SYS_posix_fallocate, SYS_fallocate, "posix_fallocate");
+    TRANS(FBSD_SYS_posix_fadvise, SYS_fadvise64, "posix_fadvise");
+    
+    /*
+     * Emulated syscalls - FreeBSD specific
+     */
+    EMUL(FBSD_SYS_getdtablesize, "getdtablesize", emul_getdtablesize);
+    EMUL(FBSD_SYS___sysctl, "__sysctl", emul_sysctl);
+    EMUL(FBSD_SYS___sysctlbyname, "__sysctlbyname", emul_sysctlbyname);
+    EMUL(FBSD_SYS_issetugid, "issetugid", emul_issetugid);
+    EMUL(FBSD_SYS_yield, "yield", emul_yield);
+    EMUL(FBSD_SYS_rfork, "rfork", emul_rfork);
+    
+    /* Jail syscalls - core of Jailhouse */
+    EMUL(FBSD_SYS_jail, "jail", emul_jail);
+    EMUL(FBSD_SYS_jail_attach, "jail_attach", emul_jail_attach);
+    EMUL(FBSD_SYS_jail_get, "jail_get", emul_jail_get);
+    EMUL(FBSD_SYS_jail_set, "jail_set", emul_jail_set);
+    EMUL(FBSD_SYS_jail_remove, "jail_remove", emul_jail_remove);
+    
+    /* kqueue - needs epoll translation */
+    EMUL(FBSD_SYS_kqueue, "kqueue", emul_kqueue);
+    EMUL(FBSD_SYS_kevent, "kevent", emul_kevent);
+    
+    /* Capsicum */
+    EMUL(FBSD_SYS_cap_enter, "cap_enter", emul_cap_enter);
+    EMUL(FBSD_SYS_cap_getmode, "cap_getmode", emul_cap_getmode);
+    
+    /* Unsupported FreeBSD-specific syscalls */
+    UNSUP(FBSD_SYS_chflags, "chflags");
+    UNSUP(FBSD_SYS_fchflags, "fchflags");
+    UNSUP(FBSD_SYS_lchflags, "lchflags");
+    UNSUP(FBSD_SYS_revoke, "revoke");
+    UNSUP(FBSD_SYS_ktrace, "ktrace");
+    UNSUP(FBSD_SYS_getlogin, "getlogin");
+    UNSUP(FBSD_SYS_setlogin, "setlogin");
+    UNSUP(FBSD_SYS_profil, "profil");
+    UNSUP(FBSD_SYS_sysarch, "sysarch");
+    UNSUP(FBSD_SYS_rtprio, "rtprio");
+    UNSUP(FBSD_SYS_ntp_adjtime, "ntp_adjtime");
+    UNSUP(FBSD_SYS_ntp_gettime, "ntp_gettime");
+    /* minherit moved to EMUL above */
+    UNSUP(FBSD_SYS_undelete, "undelete");
+    UNSUP(FBSD_SYS_pathconf, "pathconf");
+    UNSUP(FBSD_SYS_fpathconf, "fpathconf");
+    UNSUP(FBSD_SYS_lpathconf, "lpathconf");
+    
+    table_initialized = 1;
+    BSD_INFO("Syscall table initialized with %d entries", MAX_SYSCALL);
+    
+    return 0;
+}
+
+syscall_result_t syscall_translate(int freebsd_nr, int *linux_nr) {
+    if (freebsd_nr < 0 || freebsd_nr >= MAX_SYSCALL) {
+        *linux_nr = -1;
+        return SYSCALL_UNSUPPORTED;
+    }
+    
+    *linux_nr = syscall_table[freebsd_nr].linux_nr;
+    return syscall_table[freebsd_nr].type;
+}
+
+const syscall_entry_t *syscall_get_entry(int freebsd_nr) {
+    if (freebsd_nr < 0 || freebsd_nr >= MAX_SYSCALL) {
+        return NULL;
+    }
+    return &syscall_table[freebsd_nr];
+}
+
+const char *syscall_name(int freebsd_nr) {
+    if (freebsd_nr < 0 || freebsd_nr >= MAX_SYSCALL) {
+        return "unknown";
+    }
+    const char *name = syscall_table[freebsd_nr].name;
+    return name ? name : "unknown";
+}
+
+int syscall_translate_args(int freebsd_nr, uint64_t *args) {
+    /* 
+     * Some syscalls need argument translation
+     * Return 1 if args were modified, 0 otherwise
+     */
+    switch (freebsd_nr) {
+        case FBSD_SYS_open:
+        case FBSD_SYS_openat:
+            /* Translate open flags */
+            args[1] = abi_translate_open_flags(args[1]);
+            return 1;
+            
+        case FBSD_SYS_mmap:
+            /* Translate mmap flags and prot */
+            args[2] = abi_translate_mmap_prot(args[2]);
+            args[3] = abi_translate_mmap_flags(args[3]);
+            return 1;
+            
+        case FBSD_SYS_kill:
+        case FBSD_SYS_sigaction:
+        case FBSD_SYS_sigprocmask:
+            /* Translate signal number */
+            args[0] = abi_translate_signal(args[0]);
+            return 1;
+            
+        case FBSD_SYS_fcntl:
+            /* Translate fcntl command */
+            args[1] = abi_translate_fcntl_cmd(args[1]);
+            return 1;
+            
+        default:
+            return 0;
+    }
+}
+
+long syscall_translate_return(int freebsd_nr, long retval) {
+    (void)freebsd_nr;  /* Currently unused, but reserved for future use */
+    
+    /* 
+     * Some syscalls need return value translation
+     * Particularly error codes
+     */
+    if (retval < 0 && retval > -4096) {
+        /* This is an error - translate errno */
+        return -abi_translate_errno(-retval);
+    }
+    return retval;
+}
+
+long syscall_execute(pid_t pid, int freebsd_nr, uint64_t args[6]) {
+    const syscall_entry_t *entry = syscall_get_entry(freebsd_nr);
+    
+    if (!entry) {
+        return -ENOSYS;
+    }
+    
+    if (entry->type == SYSCALL_EMULATED && entry->handler) {
+        return entry->handler(pid, args);
+    }
+    
+    return -ENOSYS;
+}
+
+/*
+ * Emulation handlers
+ */
+
+static long emul_getdtablesize(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    (void)args;
+    
+    struct rlimit rlim;
+    if (getrlimit(RLIMIT_NOFILE, &rlim) < 0) {
+        return -errno;
+    }
+    return (long)rlim.rlim_cur;
+}
+
+static long emul_sysctl(pid_t pid, uint64_t args[6]) {
+    /*
+     * FreeBSD __sysctl(2) emulation using our runtime
+     */
+    BSD_TRACE("Emulating __sysctl syscall");
+    return freebsd_handle_sysctl(pid, args);
+}
+
+static long emul_sysctlbyname(pid_t pid, uint64_t args[6]) {
+    /*
+     * FreeBSD sysctlbyname(3) emulation (syscall 570)
+     */
+    BSD_TRACE("Emulating __sysctlbyname syscall");
+    return freebsd_handle_sysctlbyname(pid, args);
+}
+
+static long emul_issetugid(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    (void)args;
+    
+    /* Check if running setuid/setgid */
+    return (getuid() != geteuid() || getgid() != getegid()) ? 1 : 0;
+}
+
+static long emul_yield(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    (void)args;
+    
+    return sched_yield();
+}
+
+static long emul_rfork(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    (void)args;
+    
+    /*
+     * rfork is similar to Linux clone()
+     * TODO: Implement proper flag translation
+     */
+    BSD_WARN("rfork not implemented, using fork()");
+    return fork();
+}
+
+static long emul_seteuid(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    
+    /* seteuid(euid) -> setresuid(-1, euid, -1) */
+    uid_t euid = (uid_t)args[0];
+    return syscall(SYS_setresuid, -1, euid, -1);
+}
+
+static long emul_setegid(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    
+    /* setegid(egid) -> setresgid(-1, egid, -1) */
+    gid_t egid = (gid_t)args[0];
+    return syscall(SYS_setresgid, -1, egid, -1);
+}
+
+static long emul_mkfifo(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    
+    /* mkfifo(path, mode) -> mknod(path, mode | S_IFIFO, 0) */
+    const char *path = (const char *)args[0];
+    mode_t mode = (mode_t)args[1];
+    return syscall(SYS_mknod, path, mode | 0010000 /* S_IFIFO */, 0);
+}
+
+/*
+ * Threading syscall emulation
+ */
+
+static long emul_thr_self(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    (void)args;
+    
+    /* Return current thread ID - on Linux, use gettid() */
+    return syscall(SYS_gettid);
+}
+
+static long emul_thr_exit(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    
+    /* Thread exit - translate to exit_group or exit */
+    long *state = (long *)args[0];
+    (void)state;  /* FreeBSD writes exit state here */
+    
+    /* Just exit the thread */
+    return syscall(SYS_exit, 0);
+}
+
+/*
+ * Jail syscall emulation - these are critical for Jailhouse
+ */
+
+static long emul_jail(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    (void)args;
+    
+    /*
+     * TODO: Implement jail using Linux namespaces
+     * - Create new PID namespace
+     * - Create new network namespace  
+     * - Create new mount namespace
+     * - Set up cgroups for resource limits
+     */
+    BSD_ERROR("jail() syscall not yet implemented");
+    return -ENOSYS;
+}
+
+static long emul_jail_attach(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    (void)args;
+    
+    BSD_ERROR("jail_attach() syscall not yet implemented");
+    return -ENOSYS;
+}
+
+static long emul_jail_get(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    (void)args;
+    
+    BSD_ERROR("jail_get() syscall not yet implemented");
+    return -ENOSYS;
+}
+
+static long emul_jail_set(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    (void)args;
+    
+    BSD_ERROR("jail_set() syscall not yet implemented");
+    return -ENOSYS;
+}
+
+static long emul_jail_remove(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    (void)args;
+    
+    BSD_ERROR("jail_remove() syscall not yet implemented");
+    return -ENOSYS;
+}
+
+/*
+ * kqueue emulation using epoll
+ */
+
+static long emul_kqueue(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    (void)args;
+    
+    /*
+     * TODO: Create epoll fd and maintain kqueue->epoll mapping
+     */
+    BSD_ERROR("kqueue() syscall not yet implemented");
+    return -ENOSYS;
+}
+
+static long emul_kevent(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    (void)args;
+    
+    /*
+     * TODO: Translate kevent structures to epoll_event
+     */
+    BSD_ERROR("kevent() syscall not yet implemented");
+    return -ENOSYS;
+}
+
+/*
+ * Capsicum emulation (security framework)
+ */
+
+static long emul_cap_enter(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    (void)args;
+    
+    /*
+     * Capsicum capability mode - could use seccomp-bpf
+     * For now, just pretend we entered capability mode
+     */
+    BSD_WARN("cap_enter() - Capsicum not supported, continuing anyway");
+    return 0;
+}
+
+static long emul_cap_getmode(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    (void)args;
+    
+    /* Return 0 = not in capability mode */
+    return 0;
+}
+
+/*
+ * thr_kill - send signal to a specific thread
+ */
+static long emul_thr_kill(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    
+    /* thr_kill(long id, int sig) -> tgkill(tgid, tid, sig) */
+    long tid = (long)args[0];
+    int sig = (int)args[1];
+    
+    BSD_TRACE("thr_kill: tid=%ld sig=%d", tid, sig);
+    
+    /* Translate signal number */
+    sig = abi_translate_signal(sig);
+    
+    /* Use tgkill - send signal to specific thread */
+    return syscall(SYS_tgkill, getpid(), tid, sig);
+}
+
+/*
+ * clock_gettime - translate FreeBSD clock IDs to Linux
+ * FreeBSD: CLOCK_REALTIME=0, CLOCK_MONOTONIC=4
+ * Linux:   CLOCK_REALTIME=0, CLOCK_MONOTONIC=1
+ */
+static long emul_clock_gettime(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    
+    int fbsd_clockid = (int)args[0];
+    void *tp = (void *)args[1];
+    int linux_clockid;
+    
+    /* Translate FreeBSD clock ID to Linux */
+    switch (fbsd_clockid) {
+        case 0:  /* CLOCK_REALTIME */
+            linux_clockid = 0;  /* Same on Linux */
+            break;
+        case 4:  /* FreeBSD CLOCK_MONOTONIC */
+            linux_clockid = 1;  /* Linux CLOCK_MONOTONIC */
+            break;
+        case 5:  /* FreeBSD CLOCK_UPTIME */
+            linux_clockid = 7;  /* Linux CLOCK_BOOTTIME */
+            break;
+        case 7:  /* FreeBSD CLOCK_UPTIME_PRECISE */
+            linux_clockid = 7;  /* Linux CLOCK_BOOTTIME */
+            break;
+        case 8:  /* FreeBSD CLOCK_UPTIME_FAST */
+            linux_clockid = 7;  /* Linux CLOCK_BOOTTIME */
+            break;
+        case 9:  /* FreeBSD CLOCK_REALTIME_PRECISE */
+            linux_clockid = 0;  /* Linux CLOCK_REALTIME */
+            break;
+        case 10: /* FreeBSD CLOCK_REALTIME_FAST */
+            linux_clockid = 5;  /* Linux CLOCK_REALTIME_COARSE */
+            break;
+        case 11: /* FreeBSD CLOCK_MONOTONIC_PRECISE */
+            linux_clockid = 1;  /* Linux CLOCK_MONOTONIC */
+            break;
+        case 12: /* FreeBSD CLOCK_MONOTONIC_FAST */
+            linux_clockid = 6;  /* Linux CLOCK_MONOTONIC_COARSE */
+            break;
+        case 13: /* FreeBSD CLOCK_SECOND */
+            linux_clockid = 5;  /* Use CLOCK_REALTIME_COARSE */
+            break;
+        case 14: /* FreeBSD CLOCK_THREAD_CPUTIME_ID */
+            linux_clockid = 3;  /* Linux CLOCK_THREAD_CPUTIME_ID */
+            break;
+        case 15: /* FreeBSD CLOCK_PROCESS_CPUTIME_ID */
+            linux_clockid = 2;  /* Linux CLOCK_PROCESS_CPUTIME_ID */
+            break;
+        default:
+            BSD_WARN("Unknown FreeBSD clock ID: %d, using CLOCK_REALTIME", fbsd_clockid);
+            linux_clockid = 0;
+            break;
+    }
+    
+    BSD_TRACE("clock_gettime: FreeBSD clock %d -> Linux clock %d", fbsd_clockid, linux_clockid);
+    return syscall(SYS_clock_gettime, linux_clockid, tp);
+}
+
+/*
+ * sigprocmask - FreeBSD uses 16-byte sigset_t, Linux uses 8-byte
+ */
+static long emul_sigprocmask(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    
+    int how = (int)args[0];
+    uint64_t *set = (uint64_t *)args[1];
+    uint64_t *oldset = (uint64_t *)args[2];
+    
+    /* FreeBSD how values are same as Linux:
+     * SIG_BLOCK = 1, SIG_UNBLOCK = 2, SIG_SETMASK = 3
+     */
+    
+    /* FreeBSD sigset_t is 16 bytes (128 bits), Linux is 8 bytes (64 bits)
+     * We only use the first 8 bytes since Linux only supports 64 signals
+     */
+    uint64_t linux_set = 0;
+    uint64_t linux_oldset = 0;
+    
+    if (set) {
+        linux_set = *set;  /* Use first 64 bits */
+    }
+    
+    long ret = syscall(SYS_rt_sigprocmask, how, 
+                       set ? &linux_set : NULL, 
+                       oldset ? &linux_oldset : NULL, 
+                       sizeof(linux_set));
+    
+    if (ret == 0 && oldset) {
+        /* Write back old signal mask (Linux 8 bytes -> FreeBSD 16 bytes) */
+        oldset[0] = linux_oldset;
+        oldset[1] = 0;  /* Clear upper 64 bits */
+    }
+    
+    return ret;
+}
+
+/*
+ * sigaction - FreeBSD struct sigaction differs from Linux
+ */
+static long emul_sigaction(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    
+    int sig = (int)args[0];
+    void *act = (void *)args[1];
+    void *oldact = (void *)args[2];
+    
+    /* Translate signal number */
+    int linux_sig = abi_translate_signal(sig);
+    
+    /* FreeBSD struct sigaction:
+     *   void (*sa_handler)(int) or void (*sa_sigaction)(int, siginfo_t *, void *)
+     *   int sa_flags
+     *   sigset_t sa_mask  (16 bytes)
+     * 
+     * Linux struct sigaction (for rt_sigaction):
+     *   void (*sa_handler)(int)
+     *   unsigned long sa_flags
+     *   void (*sa_restorer)(void)
+     *   sigset_t sa_mask (8 bytes for kernel)
+     * 
+     * For now, just pass through with Linux sigsetsize.
+     * This is a simplified approach - full translation would require
+     * reading/writing the FreeBSD structures.
+     */
+    
+    BSD_TRACE("sigaction: sig=%d -> linux_sig=%d", sig, linux_sig);
+    
+    /* Use rt_sigaction with 8-byte sigset size */
+    return syscall(SYS_rt_sigaction, linux_sig, act, oldact, sizeof(uint64_t));
+}
+
+/*
+ * cpuset_getaffinity - get CPU affinity
+ */
+static long emul_cpuset_getaffinity(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    (void)args;
+    
+    /* FreeBSD cpuset_getaffinity(cpulevel_t level, cpuwhich_t which, 
+     *                            id_t id, size_t setsize, cpuset_t *mask)
+     * 
+     * For now, return success and set all CPUs available
+     * A full implementation would use sched_getaffinity
+     */
+    BSD_TRACE("cpuset_getaffinity: returning success (stub)");
+    
+    size_t setsize = (size_t)args[3];
+    uint64_t *mask = (uint64_t *)args[4];
+    
+    if (mask && setsize >= sizeof(uint64_t)) {
+        /* Set all CPUs as available (up to 64) */
+        *mask = 0xFFFFFFFFFFFFFFFFULL;
+    }
+    
+    return 0;
+}
+
+/*
+ * minherit - set memory inheritance for mmap regions
+ */
+static long emul_minherit(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    (void)args;
+    
+    /* minherit(void *addr, size_t len, int inherit)
+     * 
+     * Linux doesn't have a direct equivalent.
+     * The MADV_DONTFORK/MADV_DOFORK madvise flags are similar.
+     * 
+     * For now, return success as this is typically used for
+     * fork optimization which we can ignore.
+     */
+    BSD_TRACE("minherit: returning success (stub)");
+    return 0;
+}

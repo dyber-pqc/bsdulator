@@ -1,0 +1,396 @@
+/*
+ * BSDulator - ABI Translation Implementation
+ * Translates FreeBSD ABI elements to Linux equivalents
+ */
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <string.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <signal.h>
+#include <errno.h>
+#include "bsdulator.h"
+
+/*
+ * Track pending mmap alignment requirement
+ * This is used to post-process mmap results
+ */
+static __thread size_t pending_mmap_alignment = 0;
+static __thread size_t pending_mmap_orig_size = 0;
+
+/*
+ * Open flags translation
+ */
+int abi_translate_open_flags(int freebsd_flags) {
+    int linux_flags = 0;
+    
+    /* Access mode (bottom 2 bits are the same) */
+    linux_flags |= (freebsd_flags & FBSD_O_ACCMODE);
+    
+    /* Standard flags */
+    if (freebsd_flags & FBSD_O_NONBLOCK)   linux_flags |= O_NONBLOCK;
+    if (freebsd_flags & FBSD_O_APPEND)     linux_flags |= O_APPEND;
+    if (freebsd_flags & FBSD_O_CREAT)      linux_flags |= O_CREAT;
+    if (freebsd_flags & FBSD_O_TRUNC)      linux_flags |= O_TRUNC;
+    if (freebsd_flags & FBSD_O_EXCL)       linux_flags |= O_EXCL;
+    if (freebsd_flags & FBSD_O_NOCTTY)     linux_flags |= O_NOCTTY;
+    if (freebsd_flags & FBSD_O_SYNC)       linux_flags |= O_SYNC;
+    if (freebsd_flags & FBSD_O_ASYNC)      linux_flags |= O_ASYNC;
+    if (freebsd_flags & FBSD_O_NOFOLLOW)   linux_flags |= O_NOFOLLOW;
+    if (freebsd_flags & FBSD_O_DIRECTORY)  linux_flags |= O_DIRECTORY;
+    if (freebsd_flags & FBSD_O_CLOEXEC)    linux_flags |= O_CLOEXEC;
+    
+#ifdef O_DIRECT
+    if (freebsd_flags & FBSD_O_DIRECT)     linux_flags |= O_DIRECT;
+#endif
+
+#ifdef O_PATH
+    if (freebsd_flags & FBSD_O_PATH)       linux_flags |= O_PATH;
+#endif
+
+    /* FreeBSD-specific flags that have no Linux equivalent */
+    if (freebsd_flags & FBSD_O_SHLOCK) {
+        BSD_TRACE("O_SHLOCK flag ignored (no Linux equivalent)");
+    }
+    if (freebsd_flags & FBSD_O_EXLOCK) {
+        BSD_TRACE("O_EXLOCK flag ignored (no Linux equivalent)");
+    }
+    
+    return linux_flags;
+}
+
+int abi_translate_open_flags_to_freebsd(int linux_flags) {
+    int freebsd_flags = 0;
+    
+    freebsd_flags |= (linux_flags & O_ACCMODE);
+    
+    if (linux_flags & O_NONBLOCK)   freebsd_flags |= FBSD_O_NONBLOCK;
+    if (linux_flags & O_APPEND)     freebsd_flags |= FBSD_O_APPEND;
+    if (linux_flags & O_CREAT)      freebsd_flags |= FBSD_O_CREAT;
+    if (linux_flags & O_TRUNC)      freebsd_flags |= FBSD_O_TRUNC;
+    if (linux_flags & O_EXCL)       freebsd_flags |= FBSD_O_EXCL;
+    if (linux_flags & O_NOCTTY)     freebsd_flags |= FBSD_O_NOCTTY;
+    if (linux_flags & O_SYNC)       freebsd_flags |= FBSD_O_SYNC;
+    if (linux_flags & O_ASYNC)      freebsd_flags |= FBSD_O_ASYNC;
+    if (linux_flags & O_NOFOLLOW)   freebsd_flags |= FBSD_O_NOFOLLOW;
+    if (linux_flags & O_DIRECTORY)  freebsd_flags |= FBSD_O_DIRECTORY;
+    if (linux_flags & O_CLOEXEC)    freebsd_flags |= FBSD_O_CLOEXEC;
+    
+    return freebsd_flags;
+}
+
+/*
+ * Extract MAP_ALIGNED shift value from FreeBSD mmap flags
+ * Returns 0 if no alignment requested, otherwise the shift (12-29)
+ */
+int abi_get_mmap_alignment_shift(int freebsd_flags) {
+    /* FreeBSD MAP_ALIGNED(n) = (n << 24), stored in bits 24-29 */
+    int align_shift = (freebsd_flags >> 24) & 0x3F;
+    return align_shift;
+}
+
+/*
+ * Get pending mmap alignment requirement (in bytes)
+ */
+size_t abi_get_pending_mmap_alignment(void) {
+    return pending_mmap_alignment;
+}
+
+/*
+ * Get pending mmap original size
+ */
+size_t abi_get_pending_mmap_orig_size(void) {
+    return pending_mmap_orig_size;
+}
+
+/*
+ * Clear pending mmap alignment tracking
+ */
+void abi_clear_pending_mmap_alignment(void) {
+    pending_mmap_alignment = 0;
+    pending_mmap_orig_size = 0;
+}
+
+/*
+ * mmap flags translation
+ * Also tracks alignment requirement for post-processing
+ */
+int abi_translate_mmap_flags(int freebsd_flags) {
+    int linux_flags = 0;
+    
+    if (freebsd_flags & FBSD_MAP_SHARED)    linux_flags |= MAP_SHARED;
+    if (freebsd_flags & FBSD_MAP_PRIVATE)   linux_flags |= MAP_PRIVATE;
+    if (freebsd_flags & FBSD_MAP_FIXED)     linux_flags |= MAP_FIXED;
+    if (freebsd_flags & FBSD_MAP_ANONYMOUS) linux_flags |= MAP_ANONYMOUS;
+    
+#ifdef MAP_STACK
+    if (freebsd_flags & FBSD_MAP_STACK)     linux_flags |= MAP_STACK;
+#endif
+
+#ifdef MAP_32BIT
+    if (freebsd_flags & FBSD_MAP_32BIT)     linux_flags |= MAP_32BIT;
+#endif
+
+#ifdef MAP_NORESERVE
+    if (freebsd_flags & FBSD_MAP_NORESERVE) linux_flags |= MAP_NORESERVE;
+#endif
+    
+    /* FreeBSD MAP_ALIGNED(n) = (n << 24)
+     * This requests alignment to 2^n bytes.
+     * Linux doesn't have MAP_ALIGNED, so we need to handle this differently.
+     * We track the alignment requirement and fix it up after mmap returns.
+     */
+    int align_shift = (freebsd_flags >> 24) & 0x3F;  /* Top 6 bits after stripping */
+    if (align_shift > 0) {
+        size_t alignment = (size_t)1 << align_shift;
+        BSD_TRACE("mmap: MAP_ALIGNED(%d) = %zu byte alignment requested",
+                  align_shift, alignment);
+        pending_mmap_alignment = alignment;
+    } else {
+        pending_mmap_alignment = 0;
+    }
+    pending_mmap_orig_size = 0;  /* Will be set by caller */
+    
+    /* FreeBSD-specific flags with no Linux equivalent */
+    if (freebsd_flags & FBSD_MAP_NOSYNC) {
+        BSD_TRACE("MAP_NOSYNC flag ignored");
+    }
+    if (freebsd_flags & FBSD_MAP_NOCORE) {
+        BSD_TRACE("MAP_NOCORE flag ignored");
+    }
+    
+    /* Linux requires MAP_SHARED or MAP_PRIVATE */
+    if (!(linux_flags & (MAP_SHARED | MAP_PRIVATE))) {
+        linux_flags |= MAP_PRIVATE;
+        BSD_TRACE("mmap: adding MAP_PRIVATE (Linux requires SHARED or PRIVATE)");
+    }
+    BSD_TRACE("mmap flags: FreeBSD 0x%x -> Linux 0x%x", freebsd_flags, linux_flags);
+    
+    return linux_flags;
+}
+
+/*
+ * Set the original mmap size (for alignment fixup calculation)
+ */
+void abi_set_pending_mmap_size(size_t size) {
+    pending_mmap_orig_size = size;
+}
+
+int abi_translate_mmap_prot(int freebsd_prot) {
+    /* PROT_* values are the same on FreeBSD and Linux */
+    int linux_prot = 0;
+    
+    if (freebsd_prot & FBSD_PROT_READ)  linux_prot |= PROT_READ;
+    if (freebsd_prot & FBSD_PROT_WRITE) linux_prot |= PROT_WRITE;
+    if (freebsd_prot & FBSD_PROT_EXEC)  linux_prot |= PROT_EXEC;
+    
+    if (freebsd_prot == FBSD_PROT_NONE) linux_prot = PROT_NONE;
+    
+    return linux_prot;
+}
+
+/*
+ * Signal number translation
+ * FreeBSD and Linux signal numbers differ slightly
+ */
+static const int freebsd_to_linux_sig[] = {
+    [0] = 0,
+    [FBSD_SIGHUP] = SIGHUP,
+    [FBSD_SIGINT] = SIGINT,
+    [FBSD_SIGQUIT] = SIGQUIT,
+    [FBSD_SIGILL] = SIGILL,
+    [FBSD_SIGTRAP] = SIGTRAP,
+    [FBSD_SIGABRT] = SIGABRT,
+    [FBSD_SIGEMT] = 0,          /* No Linux equivalent */
+    [FBSD_SIGFPE] = SIGFPE,
+    [FBSD_SIGKILL] = SIGKILL,
+    [FBSD_SIGBUS] = SIGBUS,
+    [FBSD_SIGSEGV] = SIGSEGV,
+    [FBSD_SIGSYS] = SIGSYS,
+    [FBSD_SIGPIPE] = SIGPIPE,
+    [FBSD_SIGALRM] = SIGALRM,
+    [FBSD_SIGTERM] = SIGTERM,
+    [FBSD_SIGURG] = SIGURG,
+    [FBSD_SIGSTOP] = SIGSTOP,
+    [FBSD_SIGTSTP] = SIGTSTP,
+    [FBSD_SIGCONT] = SIGCONT,
+    [FBSD_SIGCHLD] = SIGCHLD,
+    [FBSD_SIGTTIN] = SIGTTIN,
+    [FBSD_SIGTTOU] = SIGTTOU,
+    [FBSD_SIGIO] = SIGIO,
+    [FBSD_SIGXCPU] = SIGXCPU,
+    [FBSD_SIGXFSZ] = SIGXFSZ,
+    [FBSD_SIGVTALRM] = SIGVTALRM,
+    [FBSD_SIGPROF] = SIGPROF,
+    [FBSD_SIGWINCH] = SIGWINCH,
+    [FBSD_SIGINFO] = 0,         /* No Linux equivalent (use SIGUSR1?) */
+    [FBSD_SIGUSR1] = SIGUSR1,
+    [FBSD_SIGUSR2] = SIGUSR2,
+    [FBSD_SIGTHR] = 0,          /* FreeBSD threading signal */
+};
+
+static const int linux_to_freebsd_sig[] = {
+    [0] = 0,
+    [SIGHUP] = FBSD_SIGHUP,
+    [SIGINT] = FBSD_SIGINT,
+    [SIGQUIT] = FBSD_SIGQUIT,
+    [SIGILL] = FBSD_SIGILL,
+    [SIGTRAP] = FBSD_SIGTRAP,
+    [SIGABRT] = FBSD_SIGABRT,
+    [SIGBUS] = FBSD_SIGBUS,
+    [SIGFPE] = FBSD_SIGFPE,
+    [SIGKILL] = FBSD_SIGKILL,
+    [SIGUSR1] = FBSD_SIGUSR1,
+    [SIGSEGV] = FBSD_SIGSEGV,
+    [SIGUSR2] = FBSD_SIGUSR2,
+    [SIGPIPE] = FBSD_SIGPIPE,
+    [SIGALRM] = FBSD_SIGALRM,
+    [SIGTERM] = FBSD_SIGTERM,
+    [SIGCHLD] = FBSD_SIGCHLD,
+    [SIGCONT] = FBSD_SIGCONT,
+    [SIGSTOP] = FBSD_SIGSTOP,
+    [SIGTSTP] = FBSD_SIGTSTP,
+    [SIGTTIN] = FBSD_SIGTTIN,
+    [SIGTTOU] = FBSD_SIGTTOU,
+    [SIGURG] = FBSD_SIGURG,
+    [SIGXCPU] = FBSD_SIGXCPU,
+    [SIGXFSZ] = FBSD_SIGXFSZ,
+    [SIGVTALRM] = FBSD_SIGVTALRM,
+    [SIGPROF] = FBSD_SIGPROF,
+    [SIGWINCH] = FBSD_SIGWINCH,
+    [SIGIO] = FBSD_SIGIO,
+    [SIGSYS] = FBSD_SIGSYS,
+};
+
+int abi_translate_signal(int freebsd_sig) {
+    if (freebsd_sig < 0 || freebsd_sig >= (int)(sizeof(freebsd_to_linux_sig)/sizeof(freebsd_to_linux_sig[0]))) {
+        return freebsd_sig;  /* Pass through unknown signals */
+    }
+    int linux_sig = freebsd_to_linux_sig[freebsd_sig];
+    return linux_sig ? linux_sig : freebsd_sig;
+}
+
+int abi_translate_signal_to_freebsd(int linux_sig) {
+    if (linux_sig < 0 || linux_sig >= (int)(sizeof(linux_to_freebsd_sig)/sizeof(linux_to_freebsd_sig[0]))) {
+        return linux_sig;
+    }
+    int freebsd_sig = linux_to_freebsd_sig[linux_sig];
+    return freebsd_sig ? freebsd_sig : linux_sig;
+}
+
+/*
+ * fcntl command translation
+ */
+int abi_translate_fcntl_cmd(int freebsd_cmd) {
+    /* Most fcntl commands are the same between FreeBSD and Linux */
+    /* Only translate the ones that differ */
+    switch (freebsd_cmd) {
+        /* These are the same on both systems */
+        case FBSD_F_DUPFD:
+        case FBSD_F_GETFD:
+        case FBSD_F_SETFD:
+        case FBSD_F_GETFL:
+        case FBSD_F_SETFL:
+        case FBSD_F_GETOWN:
+        case FBSD_F_SETOWN:
+        case FBSD_F_GETLK:
+        case FBSD_F_SETLK:
+        case FBSD_F_SETLKW:
+            return freebsd_cmd;
+            
+        /* FreeBSD-specific commands */
+        case FBSD_F_DUP2FD:
+            /* No direct Linux equivalent - would need emulation */
+            BSD_TRACE("fcntl F_DUP2FD not directly supported");
+            return -1;
+            
+        default:
+            return freebsd_cmd;
+    }
+}
+
+/*
+ * errno translation
+ * FreeBSD and Linux share most errno values, but a few differ
+ */
+int abi_translate_errno(int linux_errno) {
+    /* Most errno values are the same */
+    /* This handles the few that differ */
+    switch (linux_errno) {
+        /* These are the same on both systems */
+        case EPERM:
+        case ENOENT:
+        case ESRCH:
+        case EINTR:
+        case EIO:
+        case ENXIO:
+        case E2BIG:
+        case ENOEXEC:
+        case EBADF:
+        case ECHILD:
+        case EDEADLK:
+        case ENOMEM:
+        case EACCES:
+        case EFAULT:
+        case EBUSY:
+        case EEXIST:
+        case EXDEV:
+        case ENODEV:
+        case ENOTDIR:
+        case EISDIR:
+        case EINVAL:
+        case ENFILE:
+        case EMFILE:
+        case ENOTTY:
+        case ETXTBSY:
+        case EFBIG:
+        case ENOSPC:
+        case ESPIPE:
+        case EROFS:
+        case EMLINK:
+        case EPIPE:
+        case EDOM:
+        case ERANGE:
+        case EAGAIN:
+            return linux_errno;
+            
+        /* ENOTSUP is different */
+        case 38:  /* Linux ENOSYS */
+            return 78;  /* FreeBSD ENOSYS */
+        case 95:  /* Linux EOPNOTSUPP */
+            return 45;  /* FreeBSD EOPNOTSUPP */
+            
+        default:
+            return linux_errno;
+    }
+}
+
+int abi_translate_errno_to_linux(int freebsd_errno) {
+    switch (freebsd_errno) {
+        case 45:  /* FreeBSD EOPNOTSUPP */
+            return 95;  /* Linux EOPNOTSUPP */
+        default:
+            return freebsd_errno;
+    }
+}
+
+/*
+ * Translate FreeBSD stat structure to Linux
+ * Note: This is complex because the structures differ significantly
+ */
+int abi_translate_stat(const void *linux_stat, void *freebsd_stat) {
+    /* TODO: Implement proper stat structure translation */
+    /* For now, just copy - this works for basic fields */
+    memcpy(freebsd_stat, linux_stat, 144);  /* FreeBSD stat is 144 bytes */
+    return 0;
+}
+
+/*
+ * Translate Linux stat structure to FreeBSD
+ */
+int abi_translate_stat_to_linux(const void *freebsd_stat, void *linux_stat) {
+    memcpy(linux_stat, freebsd_stat, 144);
+    return 0;
+}

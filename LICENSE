@@ -1,0 +1,106 @@
+# BSDulator Source Available License
+
+Version 1.0, January 2025
+
+## Terms and Conditions
+
+### 1. Definitions
+
+**"Software"** means the BSDulator source code, documentation, and associated files made available under this License.
+
+**"Licensor"** means the copyright holder(s) of the Software.
+
+**"You"** means the individual or legal entity exercising permissions granted by this License.
+
+**"Commercial Use"** means any use of the Software intended for or directed toward commercial advantage or monetary compensation, including but not limited to:
+- Providing the Software as a hosted or managed service
+- Incorporating the Software into a commercial product
+- Using the Software to provide commercial services
+- Distributing the Software as part of a commercial offering
+
+**"Non-Commercial Use"** means personal, educational, research, or internal business use that does not constitute Commercial Use.
+
+### 2. Grant of Rights
+
+Subject to the terms of this License, Licensor hereby grants You a worldwide, royalty-free, non-exclusive license to:
+
+#### 2.1 Non-Commercial Use
+- Use, copy, and modify the Software for Non-Commercial purposes
+- Create derivative works for Non-Commercial purposes
+- Distribute the Software and derivative works for Non-Commercial purposes
+
+#### 2.2 Source Code Access
+- View, study, and analyze the source code
+- Modify the source code for personal use
+- Submit contributions back to the project
+
+### 3. Commercial Use Restriction
+
+**Commercial Use of the Software requires a separate commercial license agreement with the Licensor.**
+
+To obtain a commercial license, contact: Zachary Kleckner | zkleckner@dyber.org
+
+### 4. Conditions
+
+Any exercise of the rights granted herein is subject to the following conditions:
+
+#### 4.1 Attribution
+You must retain all copyright, patent, trademark, and attribution notices in the Software.
+
+#### 4.2 Notice
+You must include a copy of this License with any distribution of the Software.
+
+#### 4.3 Source Availability
+If you distribute derivative works, you must make the source code available under this same License.
+
+#### 4.4 No Trademark Rights
+This License does not grant permission to use the trade names, trademarks, service marks, or product names of the Licensor.
+
+### 5. Contributions
+
+Any contributions you submit to the project are subject to the terms of this License and the Contributor License Agreement (if applicable). By submitting a contribution, you represent that you have the right to license your contribution under this License.
+
+### 6. Patent Rights
+
+If you institute patent litigation against any entity alleging that the Software constitutes patent infringement, then any patent licenses granted to you under this License terminate as of the date such litigation is filed.
+
+### 7. Disclaimer of Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+### 8. Limitation of Liability
+
+IN NO EVENT SHALL LICENSOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+### 9. Termination
+
+This License automatically terminates if You fail to comply with its terms. Upon termination, You must cease all use and distribution of the Software.
+
+### 10. Governing Law
+
+This License shall be governed by and construed in accordance with the laws of the United States, without regard to its conflict of law provisions.
+
+---
+
+## Summary (Not Legal Advice)
+
+| Use Case | Permitted |
+|----------|-----------|
+| Personal projects | ✅ Yes |
+| Educational use | ✅ Yes |
+| Research | ✅ Yes |
+| Internal company tools (non-revenue) | ✅ Yes |
+| Open source projects (non-commercial) | ✅ Yes |
+| Commercial products | ❌ Requires commercial license |
+| Hosted/SaaS offerings | ❌ Requires commercial license |
+| Reselling or bundling | ❌ Requires commercial license |
+
+---
+
+## Copyright Notice
+
+Copyright (c) 2024-2025 BSDulator Contributors
+
+All rights reserved.
+
+For commercial licensing inquiries, please contact: [INSERT CONTACT EMAIL]
