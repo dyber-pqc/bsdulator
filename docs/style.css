@@ -1,0 +1,80 @@
+:root {
+  --bg: #0b0f14;
+  --panel: #121a23;
+  --text: #e8eef6;
+  --muted: #a8b3c2;
+  --line: #223042;
+  --accent: #66d9ef;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.wrap { max-width: 980px; margin: 0 auto; padding: 28px 18px; }
+
+.badge {
+  display: inline-block;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255,255,255,0.03);
+  color: var(--muted);
+  font-size: 13px;
+  letter-spacing: 0.4px;
+}
+
+h1 { margin: 14px 0 10px; font-size: clamp(28px, 4vw, 46px); line-height: 1.1; }
+h2 { margin: 0 0 10px; font-size: 20px; }
+h3 { margin: 18px 0 10px; font-size: 16px; color: var(--muted); }
+
+.sub { color: var(--muted); font-size: 16px; line-height: 1.6; max-width: 780px; }
+
+.cta { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
+.btn {
+  display: inline-block;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255,255,255,0.03);
+  color: var(--text);
+  font-weight: 600;
+}
+.btn.primary {
+  border-color: rgba(102,217,239,0.6);
+  box-shadow: 0 0 0 1px rgba(102,217,239,0.15) inset;
+}
+.btn:hover { background: rgba(255,255,255,0.06); text-decoration: none; }
+
+.grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+@media (min-width: 860px) {
+  .grid { grid-template-columns: 1.2fr 0.8fr; }
+}
+
+.card {
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.015));
+}
+
+ul { margin: 10px 0 0; padding-left: 18px; color: var(--muted); line-height: 1.7; }
+ol { margin: 10px 0 0; padding-left: 18px; color: var(--muted); line-height: 1.7; }
+
+pre {
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #0a0f15;
+  padding: 12px;
+  margin: 10px 0;
+}
+code, .mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 13px;
+  color: #dbe7f7;
+}
+.tiny { color: var(--muted); font-size: 13px; }
+footer { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding-top: 0; }
+.sep { opacity: 0.6; }

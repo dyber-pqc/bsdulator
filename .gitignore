@@ -1,0 +1,45 @@
+# Build artifacts
+/obj/
+/bsdulator
+*.o
+*.a
+*.so
+
+# FreeBSD root filesystem (downloaded separately)
+/freebsd-root/
+base.txz
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.sublime-*
+
+# Debug files
+*.dSYM/
+core
+core.*
+vgcore.*
+
+# Test artifacts
+/tmp/
+*.log
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Distribution
+*.tar.gz
+*.zip
+*.deb
+*.rpm
+
+# Backup Files
+*.bak
+*.bak2
+*.bak3
+*.bak*

@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>BSDulator — Jails-style isolation on Linux</title>
+  <meta name="description" content="BSDulator: run BSD-jail semantics for stateful network services on Linux with ZFS-grade rollback." />
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header class="wrap">
+    <div class="badge">BSDulator</div>
+    <h1>BSD-jails-style isolation on Linux<br/>for stateful network services</h1>
+    <p class="sub">
+      Focus: network appliances (DNS/VPN/firewall/load balancer) where deterministic networking + snapshot/rollback matters more than “microservice velocity”.
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/YOURORG/bsdulator">View on GitHub</a>
+      <a class="btn" href="#demo">Run the demo</a>
+      <a class="btn" href="#roadmap">Roadmap</a>
+    </div>
+    <p class="tiny">License: BSD-2-Clause (recommended for appliance/vendor friendliness).</p>
+  </header>
+
+  <main class="wrap">
+    <section class="grid">
+      <div class="card">
+        <h2>The “one killer demo”</h2>
+        <p>
+          <strong>Stateful, security-critical network services</strong> as isolated units on a Linux host with
+          <strong>ZFS snapshots</strong> for atomic rollback.
+        </p>
+        <ul>
+          <li>Each jail-like unit = its own filesystem dataset</li>
+          <li>Snapshot before change → apply → rollback if needed</li>
+          <li>Deterministic networking (appliance-grade)</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h2>Architecture</h2>
+        <p class="mono">
+          Linux host<br/>
+          ├─ bsdulator runtime (CLI + supervisor)<br/>
+          ├─ namespace/cgroup isolation<br/>
+          ├─ ZFS datasets per unit<br/>
+          └─ “jail” lifecycle (create/start/snapshot/rollback)
+        </p>
+        <p class="tiny">Keep this narrowly scoped. Don’t pitch “Docker replacement”.</p>
+      </div>
+    </section>
+
+    <section id="demo" class="card">
+      <h2>Demo: snapshot → break → rollback</h2>
+      <p>
+        This is the story you want in front of platform/network engineers. Keep it short and copy/pasteable.
+      </p>
+
+      <h3>1) Install</h3>
+      <pre><code>curl -fsSL https://example.com/install.sh | sudo sh</code></pre>
+
+      <h3>2) Create a unit (example: DNS)</h3>
+      <pre><code>sudo bsdulator create dns01 --dataset tank/bsdulator/dns01 --net vnet0</code></pre>
+
+      <h3>3) Snapshot before change</h3>
+      <pre><code>sudo bsdulator snapshot dns01 pre-change</code></pre>
+
+      <h3>4) Apply a change (intentionally break it)</h3>
+      <pre><code>sudo bsdulator exec dns01 -- sh -lc 'echo "broken" &gt; /etc/resolv.conf'</code></pre>
+
+      <h3>5) Rollback atomically</h3>
+      <pre><code>sudo bsdulator rollback dns01 pre-change</code></pre>
+
+      <p class="tiny">
+        Replace these commands with your real CLI once implemented. The demo page should match reality.
+      </p>
+    </section>
+
+    <section id="roadmap" class="card">
+      <h2>Roadmap (public)</h2>
+      <ol>
+        <li><strong>MVP:</strong> create/start/stop, datasets, snapshot/rollback hooks</li>
+        <li><strong>Networking:</strong> veth/vlan + deterministic policy</li>
+        <li><strong>Security:</strong> reduced attack surface defaults, auditing</li>
+        <li><strong>Interop:</strong> optional containerd/K8s integration later</li>
+      </ol>
+    </section>
+
+    <section class="card">
+      <h2>Contact</h2>
+      <p>
+        If you’re evaluating BSDulator for appliance-style workloads, open an issue or email:
+        <span class="mono">bsdulator@yourdomain.com</span>
+      </p>
+    </section>
+  </main>
+
+  <footer class="wrap tiny">
+    <span>© BSDulator</span>
+    <span class="sep">·</span>
+    <a href="https://github.com/YOURORG/bsdulator">GitHub</a>
+    <span class="sep">·</span>
+    <a href="#demo">Demo</a>
+  </footer>
+</body>
+</html>
