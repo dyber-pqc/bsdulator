@@ -24,6 +24,8 @@
 #include <fcntl.h>  /* For open, O_PATH, O_NOFOLLOW */
 #include <sys/uio.h>
 #include <sys/vfs.h>  /* For struct statfs */
+#include <sys/ioctl.h>  /* For ioctl */
+#include <termios.h>  /* For struct termios */
 #include <time.h>
 #include <asm/prctl.h>  /* For ARCH_SET_FS, etc. */
 #include "bsdulator.h"
@@ -70,6 +72,7 @@ static long emul_pathconf(pid_t pid, uint64_t args[6]);
 static long emul_fpathconf(pid_t pid, uint64_t args[6]);
 static long emul_lpathconf(pid_t pid, uint64_t args[6]);
 static long emul_fstatfs(pid_t pid, uint64_t args[6]);
+static long emul_ioctl(pid_t pid, uint64_t args[6]);
 
 /* Maximum FreeBSD syscall number */
 #define MAX_SYSCALL 600
@@ -183,7 +186,7 @@ int syscall_init(void) {
     TRANS(FBSD_SYS_lseek, SYS_lseek, "lseek");
     TRANS(FBSD_SYS_truncate, SYS_truncate, "truncate");
     TRANS(FBSD_SYS_ftruncate, SYS_ftruncate, "ftruncate");
-    TRANS(FBSD_SYS_ioctl, SYS_ioctl, "ioctl");
+    EMUL(FBSD_SYS_ioctl, "ioctl", emul_ioctl);
     TRANS(FBSD_SYS_select, SYS_select, "select");
     TRANS(FBSD_SYS_pselect, SYS_pselect6, "pselect");
     TRANS(FBSD_SYS_poll, SYS_poll, "poll");
@@ -1657,4 +1660,248 @@ static long emul_fstatfs(pid_t pid, uint64_t args[6]) {
     }
 
     return 0;
+}
+
+/*
+ * ioctl - translate FreeBSD terminal ioctls to Linux equivalents
+ * FreeBSD and Linux have different ioctl command numbers and termios structs
+ */
+
+/* FreeBSD terminal ioctl commands */
+#define FBSD_TIOCGETA      0x402c7413  /* Get termios */
+#define FBSD_TIOCSETA      0x802c7414  /* Set termios */
+#define FBSD_TIOCSETAW     0x802c7415  /* Set termios, drain first */
+#define FBSD_TIOCSETAF     0x802c7416  /* Set termios, flush first */
+#define FBSD_TIOCGWINSZ    0x40087468  /* Get window size */
+#define FBSD_TIOCSWINSZ    0x80087467  /* Set window size */
+#define FBSD_TIOCGPGRP     0x40047477  /* Get process group */
+#define FBSD_TIOCSPGRP     0x80047476  /* Set process group */
+#define FBSD_TIOCSCTTY     0x20007461  /* Set controlling terminal */
+#define FBSD_TIOCNOTTY     0x20007471  /* Release controlling terminal */
+#define FBSD_FIONREAD      0x4004667f  /* Get # bytes to read */
+#define FBSD_FIONBIO       0x8004667e  /* Set/clear non-blocking I/O */
+#define FBSD_FIOASYNC      0x8004667d  /* Set/clear async I/O */
+
+/* Linux terminal ioctl commands */
+#define LINUX_TCGETS       0x5401
+#define LINUX_TCSETS       0x5402
+#define LINUX_TCSETSW      0x5403
+#define LINUX_TCSETSF      0x5404
+#define LINUX_TIOCGWINSZ   0x5413
+#define LINUX_TIOCSWINSZ   0x5414
+#define LINUX_TIOCGPGRP    0x540f
+#define LINUX_TIOCSPGRP    0x5410
+#define LINUX_TIOCSCTTY    0x540e
+#define LINUX_TIOCNOTTY    0x5422
+#define LINUX_FIONREAD     0x541b
+#define LINUX_FIONBIO      0x5421
+#define LINUX_FIOASYNC     0x5452
+
+/* FreeBSD termios structure (44 bytes) */
+struct fbsd_termios {
+    uint32_t c_iflag;      /* input flags */
+    uint32_t c_oflag;      /* output flags */
+    uint32_t c_cflag;      /* control flags */
+    uint32_t c_lflag;      /* local flags */
+    uint8_t  c_cc[20];     /* control characters */
+    uint32_t c_ispeed;     /* input speed */
+    uint32_t c_ospeed;     /* output speed */
+};
+
+static long emul_ioctl(pid_t pid, uint64_t args[6]) {
+    int fd = (int)args[0];
+    unsigned long request = args[1];
+    uint64_t argp = args[2];
+    
+    /* Access child's fd via /proc */
+    char proc_path[64];
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d/fd/%d", pid, fd);
+    
+    int our_fd = open(proc_path, O_RDWR | O_NOCTTY);
+    if (our_fd < 0) {
+        /* Try read-only */
+        our_fd = open(proc_path, O_RDONLY);
+        if (our_fd < 0) {
+            BSD_WARN("ioctl: failed to open %s: %s", proc_path, strerror(errno));
+            return -errno;
+        }
+    }
+    
+    long ret = 0;
+    int saved_errno = 0;
+    
+    switch (request) {
+        case FBSD_TIOCGETA: {
+            /* Get termios - translate Linux to FreeBSD format */
+            struct termios linux_termios;
+            ret = ioctl(our_fd, LINUX_TCGETS, &linux_termios);
+            saved_errno = errno;
+            
+            if (ret == 0 && argp != 0) {
+                /* Convert Linux termios to FreeBSD format */
+                struct fbsd_termios fbsd_termios = {0};
+                fbsd_termios.c_iflag = linux_termios.c_iflag;
+                fbsd_termios.c_oflag = linux_termios.c_oflag;
+                fbsd_termios.c_cflag = linux_termios.c_cflag;
+                fbsd_termios.c_lflag = linux_termios.c_lflag;
+                /* Copy control characters (Linux has more, FreeBSD has 20) */
+                memcpy(fbsd_termios.c_cc, linux_termios.c_cc, 
+                       sizeof(fbsd_termios.c_cc) < NCCS ? sizeof(fbsd_termios.c_cc) : NCCS);
+                fbsd_termios.c_ispeed = cfgetispeed(&linux_termios);
+                fbsd_termios.c_ospeed = cfgetospeed(&linux_termios);
+                
+                /* Write to child's memory */
+                struct iovec local = { &fbsd_termios, sizeof(fbsd_termios) };
+                struct iovec remote = { (void *)argp, sizeof(fbsd_termios) };
+                if (process_vm_writev(pid, &local, 1, &remote, 1, 0) < 0) {
+                    close(our_fd);
+                    return -EFAULT;
+                }
+            }
+            BSD_TRACE("ioctl: TIOCGETA fd=%d ret=%ld", fd, ret);
+            break;
+        }
+        
+        case FBSD_TIOCSETA:
+        case FBSD_TIOCSETAW:
+        case FBSD_TIOCSETAF: {
+            /* Set termios - translate FreeBSD to Linux format */
+            struct fbsd_termios fbsd_termios;
+            struct iovec local = { &fbsd_termios, sizeof(fbsd_termios) };
+            struct iovec remote = { (void *)argp, sizeof(fbsd_termios) };
+            if (process_vm_readv(pid, &local, 1, &remote, 1, 0) < 0) {
+                close(our_fd);
+                return -EFAULT;
+            }
+            
+            struct termios linux_termios = {0};
+            linux_termios.c_iflag = fbsd_termios.c_iflag;
+            linux_termios.c_oflag = fbsd_termios.c_oflag;
+            linux_termios.c_cflag = fbsd_termios.c_cflag;
+            linux_termios.c_lflag = fbsd_termios.c_lflag;
+            memcpy(linux_termios.c_cc, fbsd_termios.c_cc,
+                   sizeof(fbsd_termios.c_cc) < NCCS ? sizeof(fbsd_termios.c_cc) : NCCS);
+            cfsetispeed(&linux_termios, fbsd_termios.c_ispeed);
+            cfsetospeed(&linux_termios, fbsd_termios.c_ospeed);
+            
+            unsigned long linux_req = LINUX_TCSETS;
+            if (request == FBSD_TIOCSETAW) linux_req = LINUX_TCSETSW;
+            if (request == FBSD_TIOCSETAF) linux_req = LINUX_TCSETSF;
+            
+            ret = ioctl(our_fd, linux_req, &linux_termios);
+            saved_errno = errno;
+            BSD_TRACE("ioctl: TIOCSETA fd=%d ret=%ld", fd, ret);
+            break;
+        }
+        
+        case FBSD_TIOCGWINSZ: {
+            struct winsize ws;
+            ret = ioctl(our_fd, LINUX_TIOCGWINSZ, &ws);
+            saved_errno = errno;
+            if (ret == 0 && argp != 0) {
+                struct iovec local = { &ws, sizeof(ws) };
+                struct iovec remote = { (void *)argp, sizeof(ws) };
+                if (process_vm_writev(pid, &local, 1, &remote, 1, 0) < 0) {
+                    close(our_fd);
+                    return -EFAULT;
+                }
+            }
+            BSD_TRACE("ioctl: TIOCGWINSZ fd=%d ret=%ld (%dx%d)", fd, ret, ws.ws_col, ws.ws_row);
+            break;
+        }
+        
+        case FBSD_TIOCSWINSZ: {
+            struct winsize ws;
+            struct iovec local = { &ws, sizeof(ws) };
+            struct iovec remote = { (void *)argp, sizeof(ws) };
+            if (process_vm_readv(pid, &local, 1, &remote, 1, 0) < 0) {
+                close(our_fd);
+                return -EFAULT;
+            }
+            ret = ioctl(our_fd, LINUX_TIOCSWINSZ, &ws);
+            saved_errno = errno;
+            BSD_TRACE("ioctl: TIOCSWINSZ fd=%d ret=%ld", fd, ret);
+            break;
+        }
+        
+        case FBSD_TIOCGPGRP: {
+            pid_t pgrp;
+            ret = ioctl(our_fd, LINUX_TIOCGPGRP, &pgrp);
+            saved_errno = errno;
+            if (ret == 0 && argp != 0) {
+                struct iovec local = { &pgrp, sizeof(pgrp) };
+                struct iovec remote = { (void *)argp, sizeof(pgrp) };
+                process_vm_writev(pid, &local, 1, &remote, 1, 0);
+            }
+            BSD_TRACE("ioctl: TIOCGPGRP fd=%d ret=%ld pgrp=%d", fd, ret, pgrp);
+            break;
+        }
+        
+        case FBSD_TIOCSPGRP: {
+            pid_t pgrp;
+            struct iovec local = { &pgrp, sizeof(pgrp) };
+            struct iovec remote = { (void *)argp, sizeof(pgrp) };
+            if (process_vm_readv(pid, &local, 1, &remote, 1, 0) < 0) {
+                close(our_fd);
+                return -EFAULT;
+            }
+            ret = ioctl(our_fd, LINUX_TIOCSPGRP, &pgrp);
+            saved_errno = errno;
+            BSD_TRACE("ioctl: TIOCSPGRP fd=%d ret=%ld pgrp=%d", fd, ret, pgrp);
+            break;
+        }
+        
+        case FBSD_TIOCSCTTY: {
+            ret = ioctl(our_fd, LINUX_TIOCSCTTY, (int)argp);
+            saved_errno = errno;
+            BSD_TRACE("ioctl: TIOCSCTTY fd=%d ret=%ld", fd, ret);
+            break;
+        }
+        
+        case FBSD_TIOCNOTTY: {
+            ret = ioctl(our_fd, LINUX_TIOCNOTTY, 0);
+            saved_errno = errno;
+            BSD_TRACE("ioctl: TIOCNOTTY fd=%d ret=%ld", fd, ret);
+            break;
+        }
+        
+        case FBSD_FIONREAD: {
+            int nbytes;
+            ret = ioctl(our_fd, LINUX_FIONREAD, &nbytes);
+            saved_errno = errno;
+            if (ret == 0 && argp != 0) {
+                struct iovec local = { &nbytes, sizeof(nbytes) };
+                struct iovec remote = { (void *)argp, sizeof(nbytes) };
+                process_vm_writev(pid, &local, 1, &remote, 1, 0);
+            }
+            BSD_TRACE("ioctl: FIONREAD fd=%d ret=%ld nbytes=%d", fd, ret, nbytes);
+            break;
+        }
+        
+        case FBSD_FIONBIO: {
+            int flag;
+            struct iovec local = { &flag, sizeof(flag) };
+            struct iovec remote = { (void *)argp, sizeof(flag) };
+            if (process_vm_readv(pid, &local, 1, &remote, 1, 0) < 0) {
+                close(our_fd);
+                return -EFAULT;
+            }
+            ret = ioctl(our_fd, LINUX_FIONBIO, &flag);
+            saved_errno = errno;
+            BSD_TRACE("ioctl: FIONBIO fd=%d ret=%ld flag=%d", fd, ret, flag);
+            break;
+        }
+        
+        default:
+            BSD_WARN("ioctl: unhandled request 0x%lx on fd=%d", request, fd);
+            close(our_fd);
+            return -ENOTTY;
+    }
+    
+    close(our_fd);
+    
+    if (ret < 0) {
+        return -saved_errno;
+    }
+    return ret;
 }
