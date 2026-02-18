@@ -110,3 +110,36 @@ Updated `emul_sigaction()` in `src/syscall/syscall_table.c`:
 | SIGTHR | 32 | N/A | Stub (return 0) |
 | SIGUSR1 | 30 | 10 | Translate |
 | SIGUSR2 | 31 | 12 | Translate |
+
+## Session 2 - February 18, 2026
+
+### Major Fixes
+
+#### fstatfs Emulation (syscall 556)
+- **Problem**: tar failing with "statvfs failed: Bad file descriptor"
+- **Root Cause 1**: Interceptor code was overwriting emulated fstatfs buffer at syscall-exit
+- **Root Cause 2**: fpathconf was using child's fd number directly in parent process
+- **Fix**: Disabled duplicate translation in interceptor.c, fixed fpathconf to use /proc/pid/fd/N
+
+#### fpathconf Emulation (syscall 192)  
+- **Problem**: fpathconf returning garbage values (9 instead of 255 for NAME_MAX)
+- **Root Cause**: Calling fpathconf(fd, ...) with child's fd which doesn't exist in parent
+- **Fix**: Open child's fd via /proc/pid/fd/N before calling fpathconf
+
+#### ioctl Terminal Emulation (syscall 54)
+- **Problem**: vi failing with "tcgetattr: Inappropriate ioctl for device"
+- **Root Cause**: FreeBSD and Linux have different ioctl command numbers
+- **Fix**: Added emul_ioctl() with translation for:
+  - TIOCGETA (0x402c7413) → TCGETS (0x5401)
+  - TIOCSETA (0x802c7414) → TCSETS (0x5402)
+  - TIOCGWINSZ (0x40087468) → TIOCGWINSZ (0x5413)
+  - And other terminal ioctls
+
+### Testing Results
+- **tar**: ✅ Working - creates valid archives
+- **Redirections**: ✅ `>` and `>>` work; `<` works for shell builtins
+- **vi**: ❌ Still failing with temp file error (needs investigation)
+
+### Known Limitations
+1. Input redirection (`<`) with external commands causes argv[0] corruption
+2. vi has temp file creation issue despite syscalls appearing to succeed
