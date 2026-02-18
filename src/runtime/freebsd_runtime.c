@@ -365,6 +365,177 @@ static long handle_hw_sysctl(int mib1, pid_t pid, uint64_t oldp_addr, uint64_t o
     }
 }
 
+/*
+ * Jail parameter OID table for CTL_SYSCTL name2oid lookups.
+ * These are fake OIDs that we recognize when queried.
+ * Real FreeBSD uses dynamically assigned OIDs, but we use fixed ones.
+ */
+typedef struct {
+    const char *name;
+    int oid[8];
+    int oidlen;
+    char format;  /* 'I'=int, 'S'=string, 'L'=long */
+    size_t size;  /* 0 = variable length string */
+} jail_param_oid_t;
+
+/* CTLTYPE values from FreeBSD sys/sysctl.h */
+#define CTLTYPE_INT     2   /* integer */
+#define CTLTYPE_STRING  3   /* string */
+#define CTLTYPE_STRUCT  5   /* structure/opaque */
+
+/* CTLFLAG values */
+#define CTLFLAG_RD      0x80000000  /* Read-only */
+#define CTLFLAG_WR      0x40000000  /* Write-only */
+#define CTLFLAG_RW      (CTLFLAG_RD|CTLFLAG_WR)
+
+static const jail_param_oid_t jail_param_oids[] = {
+    { "security.jail.param.jid",           {14, 1, 1, 1}, 4, 'I', sizeof(int) },
+    { "security.jail.param.name",          {14, 1, 1, 2}, 4, 'S', 256 },
+    { "security.jail.param.path",          {14, 1, 1, 3}, 4, 'S', 1024 },
+    { "security.jail.param.host.hostname", {14, 1, 1, 4}, 4, 'S', 256 },
+    { "security.jail.param.ip4.addr",      {14, 1, 1, 5}, 4, 'S', 256 },
+    { "security.jail.param.ip6.addr",      {14, 1, 1, 6}, 4, 'S', 256 },
+    { "security.jail.param.securelevel",   {14, 1, 1, 7}, 4, 'I', sizeof(int) },
+    { "security.jail.param.children.max",  {14, 1, 1, 8}, 4, 'I', sizeof(int) },
+    { "security.jail.param.children.cur",  {14, 1, 1, 9}, 4, 'I', sizeof(int) },
+    { "security.jail.param.persist",       {14, 1, 1, 10}, 4, 'I', sizeof(int) },
+    { "security.jail.param.dying",         {14, 1, 1, 11}, 4, 'I', sizeof(int) },
+    { "security.jail.param.parent",        {14, 1, 1, 12}, 4, 'I', sizeof(int) },
+    { "security.jail.param.allow.set_hostname",  {14, 1, 1, 20}, 4, 'I', sizeof(int) },
+    { "security.jail.param.allow.sysvipc",       {14, 1, 1, 21}, 4, 'I', sizeof(int) },
+    { "security.jail.param.allow.raw_sockets",   {14, 1, 1, 22}, 4, 'I', sizeof(int) },
+    { NULL, {0}, 0, 0, 0 }
+};
+
+/*
+ * Handle CTL_SYSCTL (category 0) operations.
+ * This is used for sysctl name-to-OID conversion and OID format queries.
+ */
+static long handle_sysctl_sysctl(int *mib, unsigned int namelen, pid_t pid,
+                                  uint64_t oldp_addr, uint64_t oldlenp_addr,
+                                  uint64_t newp_addr, size_t newlen) {
+    size_t oldlen = 0;
+    
+    if (oldlenp_addr) {
+        if (read_process_mem(pid, &oldlen, (void *)oldlenp_addr, sizeof(oldlen)) < 0) {
+            return -EFAULT;
+        }
+    }
+    
+    switch (mib[1]) {
+        case CTL_SYSCTL_NAME2OID: {
+            /* Convert sysctl name to OID */
+            /* newp contains the name string, newlen is its length */
+            if (newp_addr == 0 || newlen == 0) {
+                BSD_WARN("sysctl.name2oid: no name provided");
+                return -EINVAL;
+            }
+            
+            char name[256];
+            if (newlen >= sizeof(name)) newlen = sizeof(name) - 1;
+            
+            if (read_process_mem(pid, name, (void *)newp_addr, newlen) < 0) {
+                return -EFAULT;
+            }
+            name[newlen] = '\0';
+            
+            BSD_TRACE("sysctl.name2oid: looking up '%s'", name);
+            
+            /* Look up the name in our jail parameter table */
+            for (const jail_param_oid_t *p = jail_param_oids; p->name; p++) {
+                if (strcmp(name, p->name) == 0) {
+                    /* Found - return the OID */
+                    size_t oid_size = p->oidlen * sizeof(int);
+                    BSD_TRACE("sysctl.name2oid: found '%s' -> oid len=%d", name, p->oidlen);
+                    
+                    if (oldlenp_addr) {
+                        if (write_process_mem(pid, &oid_size, (void *)oldlenp_addr, sizeof(oid_size)) < 0) {
+                            return -EFAULT;
+                        }
+                    }
+                    if (oldp_addr && oldlen >= oid_size) {
+                        if (write_process_mem(pid, p->oid, (void *)oldp_addr, oid_size) < 0) {
+                            return -EFAULT;
+                        }
+                    }
+                    return 0;
+                }
+            }
+            
+            /* Check for kern.features.* which jls queries */
+            if (strncmp(name, "kern.features.", 14) == 0) {
+                BSD_TRACE("sysctl.name2oid: kern.features.* - returning not found");
+                return -ENOENT;
+            }
+            
+            BSD_WARN("sysctl.name2oid: '%s' not found", name);
+            return -ENOENT;
+        }
+        
+        case CTL_SYSCTL_OIDFMT: {
+            /* Get the format of an OID */
+            /* The MIB contains: [0, 4, oid[0], oid[1], ...] */
+            if (namelen < 3) {
+                BSD_WARN("sysctl.oidfmt: namelen too short");
+                return -EINVAL;
+            }
+            
+            BSD_TRACE("sysctl.oidfmt: looking up oid[%d,%d,...] len=%u",
+                      mib[2], namelen > 3 ? mib[3] : 0, namelen - 2);
+            
+            /* Find matching OID in our table */
+            for (const jail_param_oid_t *p = jail_param_oids; p->name; p++) {
+                if (p->oidlen == (int)(namelen - 2)) {
+                    int match = 1;
+                    for (int i = 0; i < p->oidlen && match; i++) {
+                        if (p->oid[i] != mib[i + 2]) match = 0;
+                    }
+                    if (match) {
+                        /* Found - return format info */
+                        /* Format is: 4 bytes kind + format string */
+                        /* kind = CTLFLAG_* | CTLTYPE_* */
+                        struct {
+                            uint32_t kind;
+                            char fmt[4];
+                        } __attribute__((packed)) result;
+                        
+                        /* Set kind based on format type */
+                        uint32_t ctltype;
+                        switch (p->format) {
+                            case 'I': ctltype = CTLTYPE_INT; break;
+                            case 'S': ctltype = CTLTYPE_STRING; break;
+                            default:  ctltype = CTLTYPE_STRUCT; break;
+                        }
+                        result.kind = CTLFLAG_RD | ctltype;
+                        result.fmt[0] = p->format;
+                        result.fmt[1] = '\0';
+                        
+                        size_t result_size = sizeof(result.kind) + 2;
+                        
+                        BSD_TRACE("sysctl.oidfmt: found '%s' format='%c' kind=0x%x", 
+                                  p->name, p->format, result.kind);
+                        
+                        if (oldlenp_addr) {
+                            write_process_mem(pid, &result_size, (void *)oldlenp_addr, sizeof(result_size));
+                        }
+                        if (oldp_addr && oldlen >= result_size) {
+                            write_process_mem(pid, &result, (void *)oldp_addr, result_size);
+                        }
+                        return 0;
+                    }
+                }
+            }
+            
+            BSD_WARN("sysctl.oidfmt: OID not found");
+            return -ENOENT;
+        }
+        
+        default:
+            BSD_WARN("sysctl.sysctl: unhandled operation %d", mib[1]);
+            return -ENOENT;
+    }
+}
+
 long freebsd_handle_sysctl(pid_t pid, uint64_t args[6]) {
     /*
      * FreeBSD __sysctl(2):
@@ -375,8 +546,8 @@ long freebsd_handle_sysctl(pid_t pid, uint64_t args[6]) {
     unsigned int namelen = (unsigned int)args[1];
     uint64_t oldp_addr = args[2];
     uint64_t oldlenp_addr = args[3];
-    /* uint64_t newp_addr = args[4]; */
-    /* size_t newlen = args[5]; */
+    uint64_t newp_addr = args[4];
+    size_t newlen = args[5];
     
     if (namelen < 2 || namelen > 24) {
         BSD_WARN("sysctl: invalid namelen %u", namelen);
@@ -393,11 +564,42 @@ long freebsd_handle_sysctl(pid_t pid, uint64_t args[6]) {
     BSD_TRACE("sysctl: mib[0]=%d mib[1]=%d namelen=%u", mib[0], mib[1], namelen);
     
     switch (mib[0]) {
+        case CTL_SYSCTL:
+            return handle_sysctl_sysctl(mib, namelen, pid, oldp_addr, oldlenp_addr, newp_addr, newlen);
+            
         case CTL_KERN:
             return handle_kern_sysctl(mib[1], pid, oldp_addr, oldlenp_addr);
             
         case CTL_HW:
             return handle_hw_sysctl(mib[1], pid, oldp_addr, oldlenp_addr);
+        
+        case CTL_SECURITY: {
+            /* security.jail.* sysctls for jail parameter queries */
+            /* mib = {14, 1, 1, param_id} for jail params */
+            BSD_TRACE("sysctl: security.jail query mib[2]=%d mib[3]=%d", 
+                      namelen > 2 ? mib[2] : 0, namelen > 3 ? mib[3] : 0);
+            
+            size_t oldlen = 0;
+            if (oldlenp_addr) {
+                read_process_mem(pid, &oldlen, (void *)oldlenp_addr, sizeof(oldlen));
+            }
+            
+            /*
+             * For jail parameter queries (security.jail.param.*):
+             * - If oldp is NULL, caller is asking for size - return 0
+             * - If oldp is non-NULL, caller wants data - return empty/zero
+             * 
+             * When no jails exist, return success with zero-length data.
+             * This tells jls "no jails" rather than "error".
+             */
+            size_t zero = 0;
+            if (oldlenp_addr) {
+                write_process_mem(pid, &zero, (void *)oldlenp_addr, sizeof(zero));
+            }
+            
+            /* Return success - indicates "no jails" not "error" */
+            return 0;
+        }
             
         default:
             BSD_WARN("Unhandled sysctl category: %d", mib[0]);
@@ -680,7 +882,6 @@ int freebsd_setup_stack(pid_t pid, uint64_t entry, uint64_t phdr,
      */
     uint64_t canary_addr = 0;
     uint64_t pagesizes_addr = 0;
-    (void)linux_execfn;  /* Used only for logging */
     
     if (linux_random != 0) {
         /* 
@@ -750,7 +951,12 @@ int freebsd_setup_stack(pid_t pid, uint64_t entry, uint64_t phdr,
         BSD_TRACE("Pagesizes array written at 0x%llx", (unsigned long long)pagesizes_addr);
     }
     
-    /* Note: AT_EXECPATH removed from auxv to save space - programs can use other methods */
+    /* 
+     * AT_EXECPATH - Path to the executable.
+     * CRITICAL for rtld (dynamic linker) when run directly!
+     * We use linux_execfn which points to the executed binary path.
+     */
+    uint64_t execpath_addr = linux_execfn;  /* Use Linux's AT_EXECFN location */
     
     /* 
      * Build FreeBSD auxv with CORRECT FreeBSD type numbers!
@@ -803,9 +1009,28 @@ int freebsd_setup_stack(pid_t pid, uint64_t entry, uint64_t phdr,
     ADD_AUXV(FBSD_AT_PHNUM, phnum);
     ADD_AUXV(FBSD_AT_PAGESZ, g_freebsd_runtime.pagesize);
     ADD_AUXV(FBSD_AT_ENTRY, entry);
-    /* AT_BASE - interpreter load address (critical for dynamic binaries!) */
+    /* AT_BASE - interpreter load address (critical for dynamic binaries!) 
+     * When running ld-elf.so.1 directly, linux_base is 0 because there's no
+     * separate interpreter. But rtld NEEDS AT_BASE to know where it's loaded.
+     * We can derive it from AT_PHDR - the phdr is typically at load_addr + 0x40.
+     */
     if (linux_base != 0) {
         ADD_AUXV(FBSD_AT_BASE, linux_base);
+    } else if (phdr != 0) {
+        /* Running interpreter directly - derive base from phdr */
+        uint64_t derived_base = phdr & ~0xFFFULL;  /* Round down to page */
+        if ((phdr & 0xFFF) == 0x40) {
+            /* Standard ELF layout: phdr at base + 0x40 */
+            derived_base = phdr - 0x40;
+        }
+        BSD_TRACE("Derived AT_BASE=0x%llx from phdr=0x%llx", 
+                  (unsigned long long)derived_base, (unsigned long long)phdr);
+        ADD_AUXV(FBSD_AT_BASE, derived_base);
+    }
+    
+    /* AT_EXECPATH = 15 - Path to executable (CRITICAL for rtld!) */
+    if (execpath_addr != 0) {
+        ADD_AUXV(FBSD_AT_EXECPATH, execpath_addr);
     }
     
     /* AT_CANARY = 16 - POINTER to stack canary (CRITICAL for SSP!) */

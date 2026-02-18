@@ -36,11 +36,9 @@ static long emul_getdtablesize(pid_t pid, uint64_t args[6]);
 static long emul_sysctl(pid_t pid, uint64_t args[6]);
 static long emul_syscall(pid_t pid, uint64_t args[6]);
 static long emul_sysctlbyname(pid_t pid, uint64_t args[6]);
-static long emul_jail(pid_t pid, uint64_t args[6]);
-static long emul_jail_attach(pid_t pid, uint64_t args[6]);
-static long emul_jail_get(pid_t pid, uint64_t args[6]);
-static long emul_jail_set(pid_t pid, uint64_t args[6]);
-static long emul_jail_remove(pid_t pid, uint64_t args[6]);
+/* Jail syscalls are now implemented in src/jail/jail.c
+ * Declarations are in include/bsdulator/jail.h
+ */
 static long emul_kqueue(pid_t pid, uint64_t args[6]);
 static long emul_kevent(pid_t pid, uint64_t args[6]);
 static long emul_issetugid(pid_t pid, uint64_t args[6]);
@@ -828,48 +826,9 @@ static long emul_umtx_op(pid_t pid, uint64_t args[6]) {
 }
 
 /*
- * Jail syscall emulation - these are critical for Jailhouse
+ * Jail syscall emulation - implemented in src/jail/jail.c
+ * These are critical for the Jailhouse.io project!
  */
-
-static long emul_jail(pid_t pid, uint64_t args[6]) {
-    (void)pid;
-    (void)args;
-    
-    BSD_ERROR("jail() syscall not yet implemented");
-    return -ENOSYS;
-}
-
-static long emul_jail_attach(pid_t pid, uint64_t args[6]) {
-    (void)pid;
-    (void)args;
-    
-    BSD_ERROR("jail_attach() syscall not yet implemented");
-    return -ENOSYS;
-}
-
-static long emul_jail_get(pid_t pid, uint64_t args[6]) {
-    (void)pid;
-    (void)args;
-    
-    BSD_ERROR("jail_get() syscall not yet implemented");
-    return -ENOSYS;
-}
-
-static long emul_jail_set(pid_t pid, uint64_t args[6]) {
-    (void)pid;
-    (void)args;
-    
-    BSD_ERROR("jail_set() syscall not yet implemented");
-    return -ENOSYS;
-}
-
-static long emul_jail_remove(pid_t pid, uint64_t args[6]) {
-    (void)pid;
-    (void)args;
-    
-    BSD_ERROR("jail_remove() syscall not yet implemented");
-    return -ENOSYS;
-}
 
 /*
  * kqueue emulation using epoll

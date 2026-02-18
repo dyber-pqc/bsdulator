@@ -18,7 +18,8 @@ SRCS = $(SRCDIR)/main.c \
        $(SRCDIR)/syscall/syscall_table.c \
        $(SRCDIR)/loader/elf_loader.c \
        $(SRCDIR)/abi/abi_translate.c \
-       $(SRCDIR)/runtime/freebsd_runtime.c
+       $(SRCDIR)/runtime/freebsd_runtime.c \
+       $(SRCDIR)/jail/jail.c
 
 # Object files
 OBJS = $(SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
@@ -53,10 +54,11 @@ $(OBJDIR)/%.o: $(SRCDIR)/%.c
 # Dependencies
 $(OBJDIR)/main.o: $(SRCDIR)/main.c $(INCDIR)/bsdulator.h
 $(OBJDIR)/interceptor/interceptor.o: $(SRCDIR)/interceptor/interceptor.c $(INCDIR)/bsdulator.h $(INCDIR)/bsdulator/interceptor.h
-$(OBJDIR)/syscall/syscall_table.o: $(SRCDIR)/syscall/syscall_table.c $(INCDIR)/bsdulator.h $(INCDIR)/bsdulator/syscall.h $(SRCDIR)/runtime/freebsd_runtime.h
+$(OBJDIR)/syscall/syscall_table.o: $(SRCDIR)/syscall/syscall_table.c $(INCDIR)/bsdulator.h $(INCDIR)/bsdulator/syscall.h $(INCDIR)/bsdulator/jail.h $(SRCDIR)/runtime/freebsd_runtime.h
 $(OBJDIR)/loader/elf_loader.o: $(SRCDIR)/loader/elf_loader.c $(INCDIR)/bsdulator.h $(INCDIR)/bsdulator/loader.h
 $(OBJDIR)/abi/abi_translate.o: $(SRCDIR)/abi/abi_translate.c $(INCDIR)/bsdulator.h $(INCDIR)/bsdulator/abi.h
 $(OBJDIR)/runtime/freebsd_runtime.o: $(SRCDIR)/runtime/freebsd_runtime.c $(SRCDIR)/runtime/freebsd_runtime.h $(INCDIR)/bsdulator.h
+$(OBJDIR)/jail/jail.o: $(SRCDIR)/jail/jail.c $(INCDIR)/bsdulator.h $(INCDIR)/bsdulator/jail.h
 
 # Clean
 clean:

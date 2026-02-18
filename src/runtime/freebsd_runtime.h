@@ -65,8 +65,17 @@
  * FreeBSD sysctl MIB identifiers
  * From FreeBSD sys/sysctl.h
  */
+#define CTL_SYSCTL      0   /* Sysctl internal operations */
 #define CTL_KERN        1   /* Kernel */
 #define CTL_HW          6   /* Hardware */
+
+/* CTL_SYSCTL operations (mib[1] when mib[0]=0) */
+#define CTL_SYSCTL_NAME2OID     3   /* Convert name to OID */
+#define CTL_SYSCTL_OIDFMT       4   /* Get OID format */
+
+/* Security sysctl (for jail parameters) */
+#define CTL_SECURITY    14  /* Security */
+#define SECURITY_JAIL   1   /* security.jail */
 
 /* kern.* */
 #define KERN_OSTYPE         1   /* string: system type */

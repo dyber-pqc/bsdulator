@@ -47,6 +47,7 @@ extern int bsd_debug_level;
 #include "bsdulator/interceptor.h"
 #include "bsdulator/loader.h"
 #include "bsdulator/abi.h"
+#include "bsdulator/jail.h"
 
 /* Main entry points */
 int bsdulator_init(void);
