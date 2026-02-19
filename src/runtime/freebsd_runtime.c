@@ -405,6 +405,11 @@ static const jail_param_oid_t jail_param_oids[] = {
     { "security.jail.param.allow.set_hostname",  {14, 1, 1, 20}, 4, 'I', sizeof(int) },
     { "security.jail.param.allow.sysvipc",       {14, 1, 1, 21}, 4, 'I', sizeof(int) },
     { "security.jail.param.allow.raw_sockets",   {14, 1, 1, 22}, 4, 'I', sizeof(int) },
+    { "security.jail.param.cpuset.id",             {14, 1, 1, 30}, 4, 'I', sizeof(int) },
+    { "security.jail.param.osreldate",             {14, 1, 1, 31}, 4, 'I', sizeof(int) },
+    { "security.jail.param.osrelease",             {14, 1, 1, 32}, 4, 'S', 32 },
+    { "security.jail.param.ip4",                   {14, 1, 1, 33}, 4, 'I', sizeof(int) },
+    { "security.jail.param.ip6",                   {14, 1, 1, 34}, 4, 'I', sizeof(int) },
     { NULL, {0}, 0, 0, 0 }
 };
 

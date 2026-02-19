@@ -428,6 +428,11 @@ typedef struct {
 #define FBSD_SYS_timerfd_gettime 586
 #define FBSD_SYS_timerfd_settime 587
 #define FBSD_SYS_kcmp           588
+#define FBSD_SYS_getrlimitusage 589
+#define FBSD_SYS_fchroot        590
+#define FBSD_SYS_setcred        591
+/* FreeBSD 15 additions */
+#define FBSD_SYS_credsync       596
 
 /* Initialize syscall tables */
 int syscall_init(void);

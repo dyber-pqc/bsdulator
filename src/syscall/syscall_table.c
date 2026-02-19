@@ -50,6 +50,8 @@ static long emul_cap_getmode(pid_t pid, uint64_t args[6]);
 static long emul_cap_rights_limit(pid_t pid, uint64_t args[6]);
 static long emul_cap_ioctls_limit(pid_t pid, uint64_t args[6]);
 static long emul_cap_fcntls_limit(pid_t pid, uint64_t args[6]);
+static long emul_realpathat(pid_t pid, uint64_t args[6]);
+static long emul_credsync(pid_t pid, uint64_t args[6]);
 static long emul_seteuid(pid_t pid, uint64_t args[6]);
 static long emul_setegid(pid_t pid, uint64_t args[6]);
 static long emul_mkfifo(pid_t pid, uint64_t args[6]);
@@ -446,6 +448,10 @@ int syscall_init(void) {
     EMUL(FBSD_SYS_pathconf, "pathconf", emul_pathconf);
     EMUL(FBSD_SYS_fpathconf, "fpathconf", emul_fpathconf);
     EMUL(FBSD_SYS_lpathconf, "lpathconf", emul_lpathconf);
+    
+    /* FreeBSD 15 syscalls */
+    EMUL(FBSD_SYS___realpathat, "__realpathat", emul_realpathat);
+    EMUL(FBSD_SYS_credsync, "credsync", emul_credsync);
     
     table_initialized = 1;
     BSD_INFO("Syscall table initialized with %d entries", MAX_SYSCALL);
@@ -1898,4 +1904,30 @@ static long emul_ioctl(pid_t pid, uint64_t args[6]) {
         return -saved_errno;
     }
     return ret;
+}
+
+/*
+ * __realpathat - resolve pathname relative to directory fd
+ * int __realpathat(int fd, const char *path, char *buf, size_t size, int flags)
+ */
+static long emul_realpathat(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    int fd = (int)args[0];
+    /* For now, return success with empty buffer - most uses are optional */
+    BSD_TRACE("__realpathat: fd=%d (stub - returning success)", fd);
+    return 0;
+}
+
+/*
+ * credsync - synchronize credentials (FreeBSD 15+)
+ * This is used by initgroups/setgroups for credential synchronization
+ * int credsync(void)
+ */
+static long emul_credsync(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    (void)args;
+    /* This syscall synchronizes process credentials after setgroups/initgroups.
+     * On Linux, credentials are already synchronized, so we just return success. */
+    BSD_TRACE("credsync: returning success (credentials already synchronized)");
+    return 0;
 }

@@ -1009,10 +1009,14 @@ typedef struct {
     char name[JAIL_MAX_NAME];
     char path[JAIL_MAX_PATH];
     char hostname[JAIL_MAX_HOSTNAME];
+    struct in_addr ip4_addrs[JAIL_MAX_IPS];
+    int ip4_count;
+    int persist;
     int has_jid;
     int has_name;
     int has_path;
     int has_hostname;
+    int has_ip4;
 } jail_params_t;
 
 /*
@@ -1211,6 +1215,67 @@ long emul_jail_get(pid_t pid, uint64_t args[6]) {
             write_child_int(pid, (uint64_t)iovs[i+1].iov_base, jail->persist);
         } else if (strcmp(param_name, "dying") == 0 && iovs[i+1].iov_len >= sizeof(int)) {
             write_child_int(pid, (uint64_t)iovs[i+1].iov_base, jail->dying);
+        } else if (strcmp(param_name, "ip4.addr") == 0) {
+            /* Return IP addresses as comma-separated string */
+            if (jail->ip4_count > 0) {
+                char ip_str[256] = "";
+                size_t offset = 0;
+                for (int j = 0; j < jail->ip4_count && offset < sizeof(ip_str) - 20; j++) {
+                    char ipbuf[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &jail->ip4_addrs[j], ipbuf, sizeof(ipbuf));
+                    if (j > 0) {
+                        ip_str[offset++] = ',';
+                    }
+                    strcpy(ip_str + offset, ipbuf);
+                    offset += strlen(ipbuf);
+                }
+                size_t slen = strlen(ip_str) + 1;
+                if (iovs[i+1].iov_len == 0) {
+                    /* Size query */
+                    iovs[i+1].iov_len = slen;
+                    struct iovec l = { &iovs[i+1], sizeof(struct iovec) };
+                    struct iovec r = { (void *)(iov_addr + (i+1) * sizeof(struct iovec)), sizeof(struct iovec) };
+                    process_vm_writev(pid, &l, 1, &r, 1, 0);
+                    BSD_TRACE("jail_get(): ip4.addr size query, need %zu bytes for '%s'", slen, ip_str);
+                } else if (iovs[i+1].iov_len >= slen) {
+                    struct iovec l = { ip_str, slen };
+                    struct iovec r = { iovs[i+1].iov_base, slen };
+                    process_vm_writev(pid, &l, 1, &r, 1, 0);
+                    BSD_TRACE("jail_get(): wrote ip4.addr='%s'", ip_str);
+                }
+            } else {
+                /* No IPs assigned - return empty string */
+                if (iovs[i+1].iov_len == 0) {
+                    iovs[i+1].iov_len = 1; /* Just null terminator */
+                    struct iovec l = { &iovs[i+1], sizeof(struct iovec) };
+                    struct iovec r = { (void *)(iov_addr + (i+1) * sizeof(struct iovec)), sizeof(struct iovec) };
+                    process_vm_writev(pid, &l, 1, &r, 1, 0);
+                    BSD_TRACE("jail_get(): ip4.addr size query, no IPs assigned");
+                } else {
+                    char empty = '\0';
+                    struct iovec l = { &empty, 1 };
+                    struct iovec r = { iovs[i+1].iov_base, 1 };
+                    process_vm_writev(pid, &l, 1, &r, 1, 0);
+                }
+            }
+        } else if (strcmp(param_name, "ip4") == 0 && iovs[i+1].iov_len >= sizeof(int)) {
+            /* ip4 parameter controls whether jail can use IPv4 - we always allow it */
+            write_child_int(pid, (uint64_t)iovs[i+1].iov_base, 1); /* JAIL_SYS_NEW */
+        } else if (strcmp(param_name, "cpuset.id") == 0 && iovs[i+1].iov_len >= sizeof(int)) {
+            /* Return a fake cpuset ID based on jid */
+            write_child_int(pid, (uint64_t)iovs[i+1].iov_base, jail->jid);
+            BSD_TRACE("jail_get(): wrote cpuset.id=%d", jail->jid);
+        } else if (strcmp(param_name, "osreldate") == 0 && iovs[i+1].iov_len >= sizeof(int)) {
+            /* FreeBSD 15 release date */
+            write_child_int(pid, (uint64_t)iovs[i+1].iov_base, 1500000);
+        } else if (strcmp(param_name, "osrelease") == 0) {
+            const char *release = "15.0-RELEASE";
+            size_t slen = strlen(release) + 1;
+            if (iovs[i+1].iov_len >= slen) {
+                struct iovec l = { (void*)release, slen };
+                struct iovec r = { iovs[i+1].iov_base, slen };
+                process_vm_writev(pid, &l, 1, &r, 1, 0);
+            }
         }
         /* Silently ignore unknown parameters */
     }
@@ -1288,8 +1353,41 @@ long emul_jail_set(pid_t pid, uint64_t args[6]) {
             read_child_string(pid, (uint64_t)iovs[i+1].iov_base, params.hostname, sizeof(params.hostname));
             params.has_hostname = 1;
             BSD_TRACE("jail_set(): hostname='%s'", params.hostname);
+        } else if (strcmp(param_name, "ip4.addr") == 0) {
+            /* IP addresses are passed as comma-separated string: "x.x.x.x" or "x.x.x.x,y.y.y.y" */
+            char ip_str[256] = "";
+            read_child_string(pid, (uint64_t)iovs[i+1].iov_base, ip_str, sizeof(ip_str));
+            BSD_TRACE("jail_set(): ip4.addr string='%s'", ip_str);
+            
+            if (ip_str[0]) {
+                /* Parse comma-separated IP addresses */
+                char *saveptr;
+                char *token = strtok_r(ip_str, ",", &saveptr);
+                params.ip4_count = 0;
+                while (token && params.ip4_count < JAIL_MAX_IPS) {
+                    /* Skip leading whitespace */
+                    while (*token == ' ') token++;
+                    if (inet_pton(AF_INET, token, &params.ip4_addrs[params.ip4_count]) == 1) {
+                        BSD_TRACE("jail_set(): parsed ip4[%d]='%s'", params.ip4_count, token);
+                        params.ip4_count++;
+                    } else {
+                        BSD_WARN("jail_set(): invalid IP address '%s'", token);
+                    }
+                    token = strtok_r(NULL, ",", &saveptr);
+                }
+                if (params.ip4_count > 0) {
+                    params.has_ip4 = 1;
+                    char ipstr[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &params.ip4_addrs[0], ipstr, sizeof(ipstr));
+                    BSD_TRACE("jail_set(): ip4.addr[0]='%s' (count=%d)", ipstr, params.ip4_count);
+                }
+            }
+        } else if (strcmp(param_name, "persist") == 0) {
+            /* persist flag - jail stays even with no processes */
+            params.persist = 1;
+            BSD_TRACE("jail_set(): persist=1");
         }
-        /* TODO: Handle more parameters (ip4.addr, securelevel, allow.*, etc.) */
+        /* TODO: Handle more parameters (securelevel, allow.*, etc.) */
     }
     
     /* Determine operation: create or update */
@@ -1320,6 +1418,15 @@ long emul_jail_set(pid_t pid, uint64_t args[6]) {
             memset(jail->hostname, 0, JAIL_MAX_HOSTNAME);
             memcpy(jail->hostname, params.hostname, strlen(params.hostname));
         }
+        if (params.has_ip4 && params.ip4_count > 0) {
+            jail->ip4_count = params.ip4_count;
+            memcpy(jail->ip4_addrs, params.ip4_addrs,
+                   params.ip4_count * sizeof(struct in_addr));
+            char ipstr[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &jail->ip4_addrs[0], ipstr, sizeof(ipstr));
+            BSD_INFO("jail_set(): updated ip4.addr[0]='%s'", ipstr);
+            jail_save_state();
+        }
         
         free(iovs);
         
@@ -1343,6 +1450,20 @@ long emul_jail_set(pid_t pid, uint64_t args[6]) {
             BSD_WARN("jail_set(): creation failed: %d", jid);
             free(iovs);
             return jid;
+        }
+        
+        /* Copy IP addresses to the newly created jail */
+        if (params.has_ip4 && params.ip4_count > 0) {
+            bsd_jail_t *new_jail = jail_find_by_id(jid);
+            if (new_jail) {
+                new_jail->ip4_count = params.ip4_count;
+                memcpy(new_jail->ip4_addrs, params.ip4_addrs,
+                       params.ip4_count * sizeof(struct in_addr));
+                char ipstr[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &new_jail->ip4_addrs[0], ipstr, sizeof(ipstr));
+                BSD_INFO("jail_set(): created jail with ip4.addr[0]='%s'", ipstr);
+                jail_save_state();
+            }
         }
         
         if (flags & JAIL_ATTACH) {

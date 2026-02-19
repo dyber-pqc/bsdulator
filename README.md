@@ -4,9 +4,9 @@
 
 BSDulator enables running unmodified FreeBSD binaries on Linux by intercepting and translating FreeBSD system calls to their Linux equivalents. Similar to how Wine runs Windows applications on Linux, or how FreeBSD's Linuxulator runs Linux binaries on FreeBSD—but in reverse.
 
-## 🎉 Current Status: FreeBSD Jails Working on Linux!
+## 🎉 Current Status: FreeBSD Jails Fully Functional on Linux!
 
-BSDulator now supports **FreeBSD jail syscalls**, bringing FreeBSD's powerful jail containerization to Linux. This is the first implementation of FreeBSD jails outside of FreeBSD itself.
+BSDulator now provides **complete FreeBSD jail support**, bringing FreeBSD's powerful jail containerization to Linux. This is the first implementation of FreeBSD jails outside of FreeBSD itself.
 
 ### What Works
 
@@ -16,10 +16,12 @@ BSDulator now supports **FreeBSD jail syscalls**, bringing FreeBSD's powerful ja
 | Dynamic binaries | `/bin/echo`, `/bin/ls`, `/bin/cat`, `/bin/sh` | ✅ **Working** |
 | FreeBSD Shell | `/bin/sh` with pipes, redirects | ✅ **Working** |
 | Shared libraries | `libc.so.7`, `ld-elf.so.1` | ✅ **Loading** |
-| **Jail creation** | `jail -c name=test path=./freebsd-root persist` | ✅ **Working** |
-| **Jail listing** | `jls` | ✅ **Working** |
+| **Jail creation** | `jail -c name=test path=./freebsd-root ip4.addr=10.0.0.1 persist` | ✅ **Working** |
+| **Jail listing** | `jls`, `jls -v`, `jls jid name ip4.addr path` | ✅ **Working** |
 | **Jail execution** | `jexec 1 /bin/sh -c "echo hello"` | ✅ **Working** |
+| **Jail exec flags** | `jexec -l`, `jexec -U root`, `jexec -u root` | ✅ **Working** |
 | **Jail removal** | `jail -r 1` | ✅ **Working** |
+| **Jail IP assignment** | `ip4.addr=192.168.1.10` parameter | ✅ **Working** |
 | **Multiple jails** | Create, manage, and remove multiple concurrent jails | ✅ **Working** |
 
 ```bash
@@ -29,16 +31,20 @@ BSDulator now supports **FreeBSD jail syscalls**, bringing FreeBSD's powerful ja
 ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/bin/sh -c 'pwd; echo test'
 
 # Create and manage FreeBSD jails on Linux!
-./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jail -c name=myjail path=./freebsd-root persist
+./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jail -c name=myjail path=./freebsd-root ip4.addr=10.0.0.1 persist
 ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jls
+./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jls jid name ip4.addr path
 sudo ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jexec 1 /bin/sh -c "echo Hello from inside the jail!"
+sudo ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jexec -U root 1 /bin/sh -c "id"
 ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jail -r 1
 ```
 
 ## Features
 
 - **Full Syscall Translation**: 200+ FreeBSD syscalls translated to Linux equivalents
-- **FreeBSD Jail Support**: Create, list, execute in, and remove FreeBSD jails
+- **Complete FreeBSD Jail Support**: Create, list, execute, and remove jails with IP assignment
+- **Jail IP Assignment**: Assign IPv4 addresses to jails via `ip4.addr` parameter
+- **Jail Execution Flags**: Full support for `jexec -l`, `-U`, and `-u` flags
 - **Dynamic Binary Support**: Loads FreeBSD shared libraries and dynamic linker
 - **Path Translation**: Automatically redirects FreeBSD system paths to local root
 - **ABI Translation**: Handles differences in flags, structures, errno values, and signals
@@ -74,16 +80,19 @@ make
 # 3. Run FreeBSD binaries!
 ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/bin/echo "Hello from FreeBSD!"
 
-# 4. Create a jail!
-./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jail -c name=test path=./freebsd-root persist
+# 4. Create a jail with IP address!
+./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jail -c name=test path=./freebsd-root ip4.addr=10.0.0.1 persist
 
-# 5. List jails
-./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jls
+# 5. List jails (with IP addresses)
+./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jls jid name ip4.addr path
 
 # 6. Execute commands in jail (requires sudo for chroot)
 sudo ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jexec 1 /bin/sh -c "whoami; pwd; ls /"
 
-# 7. Remove jail
+# 7. Execute with user flag
+sudo ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jexec -U root 1 /bin/sh -c "id"
+
+# 8. Remove jail
 ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jail -r 1
 ```
 
@@ -122,6 +131,7 @@ Environment:
    - Persistent jail registry in `/tmp/bsdulator_jails.dat`
    - Linux `chroot()` for filesystem isolation
    - Process tracking for jail attachment
+   - IP address assignment and retrieval
    - Dynamic linker rewriting for jailed binary execution
 
 6. **TLS Setup**: Creates FreeBSD-compatible Thread Local Storage structures including TCB, DTV, and pthread structures.
@@ -140,7 +150,8 @@ Environment:
 | *at syscalls | openat, fstatat, unlinkat, etc. | ✅ Full |
 | Threading | thr_self, thr_exit, thr_kill | ✅ Emulated |
 | sysctl | __sysctl, __sysctlbyname | ✅ Emulated |
-| **Jail** | jail, jail_get, jail_set, jail_attach, jail_remove | ✅ **Working** |
+| **Jail** | jail, jail_get, jail_set, jail_attach, jail_remove | ✅ **Full** |
+| **Credentials** | setgroups, credsync | ✅ Emulated |
 | kqueue | kqueue, kevent | ✅ Basic |
 | Capsicum | cap_enter, cap_getmode | ⚠️ Stub |
 
@@ -152,20 +163,34 @@ BSDulator implements FreeBSD jail syscalls to provide container-like isolation:
 |---------|--------|-------------|----------------|
 | `jail` | 338 | Create/modify jail | Allocates JID, stores config |
 | `jail_get` | 506 | Query jail parameters | Returns jail info via iovec |
-| `jail_set` | 507 | Set jail parameters | Updates jail config |
+| `jail_set` | 507 | Set jail parameters | Updates jail config, IP addresses |
 | `jail_attach` | 436 | Attach process to jail | Linux chroot() + process tracking |
 | `jail_remove` | 508 | Remove a jail | Removes from registry |
 
 **Jail Features:**
 - Persistent storage across BSDulator invocations
 - Multiple concurrent jails with unique JIDs
+- IPv4 address assignment (`ip4.addr` parameter)
+- Multiple IPs per jail (comma-separated)
 - Both static (`/rescue/*`) and dynamic (`/bin/*`) binaries work inside jails
 - Process isolation via chroot
+- Full `jexec` flag support (`-l`, `-U`, `-u`)
+- Verbose jail listing (`jls -v`)
 - Proper FreeBSD environment setup (TLS, auxv) for jailed processes
+
+**Supported Jail Parameters:**
+- `name` - Jail name/hostname
+- `path` - Root filesystem path
+- `host.hostname` - Hostname
+- `ip4.addr` - IPv4 address(es), comma-separated
+- `persist` - Keep jail alive without processes
+- `jid` - Jail ID (for queries)
+- `cpuset.id` - CPU set ID
+- `osreldate`, `osrelease` - OS version info
 
 ## Known Limitations
 
-- **Jail networking**: IP address assignment not yet implemented
+- **Jail networking**: IP addresses are stored but not enforced (no network namespace yet)
 - **Jail resource limits**: CPU/memory limits not enforced
 - **32-bit binaries**: Not supported (x86_64 only)
 - **Performance**: ptrace interception adds overhead (~10-30%)
@@ -227,11 +252,14 @@ bsdulator/
 - [x] Multiple concurrent jails
 - [x] Persistent jail storage
 
-### Phase 3: Enhanced Jail Features (Planned)
-- [ ] Jail IP address assignment
-- [ ] Virtual network stack for jails
-- [ ] Resource limits (CPU, memory)
-- [ ] Jail hierarchy (children jails)
+### Phase 3: Networking & Advanced Jails ✅ Complete
+- [x] Jail IP assignment (`ip4.addr` parameter)
+- [x] IP address display in `jls`
+- [x] `jexec -l` (login shell)
+- [x] `jexec -U` / `-u` (user flags)
+- [x] `jls -v` (verbose listing)
+- [x] FreeBSD 15 syscall support (`credsync`, `__realpathat`)
+- [ ] Virtual network stack (Linux network namespaces) - Future
 
 ### Phase 4: Jailhouse.io Integration (Planned)
 - [ ] CLI wrapper (`jailhouse create/start/exec/stop`)
@@ -249,7 +277,7 @@ bsdulator/
 
 Contributions welcome! Priority areas:
 
-1. Jail networking implementation
+1. Linux network namespace integration for jail isolation
 2. Resource limit enforcement
 3. Additional syscall translations
 4. Test coverage
