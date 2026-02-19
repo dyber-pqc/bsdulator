@@ -1,0 +1,23 @@
+# Example Lochfile - Custom FreeBSD image
+# Similar to Dockerfile syntax
+
+FROM freebsd:15.0-minimal
+
+LABEL maintainer="zk@lochs.dev"
+LABEL version="1.0"
+
+# Set working directory
+WORKDIR /app
+
+# Copy application files
+COPY hello.sh /app/hello.sh
+
+# Set environment variables
+ENV APP_NAME=myapp
+ENV APP_VERSION=1.0
+
+# Expose port
+EXPOSE 8080
+
+# Default command
+CMD ["/bin/sh", "/app/hello.sh"]

@@ -28,6 +28,7 @@ OBJS = $(SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 LOCHS_SRCS = $(SRCDIR)/lochs/lochs_main.c \
              $(SRCDIR)/lochs/lochs_commands.c \
              $(SRCDIR)/lochs/lochs_images.c \
+             $(SRCDIR)/lochs/lochs_compose.c \
              $(SRCDIR)/lochs/lochfile_parser.c
 
 # Lochs CLI object files
@@ -77,8 +78,9 @@ $(OBJDIR)/jail/jail.o: $(SRCDIR)/jail/jail.c $(INCDIR)/bsdulator.h $(INCDIR)/bsd
 
 # Dependencies - Lochs CLI
 $(OBJDIR)/lochs/lochs_main.o: $(SRCDIR)/lochs/lochs_main.c $(INCDIR)/bsdulator/lochs.h
-$(OBJDIR)/lochs/lochs_commands.o: $(SRCDIR)/lochs/lochs_commands.c $(INCDIR)/bsdulator/lochs.h
+$(OBJDIR)/lochs/lochs_commands.o: $(SRCDIR)/lochs/lochs_commands.c $(INCDIR)/bsdulator/lochs.h $(SRCDIR)/lochs/lochs_compose.h
 $(OBJDIR)/lochs/lochs_images.o: $(SRCDIR)/lochs/lochs_images.c $(INCDIR)/bsdulator/lochs.h
+$(OBJDIR)/lochs/lochs_compose.o: $(SRCDIR)/lochs/lochs_compose.c $(SRCDIR)/lochs/lochs_compose.h $(INCDIR)/bsdulator/lochs.h
 $(OBJDIR)/lochs/lochfile_parser.o: $(SRCDIR)/lochs/lochfile_parser.c $(INCDIR)/bsdulator/lochs.h
 
 # Clean

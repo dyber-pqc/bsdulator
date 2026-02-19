@@ -24,7 +24,10 @@
 #include <getopt.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <stdint.h>
+#include <netinet/in.h>  /* For struct in_addr, in6_addr */
 #include "bsdulator/lochs.h"
+#include "lochs_compose.h"
 
 /* Global jail list */
 static lochs_jail_t jails[LOCHS_MAX_JAILS];
@@ -32,6 +35,106 @@ static int jail_count = 0;
 
 #define STATE_FILE "/var/lib/lochs/jails.dat"
 #define IMAGES_DIR "/var/lib/lochs/images"
+#define BSDULATOR_JAIL_STATE "/tmp/bsdulator_jails.dat"
+
+/* BSDulator jail state file format */
+#define JAIL_STATE_MAGIC 0x4A41494C  /* 'JAIL' */
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    int32_t  next_jid;
+    int32_t  jail_count;
+} bsd_jail_header_t;
+
+/*
+ * bsd_jail_t structure layout from jail.h - MUST match exactly!
+ * We need the full structure to read the state file correctly.
+ */
+typedef struct {
+    int             jid;                        /* Jail ID (1-based) */
+    int             parent_jid;                 /* Parent jail ID (0 = host) */
+    char            name[256];                  /* Jail name */
+    char            path[1024];                 /* Root path */
+    char            hostname[256];              /* Hostname */
+    char            domainname[256];            /* Domain name */
+    
+    /* IPv4 addresses */
+    int             ip4_count;
+    struct in_addr  ip4_addrs[16];
+    
+    /* IPv6 addresses */
+    int             ip6_count;
+    struct in6_addr ip6_addrs[16];
+    
+    /* Security settings */
+    int             securelevel;
+    int             devfs_ruleset;
+    int             enforce_statfs;
+    int             children_max;
+    int             children_cur;
+    
+    /* Allow flags */
+    int             allow_set_hostname;
+    int             allow_sysvipc;
+    int             allow_raw_sockets;
+    int             allow_chflags;
+    int             allow_mount;
+    int             allow_quotas;
+    int             allow_socket_af;
+    int             vnet;
+
+    /* State */
+    int             active;                     /* Is this slot in use? */
+    int             persist;
+    int             dying;
+    pid_t           creator_pid;
+    int             attached_count;
+    
+    /* Linux namespace FDs */
+    int             ns_pid;
+    int             ns_mnt;
+    int             ns_uts;
+    int             ns_net;
+    int             ns_user;
+    int             ns_ipc;
+} bsd_jail_entry_t;
+
+/*
+ * Read the actual JID from BSDulator's jail state file.
+ * Returns the JID if found, -1 if not found.
+ */
+static int get_bsdulator_jid(const char *jail_name) {
+    FILE *f = fopen(BSDULATOR_JAIL_STATE, "rb");
+    if (!f) return -1;
+    
+    bsd_jail_header_t header;
+    if (fread(&header, sizeof(header), 1, f) != 1) {
+        fclose(f);
+        return -1;
+    }
+    
+    if (header.magic != JAIL_STATE_MAGIC) {
+        fclose(f);
+        return -1;
+    }
+    
+    /* Read each jail entry looking for our name */
+    for (int i = 0; i < header.jail_count; i++) {
+        bsd_jail_entry_t entry;
+        if (fread(&entry, sizeof(entry), 1, f) != 1) {
+            break;
+        }
+        
+        if (entry.active && strcmp(entry.name, jail_name) == 0) {
+            fclose(f);
+            return entry.jid;
+        }
+    }
+    
+    fclose(f);
+    return -1;
+}
 
 /* Helper to safely copy strings */
 static void safe_strcpy(char *dst, const char *src, size_t dst_size) {
@@ -49,7 +152,7 @@ static int file_exists(const char *path) {
 }
 
 /*
- * lochs create <name> [options]
+ * lochs create <n> [options]
  */
 int lochs_cmd_create(int argc, char **argv) {
     char *name = NULL;
@@ -77,7 +180,7 @@ int lochs_cmd_create(int argc, char **argv) {
             case 'p': path = optarg; break;
             case 'n': vnet = 1; break;
             case 'h':
-                printf("Usage: lochs create <name> [options]\n\n");
+                printf("Usage: lochs create <n> [options]\n\n");
                 printf("Options:\n");
                 printf("  -i, --image <image>   Base image (default: freebsd:15)\n");
                 printf("  -I, --ip <addr>       IPv4 address for jail\n");
@@ -91,7 +194,7 @@ int lochs_cmd_create(int argc, char **argv) {
     
     if (optind >= argc) {
         fprintf(stderr, "Error: container name required\n");
-        fprintf(stderr, "Usage: lochs create <name> [options]\n");
+        fprintf(stderr, "Usage: lochs create <n> [options]\n");
         return 1;
     }
     
@@ -159,13 +262,13 @@ int lochs_cmd_create(int argc, char **argv) {
 }
 
 /*
- * lochs start <name>
+ * lochs start <n>
  * 
  * Starts a FreeBSD jail using the jail binary from the container's image.
  */
 int lochs_cmd_start(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: lochs start <name>\n");
+        fprintf(stderr, "Usage: lochs start <n>\n");
         return 1;
     }
     
@@ -223,23 +326,33 @@ int lochs_cmd_start(int argc, char **argv) {
         return 1;
     }
     
-    /* Mark as running - jail command succeeded if we got here without crash */
+    /* Get the actual JID from BSDulator's jail state */
+    int actual_jid = get_bsdulator_jid(jail->name);
+    if (actual_jid > 0) {
+        jail->jid = actual_jid;
+    } else {
+        /* Fallback - jail may have been created but we can't read the JID */
+        jail->jid = 1;
+    }
+    
     jail->state = JAIL_STATE_RUNNING;
     jail->started_at = time(NULL);
-    jail->jid = 1;  /* TODO: parse actual JID from output */
     printf("Container '%s' started (jid=%d)\n", name, jail->jid);
+    
+    /* Save state with updated JID */
+    lochs_state_save();
     
     return 0;
 }
 
 /*
- * lochs stop <name>
+ * lochs stop <n>
  * 
  * Stops a FreeBSD jail using jail -r.
  */
 int lochs_cmd_stop(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: lochs stop <name>\n");
+        fprintf(stderr, "Usage: lochs stop <n>\n");
         return 1;
     }
     
@@ -279,11 +392,14 @@ int lochs_cmd_stop(int argc, char **argv) {
         fprintf(stderr, "Warning: jail -r returned error, but marking as stopped\n");
     }
     
+    /* Save state */
+    lochs_state_save();
+    
     return 0;
 }
 
 /*
- * lochs rm [-f] <name>
+ * lochs rm [-f] <n>
  */
 int lochs_cmd_rm(int argc, char **argv) {
     int force = 0;
@@ -295,7 +411,7 @@ int lochs_cmd_rm(int argc, char **argv) {
     }
     
     if (idx >= argc) {
-        fprintf(stderr, "Usage: lochs rm [-f] <name>\n");
+        fprintf(stderr, "Usage: lochs rm [-f] <n>\n");
         return 1;
     }
     
@@ -320,6 +436,7 @@ int lochs_cmd_rm(int argc, char **argv) {
     
     if (lochs_jail_remove(name) == 0) {
         printf("Removed container '%s'\n", name);
+        lochs_state_save();
     } else {
         fprintf(stderr, "Failed to remove container '%s'\n", name);
         return 1;
@@ -329,13 +446,13 @@ int lochs_cmd_rm(int argc, char **argv) {
 }
 
 /*
- * lochs exec <name> <command...>
+ * lochs exec <n> <command...>
  * 
  * Execute a command in a running jail using jexec from the container image.
  */
 int lochs_cmd_exec(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: lochs exec <name> <command> [args...]\n");
+        fprintf(stderr, "Usage: lochs exec <n> <command> [args...]\n");
         return 1;
     }
     
@@ -375,9 +492,31 @@ int lochs_cmd_exec(int argc, char **argv) {
 
 /*
  * lochs ps - List containers
+ * 
+ * Syncs state with BSDulator's jail state to show accurate JIDs and status.
  */
 int lochs_cmd_ps(int argc, char **argv) {
     (void)argc; (void)argv;
+    
+    /* Sync JIDs with BSDulator state */
+    int state_changed = 0;
+    for (int i = 0; i < jail_count; i++) {
+        lochs_jail_t *j = &jails[i];
+        if (j->state == JAIL_STATE_RUNNING) {
+            int actual_jid = get_bsdulator_jid(j->name);
+            if (actual_jid > 0) {
+                if (j->jid != actual_jid) {
+                    j->jid = actual_jid;
+                    state_changed = 1;
+                }
+            } else {
+                /* Jail no longer exists in BSDulator - mark as stopped */
+                j->state = JAIL_STATE_STOPPED;
+                j->jid = -1;
+                state_changed = 1;
+            }
+        }
+    }
     
     printf("%-15s %-6s %-20s %-15s %s\n", 
            "NAME", "JID", "IMAGE", "STATUS", "PATH");
@@ -395,16 +534,28 @@ int lochs_cmd_ps(int argc, char **argv) {
             default: state_str = "unknown"; break;
         }
         
-        printf("%-15s %-6d %-20s %-15s %s\n",
+        char jid_str[16];
+        if (j->jid > 0) {
+            snprintf(jid_str, sizeof(jid_str), "%d", j->jid);
+        } else {
+            strcpy(jid_str, "-");
+        }
+        
+        printf("%-15s %-6s %-20s %-15s %s\n",
                j->name,
-               j->jid > 0 ? j->jid : 0,
+               jid_str,
                j->image,
                state_str,
                j->path);
     }
     
     if (jail_count == 0) {
-        printf("No containers. Run 'lochs create <name>' to create one.\n");
+        printf("No containers. Run 'lochs create <n>' to create one.\n");
+    }
+    
+    /* Save state if anything changed */
+    if (state_changed) {
+        lochs_state_save();
     }
     
     return 0;
@@ -478,6 +629,7 @@ lochs_jail_t *lochs_jail_find(const char *name) {
 int lochs_jail_add(lochs_jail_t *jail) {
     if (jail_count >= LOCHS_MAX_JAILS) return -1;
     memcpy(&jails[jail_count++], jail, sizeof(lochs_jail_t));
+    lochs_state_save();
     return 0;
 }
 
@@ -575,10 +727,73 @@ int lochs_cmd_rmi(int argc, char **argv) {
 }
 
 /*
- * lochs compose (stub)
+ * lochs compose - Multi-container orchestration
+ * 
+ * Usage:
+ *   lochs compose up [-d]     Start all services
+ *   lochs compose down        Stop all services
+ *   lochs compose ps          List services
+ *   lochs compose exec <svc>  Execute command in service
  */
 int lochs_cmd_compose(int argc, char **argv) {
-    (void)argc; (void)argv;
-    printf("lochs compose not yet implemented\n");
-    return 1;
+    if (argc < 2) {
+        printf("Usage: lochs compose <command> [options]\n\n");
+        printf("Commands:\n");
+        printf("  up [-d]              Start all services\n");
+        printf("  down                 Stop and remove all services\n");
+        printf("  ps                   List services\n");
+        printf("  exec <service> <cmd> Execute command in service\n");
+        printf("\nOptions:\n");
+        printf("  -f, --file <file>    Compose file (default: lochs.yml)\n");
+        return 1;
+    }
+    
+    const char *compose_file = "lochs.yml";
+    const char *command = argv[1];
+    int cmd_arg_start = 2;
+    
+    /* Check for -f flag */
+    if (argc >= 4 && (strcmp(argv[1], "-f") == 0 || strcmp(argv[1], "--file") == 0)) {
+        compose_file = argv[2];
+        command = argv[3];
+        cmd_arg_start = 4;
+    }
+    
+    /* Parse compose file */
+    compose_file_t compose;
+    if (compose_parse_file(compose_file, &compose) != 0) {
+        return 1;
+    }
+    
+    int ret = 0;
+    
+    if (strcmp(command, "up") == 0) {
+        int detach = 0;
+        if (cmd_arg_start < argc && strcmp(argv[cmd_arg_start], "-d") == 0) {
+            detach = 1;
+        }
+        ret = compose_up(&compose, detach);
+    } else if (strcmp(command, "down") == 0) {
+        ret = compose_down(&compose);
+    } else if (strcmp(command, "ps") == 0) {
+        ret = compose_ps(&compose);
+    } else if (strcmp(command, "exec") == 0) {
+        if (cmd_arg_start >= argc) {
+            fprintf(stderr, "Usage: lochs compose exec <service> <command>\n");
+            ret = 1;
+        } else {
+            const char *service = argv[cmd_arg_start];
+            ret = compose_exec(&compose, service, argc - cmd_arg_start - 1, 
+                              &argv[cmd_arg_start + 1]);
+        }
+    } else if (strcmp(command, "logs") == 0) {
+        const char *service = (cmd_arg_start < argc) ? argv[cmd_arg_start] : NULL;
+        ret = compose_logs(&compose, service);
+    } else {
+        fprintf(stderr, "Unknown compose command: %s\n", command);
+        ret = 1;
+    }
+    
+    compose_free(&compose);
+    return ret;
 }

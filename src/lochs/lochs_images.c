@@ -602,3 +602,43 @@ int lochs_image_search(const char *query) {
     
     return 0;
 }
+
+/*
+ * Register a locally built image
+ */
+int lochs_image_register(const char *name, const char *tag, const char *image_id) {
+    lochs_images_load();
+    
+    /* Check if already exists */
+    lochs_image_t *existing = find_local_image(name, tag);
+    if (existing) {
+        /* Update existing entry */
+        safe_strcpy(existing->id, image_id, sizeof(existing->id));
+        snprintf(existing->path, sizeof(existing->path), 
+                 "%s/%s", LOCHS_IMAGES_DIR, image_id);
+        existing->size = get_dir_size(existing->path);
+        existing->created = time(NULL);
+        existing->pulled = time(NULL);
+        lochs_images_save();
+        return 0;
+    }
+    
+    /* Add new entry */
+    if (local_image_count >= 128) {
+        fprintf(stderr, "Error: Too many local images\n");
+        return -1;
+    }
+    
+    lochs_image_t *img = &local_images[local_image_count++];
+    memset(img, 0, sizeof(*img));
+    safe_strcpy(img->repository, name, sizeof(img->repository));
+    safe_strcpy(img->tag, tag, sizeof(img->tag));
+    safe_strcpy(img->id, image_id, sizeof(img->id));
+    snprintf(img->path, sizeof(img->path), "%s/%s", LOCHS_IMAGES_DIR, image_id);
+    img->size = get_dir_size(img->path);
+    img->created = time(NULL);
+    img->pulled = time(NULL);
+    
+    lochs_images_save();
+    return 0;
+}

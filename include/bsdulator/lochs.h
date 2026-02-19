@@ -100,6 +100,7 @@ int lochs_image_list_local(void);
 int lochs_image_remove(const char *image_name);
 int lochs_image_search(const char *query);
 char *lochs_image_get_path(const char *image_name);
+int lochs_image_register(const char *name, const char *tag, const char *image_id);
 
 /* Lochfile build (lochfile_parser.c) */
 int lochs_build_from_lochfile(const char *lochfile, const char *context, const char *tag);

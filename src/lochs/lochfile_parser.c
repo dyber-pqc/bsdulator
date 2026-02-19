@@ -2,6 +2,18 @@
  * Lochfile Parser
  * 
  * Parses Dockerfile-like Lochfile format for building jail images.
+ * 
+ * Supported directives:
+ *   FROM <image>           - Base image (required)
+ *   RUN <command>          - Run command in jail during build
+ *   COPY <src> <dst>       - Copy files from build context
+ *   ENV <key>=<value>      - Set environment variable
+ *   WORKDIR <path>         - Set working directory
+ *   USER <user>            - Set user
+ *   EXPOSE <port>          - Document exposed ports
+ *   ENTRYPOINT [...]       - Default entrypoint
+ *   CMD [...]              - Default command
+ *   LABEL <key>=<value>    - Add metadata label
  */
 
 #define _GNU_SOURCE
@@ -13,11 +25,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
+#include <dirent.h>
 
 #include "bsdulator/lochs.h"
-
-/* Helper to suppress unused result warnings */
-#define IGNORE_RESULT(x) do { if (x) {} } while(0)
 
 /* Safe string copy */
 static void safe_strcpy(char *dst, const char *src, size_t dst_size) {
@@ -30,47 +41,45 @@ static void safe_strcpy(char *dst, const char *src, size_t dst_size) {
 
 /* Build context */
 typedef struct {
-    char base_image[64];
-    char name[64];
-    char hostname[64];
-    char ip[32];
-    int vnet;
+    char base_image[128];
+    char tag[128];
     char workdir[256];
-    char user[32];
+    char user[64];
     
     /* Build steps */
-    char *packages[64];
-    int package_count;
-    
     struct {
-        char src[256];
-        char dst[256];
-    } copies[32];
+        char src[512];
+        char dst[512];
+    } copies[64];
     int copy_count;
     
-    char *run_commands[64];
+    char *run_commands[128];
     int run_count;
     
     struct {
         char key[64];
         char value[256];
-    } env[32];
+    } env[64];
     int env_count;
+    
+    struct {
+        char key[64];
+        char value[256];
+    } labels[32];
+    int label_count;
     
     int expose_ports[32];
     int expose_count;
     
-    char *entrypoint[16];
-    int entrypoint_count;
-    
-    char *cmd[16];
-    int cmd_count;
+    char entrypoint[1024];
+    char cmd[1024];
     
     /* Build context directory */
-    char context_dir[256];
+    char context_dir[512];
     
-    /* Output image path */
-    char output_path[256];
+    /* Build directory */
+    char build_dir[512];
+    
 } lochfile_context_t;
 
 /*
@@ -88,43 +97,11 @@ static char *trim(char *str) {
 }
 
 /*
- * Parse a JSON-style array: ["arg1", "arg2", ...]
+ * Generate short hash for image ID
  */
-static int parse_json_array(const char *str, char **out, int max_items) {
-    int count = 0;
-    const char *p = str;
-    
-    /* Skip to opening bracket */
-    while (*p && *p != '[') p++;
-    if (*p != '[') return 0;
-    p++;
-    
-    char buffer[1024];
-    int in_string = 0;
-    int buf_pos = 0;
-    
-    while (*p && *p != ']' && count < max_items) {
-        if (*p == '"') {
-            if (in_string) {
-                buffer[buf_pos] = '\0';
-                out[count++] = strdup(buffer);
-                buf_pos = 0;
-                in_string = 0;
-            } else {
-                in_string = 1;
-            }
-        } else if (in_string) {
-            if (*p == '\\' && *(p+1)) {
-                p++;
-                buffer[buf_pos++] = *p;
-            } else {
-                buffer[buf_pos++] = *p;
-            }
-        }
-        p++;
-    }
-    
-    return count;
+static void generate_hash(char *out, size_t out_size) {
+    unsigned long hash = (unsigned long)time(NULL) ^ (unsigned long)getpid();
+    snprintf(out, out_size, "%08lx%04x", hash, (unsigned)(rand() & 0xFFFF));
 }
 
 /*
@@ -157,34 +134,17 @@ static int parse_line(lochfile_context_t *ctx, const char *line, int line_num) {
     if (strcmp(directive, "FROM") == 0) {
         safe_strcpy(ctx->base_image, args, sizeof(ctx->base_image));
     }
-    else if (strcmp(directive, "NAME") == 0) {
-        safe_strcpy(ctx->name, args, sizeof(ctx->name));
-    }
-    else if (strcmp(directive, "HOSTNAME") == 0) {
-        safe_strcpy(ctx->hostname, args, sizeof(ctx->hostname));
-    }
-    else if (strcmp(directive, "IP") == 0) {
-        safe_strcpy(ctx->ip, args, sizeof(ctx->ip));
-    }
-    else if (strcmp(directive, "VNET") == 0) {
-        ctx->vnet = 1;
-    }
-    else if (strcmp(directive, "PKG") == 0) {
-        char *pkg_list = strdup(args);
-        char *saveptr;
-        char *token = strtok_r(pkg_list, " \t", &saveptr);
-        while (token && ctx->package_count < 64) {
-            ctx->packages[ctx->package_count++] = strdup(token);
-            token = strtok_r(NULL, " \t", &saveptr);
-        }
-        free(pkg_list);
-    }
-    else if (strcmp(directive, "COPY") == 0) {
-        if (ctx->copy_count < 32) {
-            char src[256] = {0}, dst[256] = {0};
-            if (sscanf(args, "%255s %255s", src, dst) == 2) {
+    else if (strcmp(directive, "COPY") == 0 || strcmp(directive, "ADD") == 0) {
+        if (ctx->copy_count < 64) {
+            char src[512] = {0}, dst[512] = {0};
+            if (sscanf(args, "%511s %511s", src, dst) >= 1) {
                 safe_strcpy(ctx->copies[ctx->copy_count].src, src, sizeof(ctx->copies[0].src));
-                safe_strcpy(ctx->copies[ctx->copy_count].dst, dst, sizeof(ctx->copies[0].dst));
+                /* If no dest, use same as source */
+                if (dst[0]) {
+                    safe_strcpy(ctx->copies[ctx->copy_count].dst, dst, sizeof(ctx->copies[0].dst));
+                } else {
+                    safe_strcpy(ctx->copies[ctx->copy_count].dst, src, sizeof(ctx->copies[0].dst));
+                }
                 ctx->copy_count++;
             } else {
                 fprintf(stderr, "Lochfile:%d: Invalid COPY syntax\n", line_num);
@@ -192,12 +152,13 @@ static int parse_line(lochfile_context_t *ctx, const char *line, int line_num) {
         }
     }
     else if (strcmp(directive, "RUN") == 0) {
-        if (ctx->run_count < 64) {
+        if (ctx->run_count < 128) {
             ctx->run_commands[ctx->run_count++] = strdup(args);
         }
     }
     else if (strcmp(directive, "ENV") == 0) {
-        if (ctx->env_count < 32) {
+        if (ctx->env_count < 64) {
+            /* Handle both "ENV KEY=value" and "ENV KEY value" */
             char *eq = strchr(args, '=');
             if (eq) {
                 size_t key_len = (size_t)(eq - args);
@@ -205,7 +166,34 @@ static int parse_line(lochfile_context_t *ctx, const char *line, int line_num) {
                 memcpy(ctx->env[ctx->env_count].key, args, key_len);
                 ctx->env[ctx->env_count].key[key_len] = '\0';
                 safe_strcpy(ctx->env[ctx->env_count].value, eq + 1, sizeof(ctx->env[0].value));
-                ctx->env_count++;
+            } else {
+                /* "ENV KEY value" format */
+                char key[64], value[256];
+                if (sscanf(args, "%63s %255[^\n]", key, value) == 2) {
+                    safe_strcpy(ctx->env[ctx->env_count].key, key, sizeof(ctx->env[0].key));
+                    safe_strcpy(ctx->env[ctx->env_count].value, value, sizeof(ctx->env[0].value));
+                }
+            }
+            ctx->env_count++;
+        }
+    }
+    else if (strcmp(directive, "LABEL") == 0) {
+        if (ctx->label_count < 32) {
+            char *eq = strchr(args, '=');
+            if (eq) {
+                size_t key_len = (size_t)(eq - args);
+                if (key_len > 63) key_len = 63;
+                memcpy(ctx->labels[ctx->label_count].key, args, key_len);
+                ctx->labels[ctx->label_count].key[key_len] = '\0';
+                /* Remove quotes from value */
+                const char *val = eq + 1;
+                if (*val == '"') val++;
+                safe_strcpy(ctx->labels[ctx->label_count].value, val, sizeof(ctx->labels[0].value));
+                size_t vlen = strlen(ctx->labels[ctx->label_count].value);
+                if (vlen > 0 && ctx->labels[ctx->label_count].value[vlen-1] == '"') {
+                    ctx->labels[ctx->label_count].value[vlen-1] = '\0';
+                }
+                ctx->label_count++;
             }
         }
     }
@@ -229,10 +217,28 @@ static int parse_line(lochfile_context_t *ctx, const char *line, int line_num) {
         safe_strcpy(ctx->user, args, sizeof(ctx->user));
     }
     else if (strcmp(directive, "ENTRYPOINT") == 0) {
-        ctx->entrypoint_count = parse_json_array(args, ctx->entrypoint, 16);
+        safe_strcpy(ctx->entrypoint, args, sizeof(ctx->entrypoint));
     }
     else if (strcmp(directive, "CMD") == 0) {
-        ctx->cmd_count = parse_json_array(args, ctx->cmd, 16);
+        safe_strcpy(ctx->cmd, args, sizeof(ctx->cmd));
+    }
+    else if (strcmp(directive, "MAINTAINER") == 0) {
+        /* Deprecated but supported - convert to label */
+        if (ctx->label_count < 32) {
+            strcpy(ctx->labels[ctx->label_count].key, "maintainer");
+            safe_strcpy(ctx->labels[ctx->label_count].value, args, sizeof(ctx->labels[0].value));
+            ctx->label_count++;
+        }
+    }
+    else if (strcmp(directive, "VOLUME") == 0 ||
+             strcmp(directive, "ARG") == 0 ||
+             strcmp(directive, "SHELL") == 0 ||
+             strcmp(directive, "STOPSIGNAL") == 0 ||
+             strcmp(directive, "HEALTHCHECK") == 0 ||
+             strcmp(directive, "ONBUILD") == 0) {
+        /* Recognized but not implemented - just warn */
+        fprintf(stderr, "Lochfile:%d: Warning: %s not yet implemented, skipping\n", 
+                line_num, directive);
     }
     else {
         fprintf(stderr, "Lochfile:%d: Unknown directive '%s'\n", line_num, directive);
@@ -267,11 +273,13 @@ static int lochfile_parse(const char *path, lochfile_context_t *ctx) {
         /* Remove trailing newline */
         size_t len = strlen(line);
         if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
+        if (len > 1 && line[len-2] == '\r') line[len-2] = '\0';
         
         /* Handle line continuation */
-        while (len > 1 && line[len-2] == '\\') {
-            line[len-2] = ' ';
-            if (!fgets(line + len - 1, (int)(sizeof(line) - len + 1), f)) break;
+        len = strlen(line);
+        while (len > 0 && line[len-1] == '\\') {
+            line[len-1] = ' ';
+            if (!fgets(line + len, (int)(sizeof(line) - len), f)) break;
             len = strlen(line);
             if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
             line_num++;
@@ -297,78 +305,82 @@ static int lochfile_parse(const char *path, lochfile_context_t *ctx) {
  * Free lochfile context
  */
 static void lochfile_free(lochfile_context_t *ctx) {
-    for (int i = 0; i < ctx->package_count; i++) {
-        free(ctx->packages[i]);
-    }
     for (int i = 0; i < ctx->run_count; i++) {
         free(ctx->run_commands[i]);
     }
-    for (int i = 0; i < ctx->entrypoint_count; i++) {
-        free(ctx->entrypoint[i]);
-    }
-    for (int i = 0; i < ctx->cmd_count; i++) {
-        free(ctx->cmd[i]);
-    }
+}
+
+/*
+ * Execute a command in the build jail using BSDulator
+ */
+static int run_in_jail(const char *build_dir, const char *command) {
+    char cmd[4096];
+    
+    /* Use BSDulator to run FreeBSD command in the build directory */
+    snprintf(cmd, sizeof(cmd),
+        "./bsdulator -t %s/libexec/ld-elf.so.1 %s/bin/sh -c '%s'",
+        build_dir, build_dir, command);
+    
+    return system(cmd);
 }
 
 /*
  * Build image from Lochfile
  */
-static int lochfile_build(const char *lochfile_path, const char *context_dir, const char *tag) {
+int lochs_build_from_lochfile(const char *lochfile_path, const char *context_dir, const char *tag) {
     lochfile_context_t ctx;
+    int ret;
     
-    printf("Building from %s...\n", lochfile_path);
+    printf("\033[1m=== Building image from %s ===\033[0m\n\n", lochfile_path);
     
+    /* Parse Lochfile */
     if (lochfile_parse(lochfile_path, &ctx) != 0) {
         return -1;
     }
     
     safe_strcpy(ctx.context_dir, context_dir, sizeof(ctx.context_dir));
-    
-    printf("\n");
-    printf("  FROM:       %s\n", ctx.base_image);
-    if (ctx.name[0]) printf("  NAME:       %s\n", ctx.name);
-    if (ctx.hostname[0]) printf("  HOSTNAME:   %s\n", ctx.hostname);
-    if (ctx.ip[0]) printf("  IP:         %s\n", ctx.ip);
-    if (ctx.vnet) printf("  VNET:       enabled\n");
-    if (ctx.package_count > 0) {
-        printf("  PACKAGES:   ");
-        for (int i = 0; i < ctx.package_count; i++) {
-            printf("%s ", ctx.packages[i]);
-        }
-        printf("\n");
+    if (tag) {
+        safe_strcpy(ctx.tag, tag, sizeof(ctx.tag));
     }
+    
+    /* Show build plan */
+    printf("Build plan:\n");
+    printf("  Base image: %s\n", ctx.base_image);
     printf("  COPY steps: %d\n", ctx.copy_count);
     printf("  RUN steps:  %d\n", ctx.run_count);
+    printf("  ENV vars:   %d\n", ctx.env_count);
+    if (tag) printf("  Tag:        %s\n", tag);
     printf("\n");
     
     /* Step 1: Get base image */
-    printf("Step 1: Resolving base image %s\n", ctx.base_image);
+    printf("\033[1mStep 1/6: Resolving base image\033[0m\n");
     
     char *base_path = lochs_image_get_path(ctx.base_image);
     if (!base_path) {
         printf("  Base image not found locally, pulling...\n");
         if (lochs_image_pull(ctx.base_image) != 0) {
+            fprintf(stderr, "Error: Failed to pull base image '%s'\n", ctx.base_image);
             lochfile_free(&ctx);
             return -1;
         }
         base_path = lochs_image_get_path(ctx.base_image);
         if (!base_path) {
-            fprintf(stderr, "Error: Failed to get base image path\n");
+            fprintf(stderr, "Error: Failed to resolve base image path\n");
             lochfile_free(&ctx);
             return -1;
         }
     }
-    printf("  Using base: %s\n", base_path);
+    printf("  ✓ Using: %s\n\n", base_path);
     
-    /* Step 2: Create build directory - use short names */
-    char build_dir[128];
-    snprintf(build_dir, sizeof(build_dir), "/var/lib/lochs/build/b%ld", (long)time(NULL));
+    /* Step 2: Create build directory */
+    printf("\033[1mStep 2/6: Creating build environment\033[0m\n");
     
-    printf("\nStep 2: Creating build directory %s\n", build_dir);
+    char image_id[20];
+    generate_hash(image_id, sizeof(image_id));
+    snprintf(ctx.build_dir, sizeof(ctx.build_dir), "/var/lib/lochs/images/%s", image_id);
     
     char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", build_dir);
+    snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", ctx.build_dir);
     if (system(cmd) != 0) {
         fprintf(stderr, "Error: Failed to create build directory\n");
         free(base_path);
@@ -378,83 +390,123 @@ static int lochfile_build(const char *lochfile_path, const char *context_dir, co
     
     /* Copy base image */
     printf("  Copying base image...\n");
-    snprintf(cmd, sizeof(cmd), "cp -a '%s'/. '%s'/ 2>/dev/null || true", base_path, build_dir);
-    IGNORE_RESULT(system(cmd));
+    snprintf(cmd, sizeof(cmd), "cp -a '%s'/. '%s'/ 2>/dev/null", base_path, ctx.build_dir);
+    ret = system(cmd);
+    (void)ret;
     free(base_path);
+    printf("  ✓ Build directory: %s\n\n", ctx.build_dir);
     
     /* Step 3: Process COPY directives */
-    if (ctx.copy_count > 0) {
-        printf("\nStep 3: Copying files\n");
-        for (int i = 0; i < ctx.copy_count; i++) {
-            char src_path[512];
-            char dst_path[512];
-            
-            /* Resolve source relative to context */
-            if (ctx.copies[i].src[0] == '/') {
-                safe_strcpy(src_path, ctx.copies[i].src, sizeof(src_path));
-            } else {
-                snprintf(src_path, sizeof(src_path), "%s/%s", context_dir, ctx.copies[i].src);
-            }
-            
-            snprintf(dst_path, sizeof(dst_path), "%s%s", build_dir, ctx.copies[i].dst);
-            
-            printf("  COPY %s -> %s\n", ctx.copies[i].src, ctx.copies[i].dst);
-            
-            /* Create parent directory */
-            char *last_slash = strrchr(dst_path, '/');
-            if (last_slash) {
-                *last_slash = '\0';
-                snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", dst_path);
-                IGNORE_RESULT(system(cmd));
-                *last_slash = '/';
-            }
-            
+    printf("\033[1mStep 3/6: Copying files\033[0m\n");
+    if (ctx.copy_count == 0) {
+        printf("  (no files to copy)\n");
+    }
+    for (int i = 0; i < ctx.copy_count; i++) {
+        char src_path[1024];
+        char dst_path[1024];
+        
+        /* Resolve source relative to context */
+        if (ctx.copies[i].src[0] == '/') {
+            safe_strcpy(src_path, ctx.copies[i].src, sizeof(src_path));
+        } else {
+            snprintf(src_path, sizeof(src_path), "%s/%s", context_dir, ctx.copies[i].src);
+        }
+        
+        /* Resolve destination in build dir */
+        if (ctx.copies[i].dst[0] == '/') {
+            snprintf(dst_path, sizeof(dst_path), "%s%s", ctx.build_dir, ctx.copies[i].dst);
+        } else {
+            snprintf(dst_path, sizeof(dst_path), "%s/%s", ctx.build_dir, ctx.copies[i].dst);
+        }
+        
+        printf("  COPY %s -> %s\n", ctx.copies[i].src, ctx.copies[i].dst);
+        
+        /* Create parent directory */
+        char *last_slash = strrchr(dst_path, '/');
+        if (last_slash && last_slash != dst_path) {
+            *last_slash = '\0';
+            snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", dst_path);
+            ret = system(cmd);
+            (void)ret;
+            *last_slash = '/';
+        }
+        
+        /* Check if source exists */
+        struct stat st;
+        if (stat(src_path, &st) != 0) {
+            fprintf(stderr, "  ✗ Source not found: %s\n", src_path);
+            continue;
+        }
+        
+        /* Copy file or directory */
+        if (S_ISDIR(st.st_mode)) {
+            snprintf(cmd, sizeof(cmd), "cp -a '%s'/. '%s'/ 2>/dev/null", src_path, dst_path);
+        } else {
             snprintf(cmd, sizeof(cmd), "cp -a '%s' '%s'", src_path, dst_path);
-            if (system(cmd) != 0) {
-                fprintf(stderr, "  Warning: Failed to copy %s\n", src_path);
-            }
+        }
+        
+        if (system(cmd) == 0) {
+            printf("  ✓ Copied\n");
+        } else {
+            fprintf(stderr, "  ✗ Failed to copy\n");
         }
     }
+    printf("\n");
     
     /* Step 4: Process RUN directives */
-    if (ctx.run_count > 0) {
-        printf("\nStep 4: Running build commands\n");
-        for (int i = 0; i < ctx.run_count; i++) {
-            printf("  RUN %s\n", ctx.run_commands[i]);
-            
-            /* Run command in chroot */
-            snprintf(cmd, sizeof(cmd), 
-                "chroot '%s' /bin/sh -c '%s' 2>&1 || echo '  (command may have failed)'",
-                build_dir, ctx.run_commands[i]);
-            IGNORE_RESULT(system(cmd));
+    printf("\033[1mStep 4/6: Running build commands\033[0m\n");
+    if (ctx.run_count == 0) {
+        printf("  (no commands to run)\n");
+    }
+    for (int i = 0; i < ctx.run_count; i++) {
+        printf("  RUN %s\n", ctx.run_commands[i]);
+        
+        /* Run command using BSDulator */
+        ret = run_in_jail(ctx.build_dir, ctx.run_commands[i]);
+        if (ret == 0) {
+            printf("  ✓ Success\n");
+        } else {
+            printf("  ⚠ Command returned %d (continuing)\n", ret);
         }
     }
+    printf("\n");
     
-    /* Step 5: Create jail metadata */
-    printf("\nStep 5: Creating jail configuration\n");
+    /* Step 5: Create image metadata */
+    printf("\033[1mStep 5/6: Creating image metadata\033[0m\n");
     
-    char meta_path[160];
-    snprintf(meta_path, sizeof(meta_path), "%s/.lochs.conf", build_dir);
+    char meta_path[600];
+    snprintf(meta_path, sizeof(meta_path), "%s/.lochs_image.conf", ctx.build_dir);
     
     FILE *meta = fopen(meta_path, "w");
     if (meta) {
-        fprintf(meta, "# Lochs jail configuration\n");
-        fprintf(meta, "# Built from Lochfile\n\n");
-        if (ctx.name[0]) fprintf(meta, "name=%s\n", ctx.name);
-        if (ctx.hostname[0]) fprintf(meta, "hostname=%s\n", ctx.hostname);
-        if (ctx.ip[0]) fprintf(meta, "ip=%s\n", ctx.ip);
-        if (ctx.vnet) fprintf(meta, "vnet=1\n");
-        if (ctx.workdir[0]) fprintf(meta, "workdir=%s\n", ctx.workdir);
-        if (ctx.user[0]) fprintf(meta, "user=%s\n", ctx.user);
+        fprintf(meta, "# Lochs image configuration\n");
+        fprintf(meta, "# Built: %s\n", ctime(&(time_t){time(NULL)}));
+        fprintf(meta, "base=%s\n", ctx.base_image);
         
-        if (ctx.entrypoint_count > 0) {
-            fprintf(meta, "entrypoint=");
-            for (int i = 0; i < ctx.entrypoint_count; i++) {
-                fprintf(meta, "%s%s", i > 0 ? " " : "", ctx.entrypoint[i]);
-            }
-            fprintf(meta, "\n");
+        if (ctx.workdir[0] && strcmp(ctx.workdir, "/") != 0) {
+            fprintf(meta, "workdir=%s\n", ctx.workdir);
+        }
+        if (ctx.user[0]) {
+            fprintf(meta, "user=%s\n", ctx.user);
+        }
+        if (ctx.entrypoint[0]) {
+            fprintf(meta, "entrypoint=%s\n", ctx.entrypoint);
+        }
+        if (ctx.cmd[0]) {
+            fprintf(meta, "cmd=%s\n", ctx.cmd);
         }
         
+        /* Environment */
+        for (int i = 0; i < ctx.env_count; i++) {
+            fprintf(meta, "env.%s=%s\n", ctx.env[i].key, ctx.env[i].value);
+        }
+        
+        /* Labels */
+        for (int i = 0; i < ctx.label_count; i++) {
+            fprintf(meta, "label.%s=%s\n", ctx.labels[i].key, ctx.labels[i].value);
+        }
+        
+        /* Exposed ports */
         if (ctx.expose_count > 0) {
             fprintf(meta, "expose=");
             for (int i = 0; i < ctx.expose_count; i++) {
@@ -464,43 +516,47 @@ static int lochfile_build(const char *lochfile_path, const char *context_dir, co
         }
         
         fclose(meta);
+        printf("  ✓ Created .lochs_image.conf\n");
     }
+    printf("\n");
     
-    /* Step 6: Save as image */
-    printf("\nStep 6: Saving image\n");
+    /* Step 6: Register image */
+    printf("\033[1mStep 6/6: Registering image\033[0m\n");
     
+    /* Determine final image name */
     char image_name[128];
+    char image_tag_only[64] = "latest";
+    
     if (tag) {
         safe_strcpy(image_name, tag, sizeof(image_name));
-    } else if (ctx.name[0]) {
-        snprintf(image_name, sizeof(image_name), "%s:latest", ctx.name);
+        /* Extract tag part */
+        char *colon = strchr(image_name, ':');
+        if (colon) {
+            safe_strcpy(image_tag_only, colon + 1, sizeof(image_tag_only));
+        }
     } else {
-        snprintf(image_name, sizeof(image_name), "build-%ld:latest", (long)time(NULL));
+        snprintf(image_name, sizeof(image_name), "build-%s:latest", image_id);
     }
     
-    /* Move to images directory */
-    char final_path[160];
-    const char *build_name = strrchr(build_dir, '/');
-    if (build_name) build_name++; else build_name = build_dir;
-    snprintf(final_path, sizeof(final_path), "/var/lib/lochs/images/%s", build_name);
+    /* Extract name without tag for registration */
+    char name_only[128];
+    safe_strcpy(name_only, image_name, sizeof(name_only));
+    char *colon = strchr(name_only, ':');
+    if (colon) *colon = '\0';
     
-    snprintf(cmd, sizeof(cmd), "mv '%s' '%s'", build_dir, final_path);
-    if (system(cmd) != 0) {
-        fprintf(stderr, "Warning: Failed to move to images directory\n");
-        safe_strcpy(final_path, build_dir, sizeof(final_path));
+    /* Register with image system */
+    if (lochs_image_register(name_only, image_tag_only, image_id) == 0) {
+        printf("  ✓ Registered as %s\n", image_name);
+    } else {
+        printf("  ⚠ Image built but registration failed\n");
+        printf("    You can still use it with --path %s\n", ctx.build_dir);
     }
     
-    printf("\n");
-    printf("Successfully built image: %s\n", image_name);
-    printf("  Path: %s\n", final_path);
+    printf("\n\033[1;32m=== Successfully built %s ===\033[0m\n", image_name);
+    printf("Image ID: %s\n", image_id);
+    printf("Path:     %s\n", ctx.build_dir);
+    printf("\nTo use: lochs create mycontainer --image %s\n", image_name);
     
     lochfile_free(&ctx);
     return 0;
-}
-
-/*
- * External interface for build command
- */
-int lochs_build_from_lochfile(const char *lochfile, const char *context, const char *tag) {
-    return lochfile_build(lochfile, context, tag);
 }
