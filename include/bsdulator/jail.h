@@ -123,7 +123,8 @@ typedef struct bsd_jail {
     int             allow_mount;
     int             allow_quotas;
     int             allow_socket_af;
-    
+    int             vnet;                       /* Use virtual network stack */
+
     /* State */
     int             active;                     /* Is this slot in use? */
     int             persist;                    /* Persist after last process exits? */

@@ -25,9 +25,216 @@
 #include <sys/ptrace.h>
 #include <sys/user.h>
 #include <arpa/inet.h>
+#include <net/if.h>
+#include <linux/if_link.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 
 #include "bsdulator.h"
 #include "bsdulator/jail.h"
+
+/* Helper to ignore return value of system() */
+#define IGNORE_RESULT(x) do { if (x) {} } while(0)
+
+/*
+ * Network namespace helper functions
+ */
+
+/* Path to network namespace files */
+#define NETNS_RUN_DIR "/var/run/netns"
+
+/*
+ * Create a network namespace for a jail
+ * Returns the fd to the namespace, or -1 on error
+ */
+static int jail_create_netns(bsd_jail_t *jail) {
+    char netns_name[64];
+    char netns_path[128];
+    
+    snprintf(netns_name, sizeof(netns_name), "bsdjail_%d", jail->jid);
+    snprintf(netns_path, sizeof(netns_path), "%s/%s", NETNS_RUN_DIR, netns_name);
+    
+    /* Ensure netns directory exists */
+    mkdir(NETNS_RUN_DIR, 0755);
+    
+    /* Create the namespace by creating a bind mount point */
+    int fd = open(netns_path, O_RDONLY | O_CREAT | O_EXCL, 0);
+    if (fd < 0) {
+        if (errno == EEXIST) {
+            /* Already exists, try to open it */
+            fd = open(netns_path, O_RDONLY);
+            if (fd >= 0) {
+                BSD_INFO("jail_create_netns: reusing existing netns %s", netns_name);
+                return fd;
+            }
+        }
+        BSD_WARN("jail_create_netns: failed to create %s: %s", netns_path, strerror(errno));
+        return -1;
+    }
+    close(fd);
+    
+    /* Create the actual network namespace using unshare in a child process */
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Child: create new network namespace and bind mount it */
+        if (unshare(CLONE_NEWNET) < 0) {
+            BSD_ERROR("jail_create_netns: unshare failed: %s", strerror(errno));
+            _exit(1);
+        }
+        
+        /* Bind mount /proc/self/ns/net to the netns file */
+        if (mount("/proc/self/ns/net", netns_path, "none", MS_BIND, NULL) < 0) {
+            BSD_ERROR("jail_create_netns: mount failed: %s", strerror(errno));
+            _exit(1);
+        }
+        
+        _exit(0);
+    } else if (pid > 0) {
+        /* Parent: wait for child */
+        int status;
+        waitpid(pid, &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            BSD_WARN("jail_create_netns: child failed");
+            unlink(netns_path);
+            return -1;
+        }
+    } else {
+        BSD_ERROR("jail_create_netns: fork failed: %s", strerror(errno));
+        unlink(netns_path);
+        return -1;
+    }
+    
+    /* Open the namespace fd */
+    fd = open(netns_path, O_RDONLY);
+    if (fd < 0) {
+        BSD_WARN("jail_create_netns: failed to open netns: %s", strerror(errno));
+        unlink(netns_path);
+        return -1;
+    }
+    
+    BSD_INFO("jail_create_netns: created netns %s (fd=%d)", netns_name, fd);
+    return fd;
+}
+
+/*
+ * Setup veth pair for jail networking
+ * Creates veth0_jailX in host and eth0 in jail namespace
+ * Connects host side to bsdjail0 bridge for inter-jail communication
+ */
+static int jail_setup_veth(bsd_jail_t *jail) {
+    char host_veth[32];
+    char jail_veth[32];
+    char cmd[512];
+    
+    snprintf(host_veth, sizeof(host_veth), "veth0_j%d", jail->jid);
+    snprintf(jail_veth, sizeof(jail_veth), "veth1_j%d", jail->jid);
+    
+    /* Ensure bridge exists */
+    IGNORE_RESULT(system("ip link add bsdjail0 type bridge 2>/dev/null"));
+    IGNORE_RESULT(system("ip link set bsdjail0 up 2>/dev/null"));
+    /* Give bridge an IP so host can route to jails */
+    IGNORE_RESULT(system("ip addr add 10.0.0.1/24 dev bsdjail0 2>/dev/null"));
+    
+    /* Create veth pair using ip command */
+    snprintf(cmd, sizeof(cmd), 
+             "ip link add %s type veth peer name %s 2>/dev/null",
+             host_veth, jail_veth);
+    int ret = system(cmd);
+    if (ret != 0) {
+        BSD_WARN("jail_setup_veth: failed to create veth pair (ret=%d)", ret);
+        return -1;
+    }
+    
+    /* Move jail_veth to jail's network namespace */
+    char netns_name[64];
+    snprintf(netns_name, sizeof(netns_name), "bsdjail_%d", jail->jid);
+    snprintf(cmd, sizeof(cmd),
+             "ip link set %s netns %s 2>/dev/null",
+             jail_veth, netns_name);
+    ret = system(cmd);
+    if (ret != 0) {
+        BSD_WARN("jail_setup_veth: failed to move veth to netns (ret=%d)", ret);
+        /* Cleanup */
+        snprintf(cmd, sizeof(cmd), "ip link delete %s 2>/dev/null", host_veth);
+        IGNORE_RESULT(system(cmd));  /* Best effort cleanup */
+        return -1;
+    }
+    
+    /* Rename jail_veth to eth0 inside the namespace */
+    snprintf(cmd, sizeof(cmd),
+             "ip netns exec %s ip link set %s name eth0 2>/dev/null",
+             netns_name, jail_veth);
+    IGNORE_RESULT(system(cmd));  /* Best effort */
+    
+    /* Connect host veth to bridge */
+    snprintf(cmd, sizeof(cmd), "ip link set %s master bsdjail0 2>/dev/null", host_veth);
+    IGNORE_RESULT(system(cmd));  /* Best effort */
+    
+    /* Bring up host side */
+    snprintf(cmd, sizeof(cmd), "ip link set %s up 2>/dev/null", host_veth);
+    IGNORE_RESULT(system(cmd));  /* Best effort */
+    
+    /* Bring up loopback in jail namespace */
+    snprintf(cmd, sizeof(cmd),
+             "ip netns exec %s ip link set lo up 2>/dev/null",
+             netns_name);
+    IGNORE_RESULT(system(cmd));  /* Best effort */
+    
+    /* Bring up eth0 in jail namespace */
+    snprintf(cmd, sizeof(cmd),
+             "ip netns exec %s ip link set eth0 up 2>/dev/null",
+             netns_name);
+    IGNORE_RESULT(system(cmd));  /* Best effort */
+    
+    /* Configure IP address if assigned */
+    if (jail->ip4_count > 0) {
+        char ipstr[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &jail->ip4_addrs[0], ipstr, sizeof(ipstr));
+        
+        /* Add IP to eth0 in jail namespace */
+        snprintf(cmd, sizeof(cmd),
+                 "ip netns exec %s ip addr add %s/24 dev eth0 2>/dev/null",
+                 netns_name, ipstr);
+        ret = system(cmd);
+        if (ret == 0) {
+            BSD_INFO("jail_setup_veth: assigned %s to jail %d", ipstr, jail->jid);
+        }
+        
+        /* Add default route via bridge in jail namespace */
+        snprintf(cmd, sizeof(cmd),
+                 "ip netns exec %s ip route add default via 10.0.0.1 2>/dev/null",
+                 netns_name);
+        IGNORE_RESULT(system(cmd));  /* Best effort */
+    }
+    
+    BSD_INFO("jail_setup_veth: created veth pair %s <-> eth0 for jail %d (bridge: bsdjail0)",
+             host_veth, jail->jid);
+    return 0;
+}
+
+/*
+ * Cleanup network namespace for jail
+ */
+static void jail_cleanup_netns(bsd_jail_t *jail) {
+    char netns_name[64];
+    char netns_path[128];
+    char host_veth[32];
+    char cmd[256];
+    
+    snprintf(netns_name, sizeof(netns_name), "bsdjail_%d", jail->jid);
+    snprintf(netns_path, sizeof(netns_path), "%s/%s", NETNS_RUN_DIR, netns_name);
+    snprintf(host_veth, sizeof(host_veth), "veth0_j%d", jail->jid);
+    
+    /* Delete veth pair (deleting one end deletes both) */
+    snprintf(cmd, sizeof(cmd), "ip link delete %s 2>/dev/null", host_veth);
+    IGNORE_RESULT(system(cmd));  /* Best effort */
+    
+    /* Unmount and remove netns file */
+    umount2(netns_path, MNT_DETACH);
+    unlink(netns_path);
+    
+    BSD_INFO("jail_cleanup_netns: cleaned up netns for jail %d", jail->jid);
+}
 
 /*
  * Global jail table
@@ -424,7 +631,14 @@ int jail_remove(int jid) {
     }
     
     BSD_INFO("Removing jail %d (%s)", jid, jail->name);
-    
+
+    /* Cleanup network namespace if vnet was enabled or namespace exists */
+    char netns_path[128];
+    snprintf(netns_path, sizeof(netns_path), "/var/run/netns/bsdjail_%d", jid);
+    if (jail->vnet || access(netns_path, F_OK) == 0) {
+        jail_cleanup_netns(jail);
+    }
+
     /* Close namespace FDs */
     if (jail->ns_pid >= 0) close(jail->ns_pid);
     if (jail->ns_mnt >= 0) close(jail->ns_mnt);
@@ -1012,11 +1226,13 @@ typedef struct {
     struct in_addr ip4_addrs[JAIL_MAX_IPS];
     int ip4_count;
     int persist;
+    int vnet;
     int has_jid;
     int has_name;
     int has_path;
     int has_hostname;
     int has_ip4;
+    int has_vnet;
 } jail_params_t;
 
 /*
@@ -1386,6 +1602,14 @@ long emul_jail_set(pid_t pid, uint64_t args[6]) {
             /* persist flag - jail stays even with no processes */
             params.persist = 1;
             BSD_TRACE("jail_set(): persist=1");
+        } else if (strcmp(param_name, "vnet") == 0) {
+            /* vnet flag - use virtual network stack 
+             * For boolean params, presence on command line means enabled.
+             * libjail sets value to 1 but we may have issues reading it,
+             * so treat presence of the parameter as "enabled" */
+            params.vnet = 1;
+            params.has_vnet = 1;
+            BSD_TRACE("jail_set(): vnet=1 (enabled)");
         }
         /* TODO: Handle more parameters (securelevel, allow.*, etc.) */
     }
@@ -1462,6 +1686,26 @@ long emul_jail_set(pid_t pid, uint64_t args[6]) {
                 char ipstr[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &new_jail->ip4_addrs[0], ipstr, sizeof(ipstr));
                 BSD_INFO("jail_set(): created jail with ip4.addr[0]='%s'", ipstr);
+                jail_save_state();
+            }
+        }
+        
+        /* Setup virtual network stack if requested */
+        if (params.has_vnet && params.vnet) {
+            bsd_jail_t *new_jail = jail_find_by_id(jid);
+            if (new_jail) {
+                new_jail->vnet = 1;
+                /* Create network namespace */
+                int ns_fd = jail_create_netns(new_jail);
+                if (ns_fd >= 0) {
+                    new_jail->ns_net = ns_fd;
+                    /* Setup veth pair and configure IP */
+                    jail_setup_veth(new_jail);
+                    BSD_INFO("jail_set(): created vnet for jail %d", jid);
+                } else {
+                    BSD_WARN("jail_set(): failed to create vnet for jail %d", jid);
+                    new_jail->vnet = 0;
+                }
                 jail_save_state();
             }
         }
