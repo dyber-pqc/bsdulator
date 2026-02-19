@@ -1418,6 +1418,16 @@ static int translate_freebsd_path(pid_t pid, int syscall_nr, uint64_t *args) {
         return -1;
     }
 
+    /*
+     * CRITICAL: If the path already exists on the real filesystem,
+     * do NOT translate it. This handles cases where we're running
+     * binaries from /var/lib/lochs/images/ or other real paths.
+     */
+    if (access(path_buf, F_OK) == 0) {
+        BSD_TRACE("Path '%s' exists on real filesystem, skipping translation", path_buf);
+        return -1;
+    }
+
     /* Check if it's a path we should translate */
     int should_translate = 0;
     if (strncmp(path_buf, "/libexec/", 9) == 0 ||
@@ -1426,7 +1436,6 @@ static int translate_freebsd_path(pid_t pid, int syscall_nr, uint64_t *args) {
         strncmp(path_buf, "/usr/libexec/", 13) == 0 ||
         strncmp(path_buf, "/usr/share/", 11) == 0 ||
         strncmp(path_buf, "/etc/", 5) == 0 ||
-        strncmp(path_buf, "/var/", 5) == 0 ||
         strncmp(path_buf, "/bin/", 5) == 0 ||
         strncmp(path_buf, "/sbin/", 6) == 0 ||
         strncmp(path_buf, "/usr/bin/", 9) == 0 ||
@@ -1434,7 +1443,8 @@ static int translate_freebsd_path(pid_t pid, int syscall_nr, uint64_t *args) {
         strncmp(path_buf, "/rescue/", 8) == 0 ||
         strncmp(path_buf, "/tmp/", 5) == 0) {
         should_translate = 1;
-    }  
+    }
+    /* Note: /var/ removed from translation list - it often exists on real filesystem */
 
     if (!should_translate) {
         return -1;

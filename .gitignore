@@ -1,9 +1,13 @@
 # Build artifacts
 /obj/
 /bsdulator
+/lochs
 *.o
 *.a
 *.so
+
+# Image builder (separate repo: github.com/dyber-pqc/lochs-images)
+/image-builder/
 
 # FreeBSD root filesystem (downloaded separately)
 /freebsd-root/
