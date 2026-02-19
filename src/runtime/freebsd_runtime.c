@@ -22,6 +22,7 @@
 
 #include "freebsd_runtime.h"
 #include "bsdulator.h"
+#include "bsdulator/jail.h"
 
 /* Global runtime state */
 freebsd_runtime_t g_freebsd_runtime = {0};
@@ -585,13 +586,35 @@ long freebsd_handle_sysctl(pid_t pid, uint64_t args[6]) {
             }
             
             /*
-             * For jail parameter queries (security.jail.param.*):
-             * - If oldp is NULL, caller is asking for size - return 0
-             * - If oldp is non-NULL, caller wants data - return empty/zero
-             * 
-             * When no jails exist, return success with zero-length data.
-             * This tells jls "no jails" rather than "error".
+             * When queried directly, jail params return the MAXIMUM SIZE for strings.
+             * This tells libjail how much buffer to allocate.
+             * Match the OID to find the size.
              */
+            for (const jail_param_oid_t *p = jail_param_oids; p->name; p++) {
+                if (p->oidlen == (int)namelen) {
+                    int match = 1;
+                    for (int i = 0; i < p->oidlen && match; i++) {
+                        if (p->oid[i] != mib[i]) match = 0;
+                    }
+                    if (match && p->size > 0) {
+                        /* Return the size as an ASCII string (e.g., "256\0") */
+                        char size_str[32];
+                        int str_len = snprintf(size_str, sizeof(size_str), "%zu", p->size);
+                        size_t len = str_len + 1;  /* Include null terminator */
+                        BSD_TRACE("sysctl: security.jail.param '%s' -> size '%s' (%zu bytes)", p->name, size_str, len);
+                        
+                        if (oldlenp_addr) {
+                            write_process_mem(pid, &len, (void *)oldlenp_addr, sizeof(len));
+                        }
+                        if (oldp_addr && oldlen >= len) {
+                            write_process_mem(pid, size_str, (void *)oldp_addr, len);
+                        }
+                        return 0;
+                    }
+                }
+            }
+            
+            /* Unknown jail param - return 0 size */
             size_t zero = 0;
             if (oldlenp_addr) {
                 write_process_mem(pid, &zero, (void *)oldlenp_addr, sizeof(zero));

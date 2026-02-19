@@ -213,4 +213,10 @@ void jail_dump(const bsd_jail_t *jail);
 /* Debug: list all jails */
 void jail_list_all(void);
 
+/* Get first active jail (for enumeration) */
+bsd_jail_t *jail_get_first(void);
+
+/* Get next active jail after the given JID */
+bsd_jail_t *jail_get_next(int after_jid);
+
 #endif /* BSDULATOR_JAIL_H */

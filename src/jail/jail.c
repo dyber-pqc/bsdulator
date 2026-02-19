@@ -23,6 +23,7 @@
 #include <sys/mount.h>
 #include <sys/uio.h>
 #include <sys/ptrace.h>
+#include <sys/user.h>
 #include <arpa/inet.h>
 
 #include "bsdulator.h"
@@ -35,6 +36,19 @@ static bsd_jail_t jail_table[JAIL_MAX_JAILS];
 static int jail_initialized = 0;
 static int jail_next_jid = 1;  /* Next jail ID to assign */
 
+/* Persistence file path */
+#define JAIL_STATE_FILE "/tmp/bsdulator_jails.dat"
+#define JAIL_STATE_MAGIC 0x4A41494C  /* 'JAIL' */
+#define JAIL_STATE_VERSION 1
+
+/* State file header */
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    int32_t  next_jid;
+    int32_t  jail_count;
+} jail_state_header_t;
+
 /* Process-to-jail mapping (simplified - tracks which processes are in which jails) */
 #define MAX_JAILED_PROCS 1024
 static struct {
@@ -42,6 +56,114 @@ static struct {
     int jid;
 } jailed_procs[MAX_JAILED_PROCS];
 static int jailed_proc_count = 0;
+
+/*
+ * Load jail state from file
+ */
+static int jail_load_state(void) {
+    FILE *f = fopen(JAIL_STATE_FILE, "rb");
+    if (!f) {
+        BSD_TRACE("No jail state file found, starting fresh");
+        return 0;  /* Not an error - just no saved state */
+    }
+    
+    jail_state_header_t header;
+    if (fread(&header, sizeof(header), 1, f) != 1) {
+        BSD_WARN("Failed to read jail state header");
+        fclose(f);
+        return -1;
+    }
+    
+    if (header.magic != JAIL_STATE_MAGIC) {
+        BSD_WARN("Invalid jail state magic: 0x%x", header.magic);
+        fclose(f);
+        return -1;
+    }
+    
+    if (header.version != JAIL_STATE_VERSION) {
+        BSD_WARN("Incompatible jail state version: %d", header.version);
+        fclose(f);
+        return -1;
+    }
+    
+    jail_next_jid = header.next_jid;
+    int count = 0;
+    
+    for (int i = 0; i < header.jail_count && i < JAIL_MAX_JAILS; i++) {
+        bsd_jail_t jail;
+        if (fread(&jail, sizeof(jail), 1, f) != 1) {
+            BSD_WARN("Failed to read jail %d", i);
+            break;
+        }
+        
+        /* Reset namespace FDs (not valid across processes) */
+        jail.ns_pid = -1;
+        jail.ns_mnt = -1;
+        jail.ns_uts = -1;
+        jail.ns_net = -1;
+        jail.ns_user = -1;
+        jail.ns_ipc = -1;
+        
+        /* Find a slot for this jail */
+        for (int j = 0; j < JAIL_MAX_JAILS; j++) {
+            if (!jail_table[j].active) {
+                memcpy(&jail_table[j], &jail, sizeof(jail));
+                count++;
+                break;
+            }
+        }
+    }
+    
+    fclose(f);
+    BSD_INFO("Loaded %d jails from state file (next_jid=%d)", count, jail_next_jid);
+    return count;
+}
+
+/*
+ * Save jail state to file
+ */
+static int jail_save_state(void) {
+    FILE *f = fopen(JAIL_STATE_FILE, "wb");
+    if (!f) {
+        BSD_WARN("Failed to open jail state file for writing: %s", strerror(errno));
+        return -1;
+    }
+    
+    /* Count active jails */
+    int count = 0;
+    for (int i = 0; i < JAIL_MAX_JAILS; i++) {
+        if (jail_table[i].active) count++;
+    }
+    
+    /* Write header */
+    jail_state_header_t header = {
+        .magic = JAIL_STATE_MAGIC,
+        .version = JAIL_STATE_VERSION,
+        .next_jid = jail_next_jid,
+        .jail_count = count
+    };
+    
+    if (fwrite(&header, sizeof(header), 1, f) != 1) {
+        BSD_WARN("Failed to write jail state header");
+        fclose(f);
+        return -1;
+    }
+    
+    /* Write each active jail */
+    for (int i = 0; i < JAIL_MAX_JAILS; i++) {
+        if (jail_table[i].active) {
+            if (fwrite(&jail_table[i], sizeof(bsd_jail_t), 1, f) != 1) {
+                BSD_WARN("Failed to write jail %d", jail_table[i].jid);
+                fclose(f);
+                return -1;
+            }
+        }
+    }
+    
+    fclose(f);
+    BSD_TRACE("Saved %d jails to state file", count);
+    return count;
+}
 
 /*
  * Initialize jail subsystem
@@ -68,6 +190,9 @@ int jail_subsystem_init(void) {
         jail_table[i].ns_user = -1;
         jail_table[i].ns_ipc = -1;
     }
+    
+    /* Load saved jail state */
+    jail_load_state();
     
     jail_initialized = 1;
     BSD_INFO("Jail subsystem initialized (max %d jails)", JAIL_MAX_JAILS);
@@ -232,6 +357,9 @@ int jail_create(const char *name, const char *path, const char *hostname, int fl
     BSD_INFO("Created jail jid=%d name='%s' path='%s' hostname='%s'",
              jail->jid, jail->name, jail->path, jail->hostname);
     
+    /* Persist jail state to file */
+    jail_save_state();
+    
     return jail->jid;
 }
 
@@ -319,6 +447,9 @@ int jail_remove(int jid) {
     /* Mark slot as free */
     jail->active = 0;
     jail->jid = 0;
+    
+    /* Persist jail state to file */
+    jail_save_state();
     
     return 0;
 }
@@ -519,6 +650,44 @@ void jail_list_all(void) {
 }
 
 /*
+ * Get first active jail (for enumeration)
+ */
+bsd_jail_t *jail_get_first(void) {
+    if (!jail_initialized) {
+        jail_subsystem_init();
+    }
+    
+    for (int i = 0; i < JAIL_MAX_JAILS; i++) {
+        if (jail_table[i].active) {
+            return &jail_table[i];
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Get next active jail after the given JID
+ */
+bsd_jail_t *jail_get_next(int after_jid) {
+    if (!jail_initialized) {
+        jail_subsystem_init();
+    }
+    
+    int found_current = 0;
+    for (int i = 0; i < JAIL_MAX_JAILS; i++) {
+        if (jail_table[i].active) {
+            if (found_current) {
+                return &jail_table[i];
+            }
+            if (jail_table[i].jid == after_jid) {
+                found_current = 1;
+            }
+        }
+    }
+    return NULL;
+}
+
+/*
  * Helper: Read string from child process memory
  */
 static int read_child_string(pid_t pid, uint64_t addr, char *buf, size_t maxlen) {
@@ -558,6 +727,95 @@ static int write_child_int(pid_t pid, uint64_t addr, int value) {
     }
     
     return 0;
+}
+
+/*
+ * Helper: Write a pointer to child process memory
+ */
+__attribute__((unused))
+static int write_child_ptr(pid_t pid, uint64_t addr, uint64_t ptr_value) {
+    struct iovec local = { &ptr_value, sizeof(ptr_value) };
+    struct iovec remote = { (void *)addr, sizeof(ptr_value) };
+    
+    ssize_t n = process_vm_writev(pid, &local, 1, &remote, 1, 0);
+    if (n < 0) {
+        /* Fallback to ptrace - need two POKEDATA for 64-bit */
+        ptrace(PTRACE_POKEDATA, pid, addr, (void *)(ptr_value & 0xFFFFFFFF));
+        ptrace(PTRACE_POKEDATA, pid, addr + 4, (void *)(ptr_value >> 32));
+    }
+    
+    return 0;
+}
+
+/*
+ * Static buffer pool for jail string allocations
+ * This is a simple approach - we maintain a pool of pre-allocated buffers
+ * that we can "lend" to the child process.
+ * 
+ * Since we can't easily allocate memory in the child, we use a trick:
+ * we allocate memory in our process and use process_vm_writev to copy
+ * data there. But the child needs a valid pointer in its address space.
+ * 
+ * Solution: Use addresses from the child's existing heap/data segments
+ * that we can identify and safely use.
+ */
+
+/* Pool of addresses allocated in child via prior mmap calls */
+static struct {
+    uint64_t addr;
+    size_t size;
+    int in_use;
+} child_buffer_pool[16];
+static int pool_initialized = 0;
+
+/*
+ * Helper: Get stack-based buffer address for string storage
+ * 
+ * Uses the child's stack as temporary storage. The x86-64 ABI reserves
+ * 128 bytes below RSP (the "red zone") that we can use safely.
+ * 
+ * We track allocations using a simple offset counter.
+ */
+static uint64_t stack_alloc_offset = 0;
+
+__attribute__((unused))
+static uint64_t get_stack_buffer(pid_t pid, size_t size) {
+    struct user_regs_struct regs;
+    
+    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0) {
+        BSD_WARN("get_stack_buffer: PTRACE_GETREGS failed");
+        return 0;
+    }
+    
+    /* 
+     * Use space WELL below RSP to avoid conflicts with stack operations.
+     * Go very far down - 64KB below RSP should be safe since the stack
+     * typically has megabytes of space available.
+     * 
+     * The stack grows downward, so going further down (lower addresses)
+     * means we're using "future" stack space that won't be touched
+     * by normal function calls.
+     */
+    uint64_t buffer_addr = regs.rsp - 65536 - stack_alloc_offset;
+    
+    /* Round down to 8-byte alignment */
+    buffer_addr &= ~7ULL;
+    
+    /* Track the allocation */
+    stack_alloc_offset += (size + 7) & ~7ULL;
+    
+    /* Reset if we've used too much */
+    if (stack_alloc_offset > 32768) {
+        stack_alloc_offset = 0;
+    }
+    
+    BSD_TRACE("get_stack_buffer: allocated %zu bytes at stack %p (RSP=%p)", 
+              size, (void*)buffer_addr, (void*)regs.rsp);
+    
+    (void)child_buffer_pool;
+    (void)pool_initialized;
+    
+    return buffer_addr;
 }
 
 /*
@@ -701,6 +959,11 @@ typedef struct {
  * int jail_get(struct iovec *iov, u_int niov, int flags)
  * 
  * Gets jail parameters. The iovec array contains name/value pairs.
+ * 
+ * For enumeration, jls uses:
+ *   - jid=0 with lastjid=0: get first jail
+ *   - jid=0 with lastjid=N: get next jail after N
+ *   - jid=N (N>0): get specific jail N
  */
 long emul_jail_get(pid_t pid, uint64_t args[6]) {
     uint64_t iov_addr = args[0];
@@ -731,8 +994,13 @@ long emul_jail_get(pid_t pid, uint64_t args[6]) {
         return -EFAULT;
     }
     
-    /* First pass: find the jail (by jid or name) */
+    /* Track errmsg buffer address (not currently used but may be useful for error messages) */
+    uint64_t errmsg_buffer = 0;
+    (void)errmsg_buffer;  /* Suppress unused warning */
+    
+    /* First pass: find the jail and errmsg buffer */
     int jid = 0;
+    int lastjid = -1;  /* -1 means not specified */
     char jailname[JAIL_MAX_NAME] = "";
     
     for (unsigned int i = 0; i < niov; i += 2) {
@@ -745,29 +1013,50 @@ long emul_jail_get(pid_t pid, uint64_t args[6]) {
             struct iovec l = { &jid, sizeof(jid) };
             struct iovec r = { iovs[i+1].iov_base, sizeof(jid) };
             process_vm_readv(pid, &l, 1, &r, 1, 0);
+            BSD_TRACE("jail_get(): jid=%d", jid);
+        } else if (strcmp(param_name, "lastjid") == 0 && iovs[i+1].iov_len >= sizeof(int)) {
+            struct iovec l = { &lastjid, sizeof(lastjid) };
+            struct iovec r = { iovs[i+1].iov_base, sizeof(lastjid) };
+            process_vm_readv(pid, &l, 1, &r, 1, 0);
+            BSD_TRACE("jail_get(): lastjid=%d", lastjid);
         } else if (strcmp(param_name, "name") == 0) {
             read_child_string(pid, (uint64_t)iovs[i+1].iov_base, jailname, sizeof(jailname));
+        } else if (strcmp(param_name, "errmsg") == 0 && iovs[i+1].iov_len >= 256) {
+            /* Save errmsg buffer address for use as string storage */
+            errmsg_buffer = (uint64_t)iovs[i+1].iov_base;
+            BSD_TRACE("jail_get(): found errmsg buffer at %p len=%zu", 
+                      (void*)errmsg_buffer, iovs[i+1].iov_len);
         }
     }
     
-    /* Find the jail */
+    /* Find the jail based on the parameters */
     bsd_jail_t *jail = NULL;
+    
     if (jid > 0) {
+        /* Specific jail requested by JID */
         jail = jail_find_by_id(jid);
     } else if (jailname[0]) {
+        /* Specific jail requested by name */
         jail = jail_find_by_name(jailname);
-    } else {
-        /* Return first active jail */
-        for (int i = 0; i < JAIL_MAX_JAILS; i++) {
-            if (jail_table[i].active) {
-                jail = &jail_table[i];
-                break;
-            }
+    } else if (lastjid >= 0) {
+        /* Enumeration mode: get jail after lastjid */
+        if (lastjid == 0) {
+            /* Get first jail */
+            jail = jail_get_first();
+            BSD_TRACE("jail_get(): enumeration - getting first jail");
+        } else {
+            /* Get next jail after lastjid */
+            jail = jail_get_next(lastjid);
+            BSD_TRACE("jail_get(): enumeration - getting jail after %d", lastjid);
         }
+    } else {
+        /* No criteria - return first active jail */
+        jail = jail_get_first();
     }
     
     if (!jail) {
-        BSD_WARN("jail_get(): no matching jail found (jid=%d name='%s')", jid, jailname);
+        BSD_TRACE("jail_get(): no matching jail found (jid=%d lastjid=%d name='%s')", 
+                  jid, lastjid, jailname);
         free(iovs);
         return -ENOENT;
     }
@@ -781,20 +1070,73 @@ long emul_jail_get(pid_t pid, uint64_t args[6]) {
         char param_name[256] = "";
         read_child_string(pid, (uint64_t)iovs[i].iov_base, param_name, sizeof(param_name));
         
+        BSD_TRACE("jail_get(): processing param '%s' len=%zu", param_name, iovs[i+1].iov_len);
+        
+        /* Track lastjid address so we can update it at the end */
+        static uint64_t lastjid_addr = 0;
+        
         if (strcmp(param_name, "jid") == 0 && iovs[i+1].iov_len >= sizeof(int)) {
             write_child_int(pid, (uint64_t)iovs[i+1].iov_base, jail->jid);
+            BSD_TRACE("jail_get(): wrote jid=%d", jail->jid);
+        } else if (strcmp(param_name, "lastjid") == 0 && iovs[i+1].iov_len >= sizeof(int)) {
+            /* Save address - we'll update at the end if all buffers are ready */
+            lastjid_addr = (uint64_t)iovs[i+1].iov_base;
+            /* Always update lastjid for now - libjail needs this */
+            write_child_int(pid, lastjid_addr, jail->jid);
+            BSD_TRACE("jail_get(): wrote lastjid=%d", jail->jid);
         } else if (strcmp(param_name, "name") == 0) {
-            struct iovec l = { jail->name, strlen(jail->name) + 1 };
-            struct iovec r = { iovs[i+1].iov_base, iovs[i+1].iov_len };
-            process_vm_writev(pid, &l, 1, &r, 1, 0);
+            size_t slen = strlen(jail->name) + 1;
+            if (iovs[i+1].iov_len == 0) {
+                /* Size query - update iov_len with required size */
+                iovs[i+1].iov_len = slen;
+                struct iovec l = { &iovs[i+1], sizeof(struct iovec) };
+                struct iovec r = { (void *)(iov_addr + (i+1) * sizeof(struct iovec)), sizeof(struct iovec) };
+                process_vm_writev(pid, &l, 1, &r, 1, 0);
+                BSD_TRACE("jail_get(): name size query, need %zu bytes", slen);
+            } else {
+                struct iovec l = { jail->name, slen };
+                struct iovec r = { iovs[i+1].iov_base, iovs[i+1].iov_len };
+                process_vm_writev(pid, &l, 1, &r, 1, 0);
+                BSD_TRACE("jail_get(): wrote name='%s'", jail->name);
+            }
         } else if (strcmp(param_name, "path") == 0) {
-            struct iovec l = { jail->path, strlen(jail->path) + 1 };
-            struct iovec r = { iovs[i+1].iov_base, iovs[i+1].iov_len };
-            process_vm_writev(pid, &l, 1, &r, 1, 0);
+            size_t slen = strlen(jail->path) + 1;
+            BSD_TRACE("jail_get(): path iov_base=%p iov_len=%zu slen=%zu", 
+                      iovs[i+1].iov_base, iovs[i+1].iov_len, slen);
+            if (iovs[i+1].iov_len == 0) {
+                /* First call - update jp_valuelen (at iov_base+8 in jailparam struct) */
+                uint64_t jp_valuelen_addr = (uint64_t)iovs[i+1].iov_base + 8;
+                size_t valuelen = slen;
+                struct iovec l = { &valuelen, sizeof(valuelen) };
+                struct iovec r = { (void*)jp_valuelen_addr, sizeof(valuelen) };
+                process_vm_writev(pid, &l, 1, &r, 1, 0);
+                BSD_TRACE("jail_get(): path - updated jp_valuelen at %p to %zu", (void*)jp_valuelen_addr, slen);
+            } else if (iovs[i+1].iov_len >= slen) {
+                /* Second call - buffer provided, write the data */
+                struct iovec l = { jail->path, slen };
+                struct iovec r = { iovs[i+1].iov_base, slen };
+                process_vm_writev(pid, &l, 1, &r, 1, 0);
+                BSD_TRACE("jail_get(): wrote path='%s' to buffer %p", jail->path, iovs[i+1].iov_base);
+            }
         } else if (strcmp(param_name, "host.hostname") == 0) {
-            struct iovec l = { jail->hostname, strlen(jail->hostname) + 1 };
-            struct iovec r = { iovs[i+1].iov_base, iovs[i+1].iov_len };
-            process_vm_writev(pid, &l, 1, &r, 1, 0);
+            size_t slen = strlen(jail->hostname) + 1;
+            BSD_TRACE("jail_get(): host.hostname iov_base=%p iov_len=%zu slen=%zu", 
+                      iovs[i+1].iov_base, iovs[i+1].iov_len, slen);
+            if (iovs[i+1].iov_len == 0) {
+                /* First call - update jp_valuelen (at iov_base+8 in jailparam struct) */
+                uint64_t jp_valuelen_addr = (uint64_t)iovs[i+1].iov_base + 8;
+                size_t valuelen = slen;
+                struct iovec l = { &valuelen, sizeof(valuelen) };
+                struct iovec r = { (void*)jp_valuelen_addr, sizeof(valuelen) };
+                process_vm_writev(pid, &l, 1, &r, 1, 0);
+                BSD_TRACE("jail_get(): hostname - updated jp_valuelen at %p to %zu", (void*)jp_valuelen_addr, slen);
+            } else if (iovs[i+1].iov_len >= slen) {
+                /* Second call - buffer provided, write the data */
+                struct iovec l = { jail->hostname, slen };
+                struct iovec r = { iovs[i+1].iov_base, slen };
+                process_vm_writev(pid, &l, 1, &r, 1, 0);
+                BSD_TRACE("jail_get(): wrote hostname='%s' to buffer %p", jail->hostname, iovs[i+1].iov_base);
+            }
         } else if (strcmp(param_name, "parent") == 0 && iovs[i+1].iov_len >= sizeof(int)) {
             write_child_int(pid, (uint64_t)iovs[i+1].iov_base, jail->parent_jid);
         } else if (strcmp(param_name, "children.cur") == 0 && iovs[i+1].iov_len >= sizeof(int)) {
