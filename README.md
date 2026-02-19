@@ -4,35 +4,46 @@
 
 BSDulator enables running unmodified FreeBSD binaries on Linux by intercepting and translating FreeBSD system calls to their Linux equivalents. Similar to how Wine runs Windows applications on Linux, or how FreeBSD's Linuxulator runs Linux binaries on FreeBSD—but in reverse.
 
-## 🎉 Current Status: Fully Functional
+## 🎉 Current Status: FreeBSD Jails Working on Linux!
 
-BSDulator now supports both **static and dynamic FreeBSD binaries**, including the FreeBSD shell!
+BSDulator now supports **FreeBSD jail syscalls**, bringing FreeBSD's powerful jail containerization to Linux. This is the first implementation of FreeBSD jails outside of FreeBSD itself.
 
 ### What Works
 
-| Binary Type | Examples | Status |
-|-------------|----------|--------|
-| Static binaries | `/rescue/echo`, `/rescue/ls`, `/rescue/cat` | ✅ **Working** |
-| Dynamic binaries | `/bin/echo`, `/bin/ls`, `/bin/cat` | ✅ **Working** |
-| FreeBSD Shell | `/bin/sh` | ✅ **Working** |
+| Feature | Examples | Status |
+|---------|----------|--------|
+| Static binaries | `/rescue/echo`, `/rescue/ls`, `/rescue/cat`, `/rescue/sh` | ✅ **Working** |
+| Dynamic binaries | `/bin/echo`, `/bin/ls`, `/bin/cat`, `/bin/sh` | ✅ **Working** |
+| FreeBSD Shell | `/bin/sh` with pipes, redirects | ✅ **Working** |
 | Shared libraries | `libc.so.7`, `ld-elf.so.1` | ✅ **Loading** |
+| **Jail creation** | `jail -c name=test path=./freebsd-root persist` | ✅ **Working** |
+| **Jail listing** | `jls` | ✅ **Working** |
+| **Jail execution** | `jexec 1 /bin/sh -c "echo hello"` | ✅ **Working** |
+| **Jail removal** | `jail -r 1` | ✅ **Working** |
+| **Multiple jails** | Create, manage, and remove multiple concurrent jails | ✅ **Working** |
 
 ```bash
-# These all work!
-./bsdulator -r ./freebsd-root ./freebsd-root/bin/echo "Hello from FreeBSD!"
-./bsdulator -r ./freebsd-root ./freebsd-root/bin/ls -la ./freebsd-root/
-./bsdulator -r ./freebsd-root ./freebsd-root/bin/cat ./freebsd-root/COPYRIGHT
-./bsdulator -r ./freebsd-root ./freebsd-root/bin/sh -c 'pwd; echo test; echo done'
+# Run FreeBSD binaries
+./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/bin/echo "Hello from FreeBSD!"
+./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/bin/ls -la /
+./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/bin/sh -c 'pwd; echo test'
+
+# Create and manage FreeBSD jails on Linux!
+./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jail -c name=myjail path=./freebsd-root persist
+./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jls
+sudo ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jexec 1 /bin/sh -c "echo Hello from inside the jail!"
+./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jail -r 1
 ```
 
 ## Features
 
 - **Full Syscall Translation**: 200+ FreeBSD syscalls translated to Linux equivalents
+- **FreeBSD Jail Support**: Create, list, execute in, and remove FreeBSD jails
 - **Dynamic Binary Support**: Loads FreeBSD shared libraries and dynamic linker
 - **Path Translation**: Automatically redirects FreeBSD system paths to local root
 - **ABI Translation**: Handles differences in flags, structures, errno values, and signals
-- **Stat Structure Translation**: Converts between FreeBSD and Linux stat formats
-- **mmap Flag Translation**: Handles FreeBSD-specific mmap flags including MAP_ALIGNED
+- **TLS Emulation**: Full Thread Local Storage setup for FreeBSD binaries
+- **Persistent Jails**: Jail state persists across BSDulator invocations
 - **Verbose Tracing**: Detailed syscall tracing for debugging
 
 ## Building
@@ -60,14 +71,20 @@ make
 # 2. Download FreeBSD base system (~180MB)
 ./scripts/setup_freebsd_root.sh
 
-# 3. Create symlink for dynamic linker (one-time setup)
-sudo mkdir -p /libexec
-sudo ln -sf $(pwd)/freebsd-root/libexec/ld-elf.so.1 /libexec/ld-elf.so.1
+# 3. Run FreeBSD binaries!
+./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/bin/echo "Hello from FreeBSD!"
 
-# 4. Run FreeBSD binaries!
-./bsdulator -r ./freebsd-root ./freebsd-root/bin/echo "Hello from FreeBSD!"
-./bsdulator -r ./freebsd-root ./freebsd-root/bin/ls -la ./freebsd-root/
-./bsdulator -r ./freebsd-root ./freebsd-root/bin/sh -c 'echo Running FreeBSD shell!'
+# 4. Create a jail!
+./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jail -c name=test path=./freebsd-root persist
+
+# 5. List jails
+./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jls
+
+# 6. Execute commands in jail (requires sudo for chroot)
+sudo ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jexec 1 /bin/sh -c "whoami; pwd; ls /"
+
+# 7. Remove jail
+./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jail -r 1
 ```
 
 ## Usage
@@ -93,7 +110,7 @@ Environment:
 
 1. **Binary Detection**: Examines ELF OS/ABI field and FreeBSD notes to identify FreeBSD binaries.
 
-2. **Dynamic Linker Setup**: For dynamic binaries, ensures the FreeBSD dynamic linker (`ld-elf.so.1`) can find and load shared libraries.
+2. **Dynamic Linker Setup**: For dynamic binaries, the FreeBSD dynamic linker (`ld-elf.so.1`) loads shared libraries from the FreeBSD root.
 
 3. **Path Translation**: Intercepts file-related syscalls and redirects FreeBSD system paths (`/lib`, `/usr/lib`, `/etc`, etc.) to the local FreeBSD root filesystem.
 
@@ -101,12 +118,13 @@ Environment:
    - **Entry**: Translates FreeBSD syscall numbers and arguments to Linux equivalents
    - **Exit**: Translates return values, structures (like stat), and errno values
 
-5. **ABI Translation**: Handles differences between FreeBSD and Linux:
-   - Open flags (O_CREAT, O_APPEND, etc.)
-   - mmap flags (MAP_ANONYMOUS, MAP_ALIGNED)
-   - Signal numbers and structures
-   - Stat structures (different field layouts and sizes)
-   - Directory entry formats
+5. **Jail Emulation**: Implements FreeBSD jail syscalls using:
+   - Persistent jail registry in `/tmp/bsdulator_jails.dat`
+   - Linux `chroot()` for filesystem isolation
+   - Process tracking for jail attachment
+   - Dynamic linker rewriting for jailed binary execution
+
+6. **TLS Setup**: Creates FreeBSD-compatible Thread Local Storage structures including TCB, DTV, and pthread structures.
 
 ## Syscall Support
 
@@ -122,17 +140,36 @@ Environment:
 | *at syscalls | openat, fstatat, unlinkat, etc. | ✅ Full |
 | Threading | thr_self, thr_exit, thr_kill | ✅ Emulated |
 | sysctl | __sysctl, __sysctlbyname | ✅ Emulated |
-| kqueue | kqueue, kevent | 🚧 Planned |
-| jail | jail, jail_attach, jail_get | 🚧 Planned |
+| **Jail** | jail, jail_get, jail_set, jail_attach, jail_remove | ✅ **Working** |
+| kqueue | kqueue, kevent | ✅ Basic |
 | Capsicum | cap_enter, cap_getmode | ⚠️ Stub |
+
+## Jail Implementation Details
+
+BSDulator implements FreeBSD jail syscalls to provide container-like isolation:
+
+| Syscall | Number | Description | Implementation |
+|---------|--------|-------------|----------------|
+| `jail` | 338 | Create/modify jail | Allocates JID, stores config |
+| `jail_get` | 506 | Query jail parameters | Returns jail info via iovec |
+| `jail_set` | 507 | Set jail parameters | Updates jail config |
+| `jail_attach` | 436 | Attach process to jail | Linux chroot() + process tracking |
+| `jail_remove` | 508 | Remove a jail | Removes from registry |
+
+**Jail Features:**
+- Persistent storage across BSDulator invocations
+- Multiple concurrent jails with unique JIDs
+- Both static (`/rescue/*`) and dynamic (`/bin/*`) binaries work inside jails
+- Process isolation via chroot
+- Proper FreeBSD environment setup (TLS, auxv) for jailed processes
 
 ## Known Limitations
 
-- **Shell pipes**: Commands using `|` may hang (fork tracking needs work)
-- **Extended attributes**: `extattr_*` syscalls return "Function not implemented"
+- **Jail networking**: IP address assignment not yet implemented
+- **Jail resource limits**: CPU/memory limits not enforced
 - **32-bit binaries**: Not supported (x86_64 only)
 - **Performance**: ptrace interception adds overhead (~10-30%)
-- **kqueue**: Not yet implemented (use poll/select based programs)
+- **Some vi features**: Editor has minor issues with temp files
 
 ## Project Structure
 
@@ -141,22 +178,25 @@ bsdulator/
 ├── src/
 │   ├── main.c                 # Entry point and CLI
 │   ├── interceptor/
-│   │   └── interceptor.c      # ptrace syscall interception
+│   │   └── interceptor.c      # ptrace syscall interception, TLS setup
 │   ├── syscall/
 │   │   └── syscall_table.c    # FreeBSD→Linux syscall mapping
 │   ├── loader/
 │   │   └── elf_loader.c       # FreeBSD ELF detection
 │   ├── abi/
 │   │   └── abi_translate.c    # Flags/struct translation
-│   └── runtime/
-│       └── freebsd_runtime.c  # FreeBSD runtime environment
+│   ├── runtime/
+│   │   └── freebsd_runtime.c  # FreeBSD runtime environment, auxv
+│   └── jail/
+│       └── jail.c             # Jail syscall emulation
 ├── include/
 │   └── bsdulator/
 │       ├── bsdulator.h        # Main header
 │       ├── interceptor.h
 │       ├── syscall.h
 │       ├── loader.h
-│       └── abi.h
+│       ├── abi.h
+│       └── jail.h             # Jail structures and functions
 ├── scripts/
 │   └── setup_freebsd_root.sh  # Download FreeBSD base
 ├── freebsd-root/              # FreeBSD filesystem (after setup)
@@ -174,23 +214,30 @@ bsdulator/
 - [x] Path translation
 - [x] Stat structure translation
 - [x] Shell support
+- [x] TLS emulation
 
-### Phase 2: Enhanced Features (In Progress)
-- [ ] kqueue → epoll translation
-- [ ] Fix shell pipe support
-- [ ] Implement extattr syscalls
-- [ ] Improve fork/clone tracking
+### Phase 2: Jail Support ✅ Complete
+- [x] jail syscall (create jails)
+- [x] jail_get (query jail info)
+- [x] jail_set (configure jails)
+- [x] jail_attach (attach process to jail)
+- [x] jail_remove (destroy jails)
+- [x] jls command working
+- [x] jexec command working
+- [x] Multiple concurrent jails
+- [x] Persistent jail storage
 
-### Phase 3: Jail Support (Planned)
-- [ ] jail syscall using Linux namespaces
-- [ ] jail_attach, jail_get, jail_set, jail_remove
-- [ ] Integration with Jailhouse.io
+### Phase 3: Enhanced Jail Features (Planned)
+- [ ] Jail IP address assignment
+- [ ] Virtual network stack for jails
+- [ ] Resource limits (CPU, memory)
+- [ ] Jail hierarchy (children jails)
 
-### Phase 4: Production Ready
-- [ ] Performance optimization
-- [ ] Comprehensive test suite
-- [ ] arm64 architecture support
-- [ ] Documentation and tutorials
+### Phase 4: Jailhouse.io Integration (Planned)
+- [ ] CLI wrapper (`jailhouse create/start/exec/stop`)
+- [ ] YAML configuration files
+- [ ] Web dashboard
+- [ ] Windows/macOS support via VM
 
 ## Related Projects
 
@@ -202,11 +249,11 @@ bsdulator/
 
 Contributions welcome! Priority areas:
 
-1. kqueue → epoll emulation
-2. Shell pipe support (fork tracking)
-3. jail syscall implementation
-4. Additional syscall translations
-5. Test coverage
+1. Jail networking implementation
+2. Resource limit enforcement
+3. Additional syscall translations
+4. Test coverage
+5. Documentation
 
 ## License
 
@@ -216,6 +263,6 @@ Core BSDulator source code is available for viewing, modification, and non-comme
 
 ## Acknowledgments
 
-- FreeBSD Project for the excellent documentation
+- FreeBSD Project for the excellent documentation and jail implementation
 - Linux kernel developers for ptrace infrastructure
 - The Wine project for inspiration on compatibility layers

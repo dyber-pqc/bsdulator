@@ -2152,9 +2152,11 @@ int interceptor_run(interceptor_state_t *state) {
                           (unsigned long long)state->retval);
                 
                 /* Monitor __stack_chk_guard for changes */
-                {
+                /* Skip stack_chk_guard monitoring for jailed processes - 
+                 * the hardcoded address doesn't apply inside jails */
+                if (jail_get_process_jid(state->pid) <= 0) {
                     errno = 0;
-                    uint64_t current_guard = ptrace(PTRACE_PEEKDATA, state->pid, 
+                    uint64_t current_guard = ptrace(PTRACE_PEEKDATA, state->pid,
                                                     (void*)0x180b5a0, NULL);
                     if (errno == 0) {
                         uint64_t expected;
