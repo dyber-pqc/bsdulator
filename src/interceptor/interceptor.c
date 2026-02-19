@@ -25,6 +25,7 @@
 #include <sys/prctl.h>
 #include "bsdulator.h"
 #include "runtime/freebsd_runtime.h"
+#include "bsdulator/jail.h"
 
 #ifndef __NR_process_vm_readv
 #define __NR_process_vm_readv 310
@@ -400,8 +401,15 @@ static uint64_t inject_mmap_for_tls(pid_t pid, size_t size) {
     return result;
 }
 
-static int setup_freebsd_tls(pid_t pid) {
-    BSD_TRACE("Setting up FreeBSD TLS for PID %d", pid);
+/*
+ * Set up FreeBSD TLS for a process.
+ * 
+ * @param pid Process ID
+ * @param skip_globals If true, skip writing to hardcoded global addresses
+ *                     (used for jailed processes where addresses differ)
+ */
+static int setup_freebsd_tls_ex(pid_t pid, int skip_globals) {
+    BSD_TRACE("Setting up FreeBSD TLS for PID %d (skip_globals=%d)", pid, skip_globals);
     
     struct user_regs_struct regs;
     if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0) {
@@ -579,59 +587,68 @@ static int setup_freebsd_tls(pid_t pid) {
      * Found via objdump: address 0x74d1f4 does "test %rdi,%rdi; jne; call abort"
      * where RDI is loaded from 0x15072c8.
      */
+    /*
+     * Write to hardcoded global addresses only for non-jailed processes.
+     * These addresses are specific to the rescue binaries' memory layout
+     * and won't exist in jailed processes running different binaries.
+     */
 #define FREEBSD_THR_INITIAL_ADDR 0x15072c8
 #define FREEBSD_THR_REFCOUNT_ADDR 0x15072c0
 #define FREEBSD_STACK_CHK_GUARD_ADDR 0x180b5a0
-    if (ptrace(PTRACE_POKEDATA, pid, (void*)FREEBSD_THR_INITIAL_ADDR, (void*)pthread_ptr) < 0) {
-        BSD_WARN("Failed to write _thr_initial at 0x%lx: %s", 
-                 (unsigned long)FREEBSD_THR_INITIAL_ADDR, strerror(errno));
-        /* Don't fail - memory might not be mapped yet */
-    } else {
-        BSD_TRACE("_thr_initial at 0x%lx = 0x%lx", 
-                  (unsigned long)FREEBSD_THR_INITIAL_ADDR, pthread_ptr);
-    }
-    
-    /*
-     * CRITICAL: Initialize thread reference counter at 0x15072c0.
-     * libthr checks this counter and aborts if zero!
-     * Found via objdump: address 0x75a6e4 does "cmpq $0x0,0x15072c0; je abort"
-     * This counter is incremented/decremented during thread creation/destruction.
-     */
-    if (ptrace(PTRACE_POKEDATA, pid, (void*)FREEBSD_THR_REFCOUNT_ADDR, (void*)1UL) < 0) {
-        BSD_WARN("Failed to write thread refcount at 0x%lx: %s", 
-                 (unsigned long)FREEBSD_THR_REFCOUNT_ADDR, strerror(errno));
-    } else {
-        BSD_TRACE("Thread refcount at 0x%lx = 1", 
-                  (unsigned long)FREEBSD_THR_REFCOUNT_ADDR);
-    }
-    
-    /*
-     * CRITICAL: Initialize __stack_chk_guard at 0x180b5a0.
-     * This is the stack canary value used for stack smashing protection.
-     * FreeBSD startup code should read AT_CANARY from auxv and copy it here,
-     * but since we're setting up the environment, we must initialize it directly.
-     * The value must match what we put in AT_CANARY (from g_freebsd_runtime.canary).
-     */
-    uint64_t canary_value;
-    memcpy(&canary_value, g_freebsd_runtime.canary, sizeof(canary_value));
-    if (ptrace(PTRACE_POKEDATA, pid, (void*)FREEBSD_STACK_CHK_GUARD_ADDR, (void*)canary_value) < 0) {
-        BSD_WARN("Failed to write __stack_chk_guard at 0x%lx: %s", 
-                 (unsigned long)FREEBSD_STACK_CHK_GUARD_ADDR, strerror(errno));
-    } else {
-        BSD_TRACE("__stack_chk_guard at 0x%lx = 0x%lx", 
-                  (unsigned long)FREEBSD_STACK_CHK_GUARD_ADDR, canary_value);
+    if (!skip_globals) {
+        if (ptrace(PTRACE_POKEDATA, pid, (void*)FREEBSD_THR_INITIAL_ADDR, (void*)pthread_ptr) < 0) {
+            BSD_WARN("Failed to write _thr_initial at 0x%lx: %s", 
+                     (unsigned long)FREEBSD_THR_INITIAL_ADDR, strerror(errno));
+            /* Don't fail - memory might not be mapped yet */
+        } else {
+            BSD_TRACE("_thr_initial at 0x%lx = 0x%lx", 
+                      (unsigned long)FREEBSD_THR_INITIAL_ADDR, pthread_ptr);
+        }
         
-        /* Verify the write */
-        errno = 0;
-        uint64_t readback = ptrace(PTRACE_PEEKDATA, pid, (void*)FREEBSD_STACK_CHK_GUARD_ADDR, NULL);
-        if (errno == 0) {
-            if (readback != canary_value) {
-                BSD_ERROR("CANARY MISMATCH at __stack_chk_guard! wrote=0x%lx read=0x%lx",
-                          canary_value, readback);
-            } else {
-                BSD_TRACE("__stack_chk_guard verified");
+        /*
+         * CRITICAL: Initialize thread reference counter at 0x15072c0.
+         * libthr checks this counter and aborts if zero!
+         * Found via objdump: address 0x75a6e4 does "cmpq $0x0,0x15072c0; je abort"
+         * This counter is incremented/decremented during thread creation/destruction.
+         */
+        if (ptrace(PTRACE_POKEDATA, pid, (void*)FREEBSD_THR_REFCOUNT_ADDR, (void*)1UL) < 0) {
+            BSD_WARN("Failed to write thread refcount at 0x%lx: %s", 
+                     (unsigned long)FREEBSD_THR_REFCOUNT_ADDR, strerror(errno));
+        } else {
+            BSD_TRACE("Thread refcount at 0x%lx = 1", 
+                      (unsigned long)FREEBSD_THR_REFCOUNT_ADDR);
+        }
+        
+        /*
+         * CRITICAL: Initialize __stack_chk_guard at 0x180b5a0.
+         * This is the stack canary value used for stack smashing protection.
+         * FreeBSD startup code should read AT_CANARY from auxv and copy it here,
+         * but since we're setting up the environment, we must initialize it directly.
+         * The value must match what we put in AT_CANARY (from g_freebsd_runtime.canary).
+         */
+        uint64_t canary_value;
+        memcpy(&canary_value, g_freebsd_runtime.canary, sizeof(canary_value));
+        if (ptrace(PTRACE_POKEDATA, pid, (void*)FREEBSD_STACK_CHK_GUARD_ADDR, (void*)canary_value) < 0) {
+            BSD_WARN("Failed to write __stack_chk_guard at 0x%lx: %s", 
+                     (unsigned long)FREEBSD_STACK_CHK_GUARD_ADDR, strerror(errno));
+        } else {
+            BSD_TRACE("__stack_chk_guard at 0x%lx = 0x%lx", 
+                      (unsigned long)FREEBSD_STACK_CHK_GUARD_ADDR, canary_value);
+            
+            /* Verify the write */
+            errno = 0;
+            uint64_t readback = ptrace(PTRACE_PEEKDATA, pid, (void*)FREEBSD_STACK_CHK_GUARD_ADDR, NULL);
+            if (errno == 0) {
+                if (readback != canary_value) {
+                    BSD_ERROR("CANARY MISMATCH at __stack_chk_guard! wrote=0x%lx read=0x%lx",
+                              canary_value, readback);
+                } else {
+                    BSD_TRACE("__stack_chk_guard verified");
+                }
             }
         }
+    } else {
+        BSD_TRACE("Skipping hardcoded global writes for jailed process");
     }
     
     /* 
@@ -691,6 +708,11 @@ static int setup_freebsd_tls(pid_t pid) {
     }
     
     return 0;
+}
+
+/* Wrapper for backwards compatibility */
+static int setup_freebsd_tls(pid_t pid) {
+    return setup_freebsd_tls_ex(pid, 0);  /* Don't skip globals */
 }
 
 /*
@@ -1081,6 +1103,17 @@ static int fix_argv0_after_exec(pid_t pid) {
     if (!freebsd_root || freebsd_root[0] == '\0') {
         return -1;
     }
+    
+    /*
+     * CRITICAL: Skip argv[0] translation for processes inside a jail!
+     * After jail_attach + chroot, the process is already inside the jail's
+     * root filesystem. Translating argv[0] would create an invalid path.
+     */
+    int jid = jail_get_process_jid(pid);
+    if (jid > 0) {
+        BSD_TRACE("fix_argv0: skipping for jailed process (jid=%d)", jid);
+        return 0;
+    }
 
     struct user_regs_struct regs;
     if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0) {
@@ -1172,6 +1205,129 @@ static int fix_argv0_after_exec(pid_t pid) {
     
 
 /*
+ * Rewrite execve for jailed processes to use the FreeBSD dynamic linker.
+ * 
+ * After chroot, when a jailed process tries to exec a FreeBSD binary like
+ * /bin/sh, the Linux kernel can't find the FreeBSD interpreter at
+ * /libexec/ld-elf.so.1 because it looks at the HOST filesystem, not the
+ * chrooted one. The solution is to rewrite:
+ *   execve("/bin/sh", argv, envp)
+ * to:
+ *   execve("/libexec/ld-elf.so.1", ["/libexec/ld-elf.so.1", "/bin/sh", ...], envp)
+ * 
+ * This way the kernel can find ld-elf.so.1 in the chroot and it will load /bin/sh.
+ * 
+ * Returns 1 if execve was rewritten, 0 if no rewrite needed, -1 on error.
+ */
+static int rewrite_jailed_execve(pid_t pid, uint64_t *args) {
+    int jid = jail_get_process_jid(pid);
+    if (jid <= 0) {
+        return 0;  /* Not jailed, no rewrite needed */
+    }
+    
+    /* Read the path being exec'd */
+    char path_buf[1024];
+    ssize_t path_len = interceptor_read_string(pid, path_buf, (const void *)args[0], sizeof(path_buf));
+    if (path_len <= 0) {
+        BSD_WARN("rewrite_jailed_execve: failed to read path");
+        return -1;
+    }
+    
+    BSD_INFO("rewrite_jailed_execve: jailed process (jid=%d) exec'ing '%s'", jid, path_buf);
+    
+    /* Skip if already executing ld-elf.so.1 */
+    if (strstr(path_buf, "ld-elf.so") != NULL) {
+        BSD_TRACE("rewrite_jailed_execve: already ld-elf, skipping");
+        return 0;
+    }
+    
+    /* Skip /rescue/ binaries - they are statically linked and don't need ld-elf */
+    if (strncmp(path_buf, "/rescue/", 8) == 0) {
+        BSD_TRACE("rewrite_jailed_execve: /rescue/ binary is static, skipping");
+        return 0;
+    }
+    
+    /* Get registers to find stack space */
+    struct user_regs_struct regs;
+    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0) {
+        BSD_ERROR("rewrite_jailed_execve: failed to get regs");
+        return -1;
+    }
+    
+    /* We need to:
+     * 1. Write "/libexec/ld-elf.so.1" to child's stack
+     * 2. Build new argv array: [ld-elf, original_path, original_argv[1:], NULL]
+     * 3. Update args[0] to point to ld-elf path
+     * 4. Update args[1] to point to new argv array
+     */
+    
+    const char *ldelf = "/libexec/ld-elf.so.1";
+    size_t ldelf_len = strlen(ldelf) + 1;
+    
+    /* Allocate stack space for new strings and argv */
+    uint64_t stack_top = (regs.rsp - 4096) & ~0xFULL;  /* Leave lots of room */
+    uint64_t ldelf_addr = stack_top;
+    uint64_t orig_path_addr = ldelf_addr + ldelf_len;
+    uint64_t new_argv_addr = (orig_path_addr + path_len + 1 + 15) & ~0x7ULL;  /* Align for pointers */
+    
+    /* Write ld-elf path */
+    if (interceptor_write_mem(pid, ldelf, (void *)ldelf_addr, ldelf_len) < 0) {
+        BSD_ERROR("rewrite_jailed_execve: failed to write ldelf path");
+        return -1;
+    }
+    
+    /* Write original path */
+    if (interceptor_write_mem(pid, path_buf, (void *)orig_path_addr, path_len + 1) < 0) {
+        BSD_ERROR("rewrite_jailed_execve: failed to write orig path");
+        return -1;
+    }
+    
+    /* Read original argv to copy remaining arguments */
+    uint64_t orig_argv = args[1];
+    uint64_t new_argv[32];  /* Max 32 args should be plenty */
+    int new_argc = 0;
+    
+    /* First two entries: ld-elf and original path */
+    new_argv[new_argc++] = ldelf_addr;
+    new_argv[new_argc++] = orig_path_addr;
+    
+    /* Copy remaining original argv entries (skip argv[0]) */
+    uint64_t argv_ptr;
+    int orig_idx = 1;  /* Start from argv[1] */
+    while (new_argc < 31) {
+        errno = 0;
+        argv_ptr = ptrace(PTRACE_PEEKDATA, pid, (void *)(orig_argv + orig_idx * 8), NULL);
+        if (errno != 0) {
+            BSD_WARN("rewrite_jailed_execve: failed to read argv[%d]", orig_idx);
+            break;
+        }
+        new_argv[new_argc++] = argv_ptr;
+        if (argv_ptr == 0) break;  /* NULL terminator */
+        orig_idx++;
+    }
+    
+    /* Ensure NULL terminator */
+    if (new_argc > 0 && new_argv[new_argc - 1] != 0) {
+        new_argv[new_argc++] = 0;
+    }
+    
+    /* Write new argv array */
+    if (interceptor_write_mem(pid, new_argv, (void *)new_argv_addr, new_argc * 8) < 0) {
+        BSD_ERROR("rewrite_jailed_execve: failed to write new argv");
+        return -1;
+    }
+    
+    /* Update execve arguments */
+    args[0] = ldelf_addr;      /* path = /libexec/ld-elf.so.1 */
+    args[1] = new_argv_addr;   /* argv = [ld-elf, orig_path, ...] */
+    /* args[2] (envp) stays the same */
+    
+    BSD_INFO("rewrite_jailed_execve: rewrote to: %s %s", ldelf, path_buf);
+    
+    return 1;
+}
+
+/*
  * Translate FreeBSD absolute paths to use the FreeBSD root filesystem.
  * Returns the argument index that was modified, or -1 if no translation needed.
  */
@@ -1179,6 +1335,18 @@ static int translate_freebsd_path(pid_t pid, int syscall_nr, uint64_t *args) {
     const char *freebsd_root = bsdulator_get_freebsd_root();
     BSD_WARN("translate_freebsd_path called for syscall %d", syscall_nr);
     if (!freebsd_root || freebsd_root[0] == '\0') {
+        return -1;
+    }
+    
+    /*
+     * CRITICAL: Skip path translation for processes inside a jail!
+     * After jail_attach + chroot, the process is already inside the jail's
+     * root filesystem. Translating paths would prepend the freebsd_root again,
+     * resulting in paths like ./freebsd-root/bin/sh when /bin/sh is correct.
+     */
+    int jid = jail_get_process_jid(pid);
+    if (jid > 0) {
+        BSD_TRACE("translate_freebsd_path: skipping for jailed process (jid=%d)", jid);
         return -1;
     }
 
@@ -1612,30 +1780,61 @@ int interceptor_wait(interceptor_state_t *state) {
                     state->last_event = EVENT_CLONE;
                 }
                     break;
-                case PTRACE_EVENT_EXEC:
+                case PTRACE_EVENT_EXEC: {
                     state->last_event = EVENT_EXEC;
                     BSD_INFO("Exec event for PID %d - setting up FreeBSD environment", state->pid);
                     set_in_syscall(state->pid, 0);
                     set_skip_post_exec(state->pid, 1);  /* Per-process flag! */
                     
-                    /* Set up FreeBSD TLS BEFORE the binary starts */
-                    if (setup_freebsd_tls(state->pid) < 0) {
-                        BSD_WARN("Failed to setup FreeBSD TLS");
-                    }
-                    
-                    /* Fix up stack alignment FIRST, before writing auxv */
-                    fixup_freebsd_entry(state->pid);
-                    
-                    /* Fix argv[0] to contain translated path for multi-call binaries */
-                    if (fix_argv0_after_exec(state->pid) < 0) {
-                        BSD_WARN("Failed to fix argv[0] after exec");
-                    }
-                    
-                    /* Now rewrite auxv with correct pointers based on realigned RSP */
-                    if (freebsd_setup_stack(state->pid, 0, 0, 0, 0) < 0) {
-                        BSD_WARN("Failed to setup FreeBSD stack environment");
+                    /*
+                     * CRITICAL: Skip all FreeBSD environment setup for jailed processes!
+                     * After jail_attach + chroot, the process is already inside the jail's
+                     * FreeBSD root filesystem. The TLS setup, stack fixup, argv0 translation,
+                     * and auxv rewriting would all corrupt the jailed process's state because:
+                     * 1. TLS addresses from the outer process don't apply inside the jail
+                     * 2. Stack alignment is already correct for the new exec
+                     * 3. Path translation would create invalid paths inside the chroot
+                     * 4. Auxv rewriting would corrupt AT_EXECPATH and other pointers
+                     */
+                    int exec_jid = jail_get_process_jid(state->pid);
+                    if (exec_jid > 0) {
+                        BSD_INFO("Exec inside jail (jid=%d) - doing minimal FreeBSD setup", exec_jid);
+                        /*
+                         * For jailed processes, we still need TLS, stack fixup, and auxv,
+                         * but we skip:
+                         * - Hardcoded global writes (addresses differ per binary)
+                         * - Path translation (paths are correct inside chroot)
+                         * - argv0 fixes (not needed inside jail)
+                         */
+                        if (setup_freebsd_tls_ex(state->pid, 1) < 0) {  /* skip_globals=1 */
+                            BSD_WARN("Failed to setup FreeBSD TLS for jailed process");
+                        }
+                        fixup_freebsd_entry(state->pid);
+                        /* Jailed processes still need auxv rewriting for FreeBSD format */
+                        if (freebsd_setup_stack(state->pid, 0, 0, 0, 0) < 0) {
+                            BSD_WARN("Failed to setup FreeBSD stack for jailed process");
+                        }
+                    } else {
+                        /* Set up FreeBSD TLS BEFORE the binary starts */
+                        if (setup_freebsd_tls(state->pid) < 0) {
+                            BSD_WARN("Failed to setup FreeBSD TLS");
+                        }
+                        
+                        /* Fix up stack alignment FIRST, before writing auxv */
+                        fixup_freebsd_entry(state->pid);
+                        
+                        /* Fix argv[0] to contain translated path for multi-call binaries */
+                        if (fix_argv0_after_exec(state->pid) < 0) {
+                            BSD_WARN("Failed to fix argv[0] after exec");
+                        }
+                        
+                        /* Now rewrite auxv with correct pointers based on realigned RSP */
+                        if (freebsd_setup_stack(state->pid, 0, 0, 0, 0) < 0) {
+                            BSD_WARN("Failed to setup FreeBSD stack environment");
+                        }
                     }
                     break;
+                }
                 default:
                     state->last_event = EVENT_SIGNAL;
                     state->signal = SIGTRAP;
@@ -1849,6 +2048,21 @@ int interceptor_run(interceptor_state_t *state) {
                     /* Path was translated, need to update args in child */
                     if (interceptor_set_args(state->pid, state->args) < 0) {
                         BSD_ERROR("Failed to set translated path args");
+                    }
+                }
+                
+                /*
+                 * Special handling for execve in jailed processes:
+                 * Rewrite execve to go through the dynamic linker because
+                 * Linux can't find the FreeBSD interpreter inside the chroot.
+                 */
+                if ((int)state->syscall_nr == FBSD_SYS_execve) {
+                    int rewritten = rewrite_jailed_execve(state->pid, state->args);
+                    if (rewritten > 0) {
+                        /* Execve was rewritten, update args in child */
+                        if (interceptor_set_args(state->pid, state->args) < 0) {
+                            BSD_ERROR("Failed to set rewritten execve args");
+                        }
                     }
                 }
 

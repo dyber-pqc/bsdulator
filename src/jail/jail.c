@@ -912,6 +912,9 @@ long emul_jail(pid_t pid, uint64_t args[6]) {
  * int jail_attach(int jid)
  * 
  * Attaches the current process to an existing jail.
+ * 
+ * This rewrites the syscall to perform a Linux chroot() to the jail's path,
+ * then returns -EAGAIN to signal that the syscall should execute normally.
  */
 long emul_jail_attach(pid_t pid, uint64_t args[6]) {
     int jid = (int)args[0];
@@ -928,12 +931,71 @@ long emul_jail_attach(pid_t pid, uint64_t args[6]) {
         return -EINVAL;
     }
     
+    /* Track the attachment */
     int ret = jail_attach_process(pid, jid);
     if (ret < 0) {
         return ret;
     }
     
-    return 0;
+    /*
+     * Rewrite the syscall to Linux chroot(161).
+     * 
+     * IMPORTANT: The jail utility typically does chdir(jail->path) BEFORE
+     * calling jail_attach(). So when we get here, the current directory is
+     * already the jail root. We should chroot to "." (current directory),
+     * not the original path, because the original path is relative to the
+     * OLD working directory which no longer applies.
+     * 
+     * We need to:
+     * 1. Write "." to child's stack
+     * 2. Set syscall number to 161 (chroot)
+     * 3. Set arg0 to point to the "." string
+     * 4. Return -EAGAIN to let the interceptor execute the rewritten syscall
+     */
+    
+    /* Get child's RSP to allocate stack space for the path */
+    struct user_regs_struct regs;
+    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0) {
+        BSD_ERROR("jail_attach(): failed to get registers");
+        return -EFAULT;
+    }
+    
+    /* 
+     * Use the actual jail path for chroot.
+     * NOTE: We previously assumed jexec does chdir(jail_path) BEFORE jail_attach,
+     * but tracing shows jexec does jail_attach FIRST, then chdir("/").
+     * So we must chroot to the actual jail path, not ".".
+     */
+    const char *chroot_path = jail->path;
+    size_t path_len = strlen(chroot_path) + 1;
+    uint64_t path_addr = (regs.rsp - path_len - 128) & ~0xFULL;  /* Align to 16 bytes */
+    
+    /* Write the chroot path to child's memory */
+    struct iovec local = { (void *)chroot_path, path_len };
+    struct iovec remote = { (void *)path_addr, path_len };
+    
+    ssize_t written = process_vm_writev(pid, &local, 1, &remote, 1, 0);
+    if (written < 0) {
+        BSD_ERROR("jail_attach(): failed to write path to child memory: %s", strerror(errno));
+        return -EFAULT;
+    }
+    
+    BSD_INFO("jail_attach(): wrote path '%s' to child stack at 0x%lx (jail path was '%s')", 
+             chroot_path, path_addr, jail->path);
+    
+    /* Rewrite syscall: change to Linux chroot(161) with path as arg0 */
+    regs.orig_rax = 161;  /* Linux chroot syscall number */
+    regs.rdi = path_addr; /* arg0 = path pointer */
+    
+    if (ptrace(PTRACE_SETREGS, pid, NULL, &regs) < 0) {
+        BSD_ERROR("jail_attach(): failed to rewrite syscall");
+        return -EFAULT;
+    }
+    
+    BSD_INFO("jail_attach(): rewrote syscall to chroot('%s')", chroot_path);
+    
+    /* Return -EAGAIN to signal the interceptor to execute the rewritten syscall */
+    return -EAGAIN;
 }
 
 /*
