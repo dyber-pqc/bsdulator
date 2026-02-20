@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-02-20
+
+### Added
+- **Auto-start CMD support** for containers
+  - CMD from Lochfile is stored in `.lochs_image.conf` during build
+  - CMD is loaded into jail structure when creating container
+  - CMD automatically executed in background when container starts
+- **DNS configuration** for containers
+  - `/etc/resolv.conf` copied from host into container at network setup
+  - Fallback to Google DNS (8.8.8.8, 8.8.4.4) if host resolv.conf unavailable
+- **External network access (NAT)** now fully functional
+  - iptables MASQUERADE rules applied when creating networks
+  - Containers can reach external IPs (verified: 8.8.8.8, 1.1.1.1)
+  - Requires `iptables` package and `net.ipv4.ip_forward=1`
+
+### Fixed
+- Image metadata (CMD, ENTRYPOINT, WORKDIR) now properly passed from build to container
+
+### Technical Details
+- `load_image_metadata()` function reads `.lochs_image.conf` at container creation
+- `lochs_jail_t` extended with `cmd[1024]`, `entrypoint[1024]`, `workdir[256]` fields
+- Network setup creates `/etc/resolv.conf` alongside `/etc/hosts`
+- NAT rules: `iptables -t nat -A POSTROUTING -s <subnet> -j MASQUERADE`
+
+### Known Limitations
+- DNS hostname resolution (e.g., `ping google.com`) requires getaddrinfo syscall emulation (not yet implemented)
+- External access works with IP addresses only
+
 ## [0.3.5] - 2026-02-20
 
 ### Added
@@ -174,6 +202,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| 0.3.6 | 2026-02-20 | Auto-start CMD, DNS config, NAT working |
 | 0.3.5 | 2026-02-20 | Socket option translation, ping working |
 | 0.3.4 | 2026-02-20 | OverlayFS COW filesystem |
 | 0.3.3 | 2026-02-20 | Network namespace isolation |

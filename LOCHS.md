@@ -1261,7 +1261,15 @@ make lint
 - [x] **Network namespace isolation** — Full Linux netns per container, veth pairs, isolated eth0
 - [x] Image registration for built images
 
-### v0.3.5 (Current)
+### v0.3.6 (Current)
+- [x] **Auto-start CMD** from Lochfile
+  - CMD stored in image metadata, executed on container start
+- [x] **DNS configuration** - `/etc/resolv.conf` copied to containers
+- [x] **External network access (NAT)** - containers can reach internet IPs
+  - iptables MASQUERADE applied automatically
+  - Verified working: ping 8.8.8.8, 1.1.1.1 from containers
+
+### v0.3.5
 - [x] **Socket option translation** for setsockopt/getsockopt
   - SO_TIMESTAMP, SO_SNDBUF, SO_RCVBUF, SO_REUSEADDR, etc.
   - SOL_SOCKET level translation (FreeBSD 0xffff → Linux 1)
@@ -1274,12 +1282,11 @@ make lint
 - [x] Container-to-container networking (ping by IP)
 - [x] Unique MAC addresses per container
 - [x] Clean `/etc/hosts` per container (no duplication)
-- [ ] Auto-start command (CMD/command from Lochfile/compose)
-- [ ] Resource limits (memory, CPU via cgroups)
+- [ ] DNS hostname resolution (getaddrinfo syscall emulation)
 - [ ] Health checks
+- [ ] Resource limits (memory, CPU via cgroups)
 - [ ] Restart policies
-- [ ] Container-to-container networking (ping by name via DNS)
-- [ ] NAT masquerade for external network access
+- [ ] ifconfig inside jail (netlink emulation)
 
 ### v0.5
 - [ ] Push to registry (`lochs push`)
@@ -1313,6 +1320,22 @@ BSD 2-Clause License. See [LICENSE](LICENSE) for details.
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for the full changelog.
+
+### v0.3.6 (February 2026)
+
+**Features:**
+- **Auto-start CMD support** for containers
+  - CMD from Lochfile stored in `.lochs_image.conf` during build
+  - CMD automatically executed when container starts
+- **DNS configuration** for containers
+  - `/etc/resolv.conf` copied from host at network setup
+  - Fallback to Google DNS if host config unavailable
+- **External network access (NAT)** fully functional
+  - iptables MASQUERADE rules applied automatically
+  - Containers can ping external IPs (8.8.8.8, 1.1.1.1)
+
+**Fixed:**
+- Image metadata (CMD, ENTRYPOINT, WORKDIR) now properly passed to containers
 
 ### v0.3.5 (February 2026)
 
