@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-02-20
+
+### Added
+- **Socket option translation** for FreeBSD→Linux setsockopt/getsockopt
+  - SO_TIMESTAMP (0x400 → 29) - enables packet timestamps for ping
+  - SO_SNDBUF, SO_RCVBUF, SO_SNDLOWAT, SO_RCVLOWAT translation
+  - SO_SNDTIMEO, SO_RCVTIMEO, SO_ERROR, SO_TYPE translation
+  - SO_DEBUG, SO_REUSEADDR, SO_KEEPALIVE, SO_BROADCAST, etc.
+  - SOL_SOCKET level translation (FreeBSD 0xffff → Linux 1)
+- **jail_attach syscall mapping** in interceptor for chroot execution
+- FreeBSD `/rescue/ping` now fully functional in containers
+
+### Fixed
+- `setsockopt SO_TIMESTAMP: Protocol not available` error
+  - Root cause: FreeBSD SO_TIMESTAMP=0x400, Linux SO_TIMESTAMP=29
+  - Root cause: FreeBSD SOL_SOCKET=0xffff, Linux SOL_SOCKET=1
+- `No Linux syscall mapping for emulated FreeBSD syscall 436` error
+  - jail_attach (436) now properly maps to chroot (161) in interceptor
+- Socket option translation now works regardless of level parameter
+
+### Technical Details
+- New `translate_sockopt_to_linux()` function in syscall_table.c
+- `emul_setsockopt()` and `emul_getsockopt()` handlers with level+optname translation
+- SO_TS_CLOCK (0x1017) gracefully ignored (FreeBSD-specific, no Linux equivalent)
+- SO_NOSIGPIPE gracefully ignored (FreeBSD-specific)
+- Interceptor switch statement extended with FBSD_SYS_jail_attach → 161 mapping
+
 ## [0.3.4] - 2026-02-20
 
 ### Added
@@ -147,6 +174,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| 0.3.5 | 2026-02-20 | Socket option translation, ping working |
+| 0.3.4 | 2026-02-20 | OverlayFS COW filesystem |
 | 0.3.3 | 2026-02-20 | Network namespace isolation |
 | 0.3.2 | 2026-02-20 | Container networking, RUN directive |
 | 0.3.1 | 2026-02-19 | Volumes, env vars, logs |

@@ -1261,7 +1261,15 @@ make lint
 - [x] **Network namespace isolation** — Full Linux netns per container, veth pairs, isolated eth0
 - [x] Image registration for built images
 
-### v0.4 (Current)
+### v0.3.5 (Current)
+- [x] **Socket option translation** for setsockopt/getsockopt
+  - SO_TIMESTAMP, SO_SNDBUF, SO_RCVBUF, SO_REUSEADDR, etc.
+  - SOL_SOCKET level translation (FreeBSD 0xffff → Linux 1)
+- [x] **FreeBSD `/rescue/ping` fully functional** in containers
+- [x] jail_attach syscall mapping for chroot execution
+- [x] SO_TS_CLOCK and SO_NOSIGPIPE graceful fallback
+
+### v0.4 (Next)
 - [x] **OverlayFS Copy-on-Write filesystem** for per-container isolation
 - [x] Container-to-container networking (ping by IP)
 - [x] Unique MAC addresses per container
@@ -1271,6 +1279,7 @@ make lint
 - [ ] Health checks
 - [ ] Restart policies
 - [ ] Container-to-container networking (ping by name via DNS)
+- [ ] NAT masquerade for external network access
 
 ### v0.5
 - [ ] Push to registry (`lochs push`)
@@ -1304,6 +1313,21 @@ BSD 2-Clause License. See [LICENSE](LICENSE) for details.
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for the full changelog.
+
+### v0.3.5 (February 2026)
+
+**Features:**
+- **Socket option translation** for FreeBSD→Linux setsockopt/getsockopt
+  - SO_TIMESTAMP (0x400 → 29) - enables packet timestamps
+  - Full SOL_SOCKET level translation (FreeBSD 0xffff → Linux 1)
+  - SO_SNDBUF, SO_RCVBUF, SO_REUSEADDR, SO_KEEPALIVE, etc.
+- **FreeBSD `/rescue/ping` now fully functional** in containers
+- jail_attach syscall mapping in interceptor for chroot execution
+
+**Fixed:**
+- `setsockopt SO_TIMESTAMP: Protocol not available` error
+- `No Linux syscall mapping for emulated FreeBSD syscall 436` error
+- SO_TS_CLOCK and SO_NOSIGPIPE gracefully handled (FreeBSD-specific options)
 
 ### v0.3.4 (February 2026)
 

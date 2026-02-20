@@ -318,64 +318,120 @@ int abi_translate_fcntl_cmd(int freebsd_cmd) {
 
 /*
  * errno translation
- * FreeBSD and Linux share most errno values, but a few differ
+ * FreeBSD and Linux share most errno values 1-34, but network errnos differ significantly!
+ * 
+ * CRITICAL: Linux errno 97 = EAFNOSUPPORT, but FreeBSD errno 97 = EINTEGRITY!
+ * This was causing "Integrity check failed" errors when connect() failed.
+ *
+ * Key differences (Linux -> FreeBSD):
+ *   Linux 97 (EAFNOSUPPORT)   -> FreeBSD 47 (EAFNOSUPPORT)
+ *   Linux 98-111 network errnos -> FreeBSD 48-61
  */
 int abi_translate_errno(int linux_errno) {
-    /* Most errno values are the same */
-    /* This handles the few that differ */
+    /* Errnos 1-34 are the same on both systems */
+    if (linux_errno >= 1 && linux_errno <= 34) {
+        return linux_errno;
+    }
+    
+    /* EAGAIN/EWOULDBLOCK = 35 on both */
+    if (linux_errno == 35) {
+        return 35;
+    }
+    
+    /* Handle the network and other errnos that differ */
     switch (linux_errno) {
-        /* These are the same on both systems */
-        case EPERM:
-        case ENOENT:
-        case ESRCH:
-        case EINTR:
-        case EIO:
-        case ENXIO:
-        case E2BIG:
-        case ENOEXEC:
-        case EBADF:
-        case ECHILD:
-        case EDEADLK:
-        case ENOMEM:
-        case EACCES:
-        case EFAULT:
-        case EBUSY:
-        case EEXIST:
-        case EXDEV:
-        case ENODEV:
-        case ENOTDIR:
-        case EISDIR:
-        case EINVAL:
-        case ENFILE:
-        case EMFILE:
-        case ENOTTY:
-        case ETXTBSY:
-        case EFBIG:
-        case ENOSPC:
-        case ESPIPE:
-        case EROFS:
-        case EMLINK:
-        case EPIPE:
-        case EDOM:
-        case ERANGE:
-        case EAGAIN:
-            return linux_errno;
-            
-        /* ENOTSUP is different */
-        case 38:  /* Linux ENOSYS */
-            return 78;  /* FreeBSD ENOSYS */
-        case 95:  /* Linux EOPNOTSUPP */
-            return 45;  /* FreeBSD EOPNOTSUPP */
-            
+        /* ENOSYS - different location */
+        case 38:  return 78;  /* Linux ENOSYS -> FreeBSD ENOSYS */
+        
+        /* Network protocol errors (Linux 91-96 -> FreeBSD 41-46) */
+        case 91:  return 41;  /* EPROTOTYPE */
+        case 92:  return 42;  /* ENOPROTOOPT */
+        case 93:  return 43;  /* EPROTONOSUPPORT */
+        case 94:  return 44;  /* ESOCKTNOSUPPORT */
+        case 95:  return 45;  /* EOPNOTSUPP */
+        case 96:  return 46;  /* EPFNOSUPPORT */
+        
+        /* Network address errors (Linux 97-99 -> FreeBSD 47-49) */
+        case 97:  return 47;  /* EAFNOSUPPORT - THIS WAS CAUSING "Integrity check failed"! */
+        case 98:  return 48;  /* EADDRINUSE */
+        case 99:  return 49;  /* EADDRNOTAVAIL */
+        
+        /* Network state errors (Linux 100-111 -> FreeBSD 50-61) */
+        case 100: return 50;  /* ENETDOWN */
+        case 101: return 51;  /* ENETUNREACH */
+        case 102: return 52;  /* ENETRESET */
+        case 103: return 53;  /* ECONNABORTED */
+        case 104: return 54;  /* ECONNRESET */
+        case 105: return 55;  /* ENOBUFS */
+        case 106: return 56;  /* EISCONN */
+        case 107: return 57;  /* ENOTCONN */
+        case 108: return 58;  /* ESHUTDOWN */
+        case 109: return 59;  /* ETOOMANYREFS */
+        case 110: return 60;  /* ETIMEDOUT */
+        case 111: return 61;  /* ECONNREFUSED */
+        
+        /* Host errors */
+        case 112: return 64;  /* EHOSTDOWN */
+        case 113: return 65;  /* EHOSTUNREACH */
+        
+        /* In-progress errors (different location on FreeBSD) */
+        case 114: return 37;  /* EALREADY */
+        case 115: return 36;  /* EINPROGRESS */
+        
         default:
             return linux_errno;
     }
 }
 
 int abi_translate_errno_to_linux(int freebsd_errno) {
+    /* Errnos 1-34 are the same */
+    if (freebsd_errno >= 1 && freebsd_errno <= 34) {
+        return freebsd_errno;
+    }
+    
+    if (freebsd_errno == 35) {
+        return 35;
+    }
+    
     switch (freebsd_errno) {
-        case 45:  /* FreeBSD EOPNOTSUPP */
-            return 95;  /* Linux EOPNOTSUPP */
+        /* In-progress errors */
+        case 36:  return 115; /* EINPROGRESS */
+        case 37:  return 114; /* EALREADY */
+        
+        /* Network protocol errors (FreeBSD 41-46 -> Linux 91-96) */
+        case 41:  return 91;  /* EPROTOTYPE */
+        case 42:  return 92;  /* ENOPROTOOPT */
+        case 43:  return 93;  /* EPROTONOSUPPORT */
+        case 44:  return 94;  /* ESOCKTNOSUPPORT */
+        case 45:  return 95;  /* EOPNOTSUPP */
+        case 46:  return 96;  /* EPFNOSUPPORT */
+        
+        /* Network address errors (FreeBSD 47-49 -> Linux 97-99) */
+        case 47:  return 97;  /* EAFNOSUPPORT */
+        case 48:  return 98;  /* EADDRINUSE */
+        case 49:  return 99;  /* EADDRNOTAVAIL */
+        
+        /* Network state errors (FreeBSD 50-61 -> Linux 100-111) */
+        case 50:  return 100; /* ENETDOWN */
+        case 51:  return 101; /* ENETUNREACH */
+        case 52:  return 102; /* ENETRESET */
+        case 53:  return 103; /* ECONNABORTED */
+        case 54:  return 104; /* ECONNRESET */
+        case 55:  return 105; /* ENOBUFS */
+        case 56:  return 106; /* EISCONN */
+        case 57:  return 107; /* ENOTCONN */
+        case 58:  return 108; /* ESHUTDOWN */
+        case 59:  return 109; /* ETOOMANYREFS */
+        case 60:  return 110; /* ETIMEDOUT */
+        case 61:  return 111; /* ECONNREFUSED */
+        
+        /* Host errors */
+        case 64:  return 112; /* EHOSTDOWN */
+        case 65:  return 113; /* EHOSTUNREACH */
+        
+        /* ENOSYS */
+        case 78:  return 38;  /* FreeBSD ENOSYS -> Linux ENOSYS */
+        
         default:
             return freebsd_errno;
     }

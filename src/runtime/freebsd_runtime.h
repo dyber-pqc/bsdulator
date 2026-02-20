@@ -95,6 +95,22 @@
 #define HW_PAGESIZE     7   /* int: page size */
 #define HW_MACHINE_ARCH 11  /* string: machine architecture */
 
+/* net.* - CTL_NET = 4 */
+#define CTL_NET         4   /* Network */
+
+/* net.route.* */
+#define NET_RT_DUMP     1   /* Dump routing table entries */
+#define NET_RT_FLAGS    2   /* by flags */
+#define NET_RT_IFLIST   3   /* Survey interface list */
+#define NET_RT_IFMALIST 4   /* Multicast address list */
+#define NET_RT_IFLISTL  5   /* Survey interface list (extended) */
+
+/* Address families used with NET_RT_IFLIST */
+#define NET_RT_AF_UNSPEC  0
+#define NET_RT_AF_INET    2
+#define NET_RT_AF_INET6   28
+#define NET_RT_AF_LINK    18
+
 /*
  * FreeBSD runtime state
  */

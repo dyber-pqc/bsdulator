@@ -2160,8 +2160,41 @@ int interceptor_run(interceptor_state_t *state) {
                                   name ? name : "unknown");
                         long ret = syscall_execute(state->pid, (int)state->syscall_nr, state->args);
                         if (ret == -EAGAIN) {
-                            /* Special: syscall was rewritten, let it execute normally */
-                            BSD_INFO("Emulated syscall rewrote registers, executing normally");
+                            /* Special: emulator modified child's memory, now execute syscall normally.
+                             * We MUST translate the syscall number to Linux since emulated syscalls
+                             * don't have a linux_nr in the table! */
+                            BSD_INFO("Emulated syscall modified memory, translating and executing");
+                            
+                            /* Map FreeBSD socket syscall numbers to Linux equivalents */
+                            int actual_linux_nr = -1;
+                            switch ((int)state->syscall_nr) {
+                                case FBSD_SYS_connect:    actual_linux_nr = 42; break;  /* SYS_connect */
+                                case FBSD_SYS_bind:       actual_linux_nr = 49; break;  /* SYS_bind */
+                                case FBSD_SYS_sendto:     actual_linux_nr = 44; break;  /* SYS_sendto */
+                                case FBSD_SYS_setsockopt: actual_linux_nr = 54; break;  /* SYS_setsockopt */
+                                case FBSD_SYS_getsockopt: actual_linux_nr = 55; break;  /* SYS_getsockopt */
+                                case FBSD_SYS_jail_attach: actual_linux_nr = 161; break;  /* SYS_chroot - jail_attach rewrites to chroot */
+                                default:
+                                    BSD_ERROR("No Linux syscall mapping for emulated FreeBSD syscall %d",
+                                              (int)state->syscall_nr);
+                                    break;
+                            }
+                            
+                            /* For setsockopt/getsockopt, also update the args (optname was translated) */
+                            if ((int)state->syscall_nr == FBSD_SYS_setsockopt ||
+                                (int)state->syscall_nr == FBSD_SYS_getsockopt) {
+                                if (interceptor_set_args(state->pid, state->args) < 0) {
+                                    BSD_ERROR("Failed to update args for sockopt syscall");
+                                }
+                            }
+                            
+                            if (actual_linux_nr >= 0) {
+                                BSD_TRACE("  Translating emulated syscall %llu -> %d",
+                                          (unsigned long long)state->syscall_nr, actual_linux_nr);
+                                if (interceptor_set_syscall(state->pid, (uint64_t)actual_linux_nr) < 0) {
+                                    BSD_ERROR("Failed to set syscall number for emulated syscall");
+                                }
+                            }
                             state->translated_count++;
                         } else {
                             interceptor_skip_syscall(state->pid, ret);

@@ -37,6 +37,11 @@ static long emul_getdtablesize(pid_t pid, uint64_t args[6]);
 static long emul_sysctl(pid_t pid, uint64_t args[6]);
 static long emul_syscall(pid_t pid, uint64_t args[6]);
 static long emul_sysctlbyname(pid_t pid, uint64_t args[6]);
+static long emul_connect(pid_t pid, uint64_t args[6]);
+static long emul_bind(pid_t pid, uint64_t args[6]);
+static long emul_sendto(pid_t pid, uint64_t args[6]);
+static long emul_setsockopt(pid_t pid, uint64_t args[6]);
+static long emul_getsockopt(pid_t pid, uint64_t args[6]);
 /* Jail syscalls are now implemented in src/jail/jail.c
  * Declarations are in include/bsdulator/jail.h
  */
@@ -255,21 +260,23 @@ int syscall_init(void) {
     
     /*
      * Socket/Network syscalls
+     * NOTE: bind/connect/sendto need emulation for sockaddr translation!
+     * FreeBSD sockaddr has sin_len field, Linux doesn't.
      */
     TRANS(FBSD_SYS_socket, SYS_socket, "socket");
-    TRANS(FBSD_SYS_bind, SYS_bind, "bind");
+    EMUL(FBSD_SYS_bind, "bind", emul_bind);  /* sockaddr translation */
     TRANS(FBSD_SYS_listen, SYS_listen, "listen");
     TRANS(FBSD_SYS_accept, SYS_accept, "accept");
     TRANS(FBSD_SYS_accept4, SYS_accept4, "accept4");
-    TRANS(FBSD_SYS_connect, SYS_connect, "connect");
+    EMUL(FBSD_SYS_connect, "connect", emul_connect);  /* sockaddr translation */
     TRANS(FBSD_SYS_shutdown, SYS_shutdown, "shutdown");
     TRANS(FBSD_SYS_socketpair, SYS_socketpair, "socketpair");
-    TRANS(FBSD_SYS_sendto, SYS_sendto, "sendto");
+    EMUL(FBSD_SYS_sendto, "sendto", emul_sendto);  /* sockaddr translation */
     TRANS(FBSD_SYS_recvfrom, SYS_recvfrom, "recvfrom");
     TRANS(FBSD_SYS_sendmsg, SYS_sendmsg, "sendmsg");
     TRANS(FBSD_SYS_recvmsg, SYS_recvmsg, "recvmsg");
-    TRANS(FBSD_SYS_getsockopt, SYS_getsockopt, "getsockopt");
-    TRANS(FBSD_SYS_setsockopt, SYS_setsockopt, "setsockopt");
+    EMUL(FBSD_SYS_getsockopt, "getsockopt", emul_getsockopt);  /* sockopt translation */
+    EMUL(FBSD_SYS_setsockopt, "setsockopt", emul_setsockopt);  /* sockopt translation */
     TRANS(FBSD_SYS_getsockname, SYS_getsockname, "getsockname");
     TRANS(FBSD_SYS_getpeername, SYS_getpeername, "getpeername");
     TRANS(FBSD_SYS_sendfile, SYS_sendfile, "sendfile");
@@ -1930,4 +1937,379 @@ static long emul_credsync(pid_t pid, uint64_t args[6]) {
      * On Linux, credentials are already synchronized, so we just return success. */
     BSD_TRACE("credsync: returning success (credentials already synchronized)");
     return 0;
+}
+
+/*
+ * Socket address translation
+ * 
+ * FreeBSD sockaddr structures have a length field that Linux doesn't:
+ * 
+ * FreeBSD sockaddr_in (16 bytes):
+ *   uint8_t  sin_len      (1 byte)  - FREEBSD ONLY!
+ *   uint8_t  sin_family   (1 byte)  - sa_family_t
+ *   uint16_t sin_port     (2 bytes)
+ *   struct in_addr sin_addr (4 bytes)
+ *   uint8_t  sin_zero[8]  (8 bytes)
+ * 
+ * Linux sockaddr_in (16 bytes):
+ *   uint16_t sin_family   (2 bytes) - sa_family_t  
+ *   uint16_t sin_port     (2 bytes)
+ *   struct in_addr sin_addr (4 bytes)
+ *   uint8_t  sin_zero[8]  (8 bytes)
+ * 
+ * The key difference: FreeBSD has sin_len at offset 0, sin_family at offset 1.
+ * Linux has sin_family at offset 0 (16-bit).
+ * 
+ * When FreeBSD sets sin_len=16, sin_family=2 (AF_INET), Linux sees
+ * sin_family = 0x0210 (little-endian) = 528, which is invalid!
+ */
+
+/*
+ * connect - translate FreeBSD sockaddr to Linux format
+ * int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
+ * 
+ * IMPORTANT: We can't call connect() from BSDulator - the fd belongs to the child!
+ * Instead, we translate the sockaddr in the child's memory and let the syscall proceed.
+ */
+static long emul_connect(pid_t pid, uint64_t args[6]) {
+    int sockfd = (int)args[0];
+    uint64_t addr = args[1];
+    socklen_t addrlen = (socklen_t)args[2];
+    
+    BSD_TRACE("connect: fd=%d addr=0x%lx addrlen=%d", sockfd, addr, addrlen);
+    
+    if (addr == 0 || addrlen == 0) {
+        /* No address - execute syscall directly in child */
+        return -EAGAIN;  /* Special: tell interceptor to execute syscall normally */
+    }
+    
+    /* Read FreeBSD sockaddr from child's memory */
+    uint8_t fbsd_buf[128];
+    if (addrlen > sizeof(fbsd_buf)) addrlen = sizeof(fbsd_buf);
+    
+    struct iovec local = { fbsd_buf, addrlen };
+    struct iovec remote = { (void *)addr, addrlen };
+    
+    if (process_vm_readv(pid, &local, 1, &remote, 1, 0) < 0) {
+        BSD_WARN("connect: failed to read sockaddr from child");
+        return -EFAULT;
+    }
+    
+    /* FreeBSD sockaddr: byte 0 = len, byte 1 = family */
+    uint8_t fbsd_len = fbsd_buf[0];
+    uint8_t fbsd_family = fbsd_buf[1];
+    
+    BSD_TRACE("connect: fbsd_len=%d fbsd_family=%d", fbsd_len, fbsd_family);
+    
+    /* Convert to Linux format in-place:
+     * Linux sa_family is 16-bit at offset 0, so we need to shift things
+     * 
+     * FreeBSD: [len][family][port_hi][port_lo][addr...]  
+     * Linux:   [family_lo][family_hi][port_hi][port_lo][addr...]
+     * 
+     * Since family fits in 8 bits and Linux is little-endian:
+     * Linux: [family][0][port_hi][port_lo][addr...]
+     */
+    uint8_t linux_buf[128];
+    memset(linux_buf, 0, addrlen);
+    
+    /* Set Linux sa_family (16-bit, little-endian) */
+    linux_buf[0] = fbsd_family;  /* Low byte = family */
+    linux_buf[1] = 0;            /* High byte = 0 */
+    
+    /* Copy port and address data (starting at offset 2 in both) */
+    if (addrlen > 2) {
+        memcpy(linux_buf + 2, fbsd_buf + 2, addrlen - 2);
+    }
+    
+    /* Write translated sockaddr back to child's memory */
+    struct iovec local_w = { linux_buf, addrlen };
+    struct iovec remote_w = { (void *)addr, addrlen };
+    
+    if (process_vm_writev(pid, &local_w, 1, &remote_w, 1, 0) < 0) {
+        BSD_WARN("connect: failed to write translated sockaddr");
+        return -EFAULT;
+    }
+    
+    BSD_TRACE("connect: translated sockaddr, family=%d", fbsd_family);
+    
+    /* Return -EAGAIN to tell interceptor to execute the syscall normally.
+     * The child's sockaddr has been translated in-place. */
+    return -EAGAIN;
+}
+
+/*
+ * bind - translate FreeBSD sockaddr to Linux format
+ * int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
+ * 
+ * Same approach as connect: translate sockaddr in child's memory, then let syscall proceed.
+ */
+static long emul_bind(pid_t pid, uint64_t args[6]) {
+    int sockfd = (int)args[0];
+    uint64_t addr = args[1];
+    socklen_t addrlen = (socklen_t)args[2];
+    
+    BSD_TRACE("bind: fd=%d addr=0x%lx addrlen=%d", sockfd, addr, addrlen);
+    
+    if (addr == 0 || addrlen == 0) {
+        return -EAGAIN;  /* Execute syscall normally */
+    }
+    
+    /* Read FreeBSD sockaddr from child's memory */
+    uint8_t fbsd_buf[128];
+    if (addrlen > sizeof(fbsd_buf)) addrlen = sizeof(fbsd_buf);
+    
+    struct iovec local = { fbsd_buf, addrlen };
+    struct iovec remote = { (void *)addr, addrlen };
+    
+    if (process_vm_readv(pid, &local, 1, &remote, 1, 0) < 0) {
+        return -EFAULT;
+    }
+    
+    uint8_t fbsd_family = fbsd_buf[1];
+    
+    /* Convert to Linux format */
+    uint8_t linux_buf[128];
+    memset(linux_buf, 0, addrlen);
+    linux_buf[0] = fbsd_family;
+    linux_buf[1] = 0;
+    if (addrlen > 2) {
+        memcpy(linux_buf + 2, fbsd_buf + 2, addrlen - 2);
+    }
+    
+    /* Write back to child's memory */
+    struct iovec local_w = { linux_buf, addrlen };
+    struct iovec remote_w = { (void *)addr, addrlen };
+    
+    if (process_vm_writev(pid, &local_w, 1, &remote_w, 1, 0) < 0) {
+        return -EFAULT;
+    }
+    
+    BSD_TRACE("bind: translated sockaddr, family=%d", fbsd_family);
+    return -EAGAIN;  /* Execute syscall normally */
+}
+
+/*
+ * sendto - translate FreeBSD sockaddr to Linux format
+ * ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
+ *                const struct sockaddr *dest_addr, socklen_t addrlen)
+ * 
+ * Same approach: translate sockaddr in child's memory, then let syscall proceed.
+ */
+static long emul_sendto(pid_t pid, uint64_t args[6]) {
+    int sockfd = (int)args[0];
+    /* buf, len, flags passed through unchanged */
+    uint64_t dest_addr = args[4];
+    socklen_t addrlen = (socklen_t)args[5];
+    
+    BSD_TRACE("sendto: fd=%d dest=0x%lx addrlen=%d", sockfd, dest_addr, addrlen);
+    
+    if (dest_addr == 0 || addrlen == 0) {
+        return -EAGAIN;  /* Execute syscall normally */
+    }
+    
+    /* Read FreeBSD sockaddr from child's memory */
+    uint8_t fbsd_buf[128];
+    if (addrlen > sizeof(fbsd_buf)) addrlen = sizeof(fbsd_buf);
+    
+    struct iovec local = { fbsd_buf, addrlen };
+    struct iovec remote = { (void *)dest_addr, addrlen };
+    
+    if (process_vm_readv(pid, &local, 1, &remote, 1, 0) < 0) {
+        return -EFAULT;
+    }
+    
+    uint8_t fbsd_family = fbsd_buf[1];
+    
+    /* Convert to Linux format */
+    uint8_t linux_buf[128];
+    memset(linux_buf, 0, addrlen);
+    linux_buf[0] = fbsd_family;
+    linux_buf[1] = 0;
+    if (addrlen > 2) {
+        memcpy(linux_buf + 2, fbsd_buf + 2, addrlen - 2);
+    }
+    
+    /* Write back to child's memory */
+    struct iovec local_w = { linux_buf, addrlen };
+    struct iovec remote_w = { (void *)dest_addr, addrlen };
+    
+    if (process_vm_writev(pid, &local_w, 1, &remote_w, 1, 0) < 0) {
+        return -EFAULT;
+    }
+    
+    BSD_TRACE("sendto: translated sockaddr, family=%d", fbsd_family);
+    return -EAGAIN;  /* Execute syscall normally */
+}
+
+/*
+ * Socket option translation between FreeBSD and Linux
+ * 
+ * FreeBSD and Linux use different values for socket options.
+ * Key differences at SOL_SOCKET level:
+ */
+
+/* FreeBSD socket options (from sys/socket.h) */
+#define FBSD_SO_DEBUG        0x0001
+#define FBSD_SO_ACCEPTCONN   0x0002
+#define FBSD_SO_REUSEADDR    0x0004
+#define FBSD_SO_KEEPALIVE    0x0008
+#define FBSD_SO_DONTROUTE    0x0010
+#define FBSD_SO_BROADCAST    0x0020
+#define FBSD_SO_USELOOPBACK  0x0040
+#define FBSD_SO_LINGER       0x0080
+#define FBSD_SO_OOBINLINE    0x0100
+#define FBSD_SO_REUSEPORT    0x0200
+#define FBSD_SO_TIMESTAMP    0x0400
+#define FBSD_SO_NOSIGPIPE    0x0800
+#define FBSD_SO_ACCEPTFILTER 0x1000
+#define FBSD_SO_BINTIME      0x2000
+#define FBSD_SO_NO_OFFLOAD   0x4000
+#define FBSD_SO_NO_DDP       0x8000
+#define FBSD_SO_SNDBUF       0x1001
+#define FBSD_SO_RCVBUF       0x1002
+#define FBSD_SO_SNDLOWAT     0x1003
+#define FBSD_SO_RCVLOWAT     0x1004
+#define FBSD_SO_SNDTIMEO     0x1005
+#define FBSD_SO_RCVTIMEO     0x1006
+#define FBSD_SO_ERROR        0x1007
+#define FBSD_SO_TYPE         0x1008
+
+/* Linux socket options */
+#define LINUX_SO_DEBUG        1
+#define LINUX_SO_REUSEADDR    2
+#define LINUX_SO_TYPE         3
+#define LINUX_SO_ERROR        4
+#define LINUX_SO_DONTROUTE    5
+#define LINUX_SO_BROADCAST    6
+#define LINUX_SO_SNDBUF       7
+#define LINUX_SO_RCVBUF       8
+#define LINUX_SO_KEEPALIVE    9
+#define LINUX_SO_OOBINLINE    10
+#define LINUX_SO_LINGER       13
+#define LINUX_SO_REUSEPORT    15
+#define LINUX_SO_RCVLOWAT     18
+#define LINUX_SO_SNDLOWAT     19
+#define LINUX_SO_RCVTIMEO     20
+#define LINUX_SO_SNDTIMEO     21
+#define LINUX_SO_ACCEPTCONN   30
+#define LINUX_SO_TIMESTAMP    29
+
+/* Translate FreeBSD socket option to Linux */
+static int translate_sockopt_to_linux(int level __attribute__((unused)), int fbsd_optname, int *linux_optname) {
+    /* Only translate SOL_SOCKET level options */
+    if (0) {  /* SOL_SOCKET = 1 on both */
+        *linux_optname = fbsd_optname;
+        return 0;  /* Pass through for other levels */
+    }
+    
+    switch (fbsd_optname) {
+        case FBSD_SO_DEBUG:       *linux_optname = LINUX_SO_DEBUG; break;
+        case FBSD_SO_ACCEPTCONN:  *linux_optname = LINUX_SO_ACCEPTCONN; break;
+        case FBSD_SO_REUSEADDR:   *linux_optname = LINUX_SO_REUSEADDR; break;
+        case FBSD_SO_KEEPALIVE:   *linux_optname = LINUX_SO_KEEPALIVE; break;
+        case FBSD_SO_DONTROUTE:   *linux_optname = LINUX_SO_DONTROUTE; break;
+        case FBSD_SO_BROADCAST:   *linux_optname = LINUX_SO_BROADCAST; break;
+        case FBSD_SO_LINGER:      *linux_optname = LINUX_SO_LINGER; break;
+        case FBSD_SO_OOBINLINE:   *linux_optname = LINUX_SO_OOBINLINE; break;
+        case FBSD_SO_REUSEPORT:   *linux_optname = LINUX_SO_REUSEPORT; break;
+        case FBSD_SO_TIMESTAMP:   *linux_optname = LINUX_SO_TIMESTAMP; break;
+        case FBSD_SO_SNDBUF:      *linux_optname = LINUX_SO_SNDBUF; break;
+        case FBSD_SO_RCVBUF:      *linux_optname = LINUX_SO_RCVBUF; break;
+        case FBSD_SO_SNDLOWAT:    *linux_optname = LINUX_SO_SNDLOWAT; break;
+        case FBSD_SO_RCVLOWAT:    *linux_optname = LINUX_SO_RCVLOWAT; break;
+        case FBSD_SO_SNDTIMEO:    *linux_optname = LINUX_SO_SNDTIMEO; break;
+        case FBSD_SO_RCVTIMEO:    *linux_optname = LINUX_SO_RCVTIMEO; break;
+        case FBSD_SO_ERROR:       *linux_optname = LINUX_SO_ERROR; break;
+        case FBSD_SO_TYPE:        *linux_optname = LINUX_SO_TYPE; break;
+        
+        /* FreeBSD-specific options with no Linux equivalent */
+        case 0x1017: /* SO_TS_CLOCK - FreeBSD-specific, ignore */
+            BSD_TRACE("setsockopt: SO_TS_CLOCK has no Linux equivalent, ignoring");
+            return -1;
+        case FBSD_SO_NOSIGPIPE:
+            BSD_TRACE("setsockopt: SO_NOSIGPIPE has no Linux equivalent, ignoring");
+            return -1;  /* Signal to skip this option */
+        case FBSD_SO_USELOOPBACK:
+        case FBSD_SO_ACCEPTFILTER:
+        case FBSD_SO_BINTIME:
+        case FBSD_SO_NO_OFFLOAD:
+        case FBSD_SO_NO_DDP:
+            BSD_TRACE("setsockopt: FreeBSD-specific option 0x%x ignored", fbsd_optname);
+            return -1;
+            
+        default:
+            BSD_WARN("setsockopt: unknown FreeBSD option 0x%x, passing through", fbsd_optname);
+            *linux_optname = fbsd_optname;
+            break;
+    }
+    
+    return 0;
+}
+
+/*
+ * setsockopt - translate FreeBSD socket options to Linux
+ * int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen)
+ */
+static long emul_setsockopt(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    int sockfd = (int)args[0];
+    int level = (int)args[1];
+    /* Translate FreeBSD SOL_SOCKET (0xffff) to Linux (1) */
+    if (level == 0xffff) {
+        level = 1;
+        args[1] = 1;
+    }
+    int fbsd_optname = (int)args[2];
+    /* optval and optlen passed through */
+    
+    BSD_TRACE("setsockopt: fd=%d level=%d optname=0x%x", sockfd, level, fbsd_optname);
+    
+    int linux_optname;
+    int ret = translate_sockopt_to_linux(level, fbsd_optname, &linux_optname);
+    
+    if (ret < 0) {
+        /* Option should be skipped/ignored - return success */
+        return 0;
+    }
+    
+    BSD_TRACE("setsockopt: translated optname 0x%x -> %d", fbsd_optname, linux_optname);
+    
+    /* Update the optname in the child's registers */
+    args[2] = (uint64_t)linux_optname;
+    
+    return -EAGAIN;  /* Execute syscall with translated optname */
+}
+
+/*
+ * getsockopt - translate FreeBSD socket options to Linux
+ * int getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen)
+ */
+static long emul_getsockopt(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    int sockfd = (int)args[0];
+    int level = (int)args[1];
+    /* Translate FreeBSD SOL_SOCKET (0xffff) to Linux (1) */
+    if (level == 0xffff) {
+        level = 1;
+        args[1] = 1;
+    }
+    int fbsd_optname = (int)args[2];
+    
+    BSD_TRACE("getsockopt: fd=%d level=%d optname=0x%x", sockfd, level, fbsd_optname);
+    
+    int linux_optname;
+    int ret = translate_sockopt_to_linux(level, fbsd_optname, &linux_optname);
+    
+    if (ret < 0) {
+        /* Option not supported - return error */
+        return -ENOPROTOOPT;
+    }
+    
+    BSD_TRACE("getsockopt: translated optname 0x%x -> %d", fbsd_optname, linux_optname);
+    
+    /* Update the optname in the child's registers */
+    args[2] = (uint64_t)linux_optname;
+    
+    return -EAGAIN;  /* Execute syscall with translated optname */
 }
