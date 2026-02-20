@@ -30,9 +30,13 @@
 #include "bsdulator/lochs.h"
 #include "lochs_compose.h"
 
-/* Global jail list */
-static lochs_jail_t jails[LOCHS_MAX_JAILS];
-static int jail_count = 0;
+/* Global jail list - exposed for network module */
+lochs_jail_t lochs_jails[LOCHS_MAX_JAILS];
+int lochs_jail_count = 0;
+
+/* Legacy aliases for internal use */
+#define jails lochs_jails
+#define jail_count lochs_jail_count
 
 #define STATE_FILE "/var/lib/lochs/jails.dat"
 #define IMAGES_DIR "/var/lib/lochs/images"
@@ -258,6 +262,7 @@ int lochs_cmd_create(int argc, char **argv) {
     char *image = "freebsd:15";
     char *ip = NULL;
     char *path = NULL;
+    char *network = NULL;
     int vnet = 0;
     lochs_port_map_t ports[LOCHS_MAX_PORTS];
     int port_count = 0;
@@ -274,6 +279,7 @@ int lochs_cmd_create(int argc, char **argv) {
         {"path",    required_argument, 0, 'P'},
         {"volume",  required_argument, 0, 'v'},
         {"env",     required_argument, 0, 'e'},
+        {"network", required_argument, 0, 'N'},
         {"vnet",    no_argument,       0, 'n'},
         {"help",    no_argument,       0, 'h'},
         {0, 0, 0, 0}
@@ -282,7 +288,7 @@ int lochs_cmd_create(int argc, char **argv) {
     int opt;
     optind = 1;
     
-    while ((opt = getopt_long(argc, argv, "i:I:p:P:v:e:nh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:I:p:P:v:e:N:nh", long_options, NULL)) != -1) {
         switch (opt) {
             case 'i': image = optarg; break;
             case 'I': ip = optarg; break;
@@ -315,6 +321,7 @@ int lochs_cmd_create(int argc, char **argv) {
                     }
                 }
                 break;
+            case 'N': network = optarg; break;
             case 'P': path = optarg; break;
             case 'n': vnet = 1; break;
             case 'h':
@@ -325,6 +332,7 @@ int lochs_cmd_create(int argc, char **argv) {
                 printf("  -p, --publish <port>  Publish port (host:container)\n");
                 printf("  -v, --volume <vol>    Mount volume (/host:/container[:ro])\n");
                 printf("  -e, --env <var>       Set environment variable (KEY=value)\n");
+                printf("  -N, --network <net>   Connect to network\n");
                 printf("  -P, --path <path>     Root filesystem path\n");
                 printf("  -n, --vnet            Enable virtual networking\n");
                 printf("\nExamples:\n");
@@ -410,6 +418,11 @@ int lochs_cmd_create(int argc, char **argv) {
         safe_strcpy(jail.env_values[i], env_values[i], sizeof(jail.env_values[0]));
     }
     
+    /* Store network */
+    if (network) {
+        safe_strcpy(jail.network, network, sizeof(jail.network));
+    }
+    
     if (lochs_jail_add(&jail) != 0) {
         fprintf(stderr, "Error: failed to register container\n");
         return 1;
@@ -440,6 +453,9 @@ int lochs_cmd_create(int argc, char **argv) {
             printf("%s=%s%s", env_keys[i], env_values[i], (i < env_count - 1) ? ", " : "");
         }
         printf("\n");
+    }
+    if (network) {
+        printf("  Network: %s\n", network);
     }
     printf("\nRun 'lochs start %s' to start the container.\n", name);
     
@@ -523,6 +539,14 @@ int lochs_cmd_start(int argc, char **argv) {
     
     printf("Starting container '%s'...\n", name);
     
+    /* Set up network if configured */
+    if (jail->network[0]) {
+        lochs_networks_load();
+        if (lochs_network_setup_container(name, jail->network) != 0) {
+            fprintf(stderr, "Warning: failed to set up network\n");
+        }
+    }
+    
     /* Mount volumes before starting jail */
     if (jail->volume_count > 0) {
         printf("Mounting volumes...\n");
@@ -574,15 +598,32 @@ int lochs_cmd_start(int argc, char **argv) {
     /*
      * Build the jail command using binaries FROM THE CONTAINER IMAGE.
      * 
-     * Format: ./bsdulator <ld-elf.so.1> <jail> -c name=X path=Y persist
+     * If container has network namespace, pass --netns to bsdulator.
+     * BSDulator will enter the namespace in the child process AFTER
+     * ptrace setup but BEFORE execve, avoiding ptrace conflicts.
+     * 
+     * Format: ./bsdulator [--netns <ns>] <ld-elf.so.1> <jail> -c name=X path=Y persist
      */
     char cmd[4096];
-    int pos = snprintf(cmd, sizeof(cmd),
-        "./bsdulator %s/libexec/ld-elf.so.1 %s/usr/sbin/jail -c name=%s path=%s",
-        jail->path,   /* ld-elf.so.1 from container */
-        jail->path,   /* jail binary from container */
-        jail->name,
-        jail->path);
+    int pos = 0;
+    
+    /* Start with bsdulator and optional netns */
+    if (jail->netns[0]) {
+        pos = snprintf(cmd, sizeof(cmd),
+            "./bsdulator --netns %s %s/libexec/ld-elf.so.1 %s/usr/sbin/jail -c name=%s path=%s",
+            jail->netns,
+            jail->path,
+            jail->path,
+            jail->name,
+            jail->path);
+    } else {
+        pos = snprintf(cmd, sizeof(cmd),
+            "./bsdulator %s/libexec/ld-elf.so.1 %s/usr/sbin/jail -c name=%s path=%s",
+            jail->path,
+            jail->path,
+            jail->name,
+            jail->path);
+    }
     
     if (jail->ip4_addr[0]) {
         pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos, 
@@ -692,6 +733,11 @@ int lochs_cmd_stop(int argc, char **argv) {
         }
     }
     
+    /* Tear down network */
+    if (jail->network[0]) {
+        lochs_network_teardown_container(name);
+    }
+    
     /* Use jail -r from the container image */
     char cmd[4096];
     snprintf(cmd, sizeof(cmd),
@@ -794,14 +840,26 @@ int lochs_cmd_exec(int argc, char **argv) {
     /*
      * Build jexec command using binaries FROM THE CONTAINER IMAGE.
      * 
-     * Format: ./bsdulator <ld-elf.so.1> <jexec> <jail-name> <command...>
+     * If container has network namespace, pass --netns to bsdulator.
+     * Format: ./bsdulator [--netns <ns>] <ld-elf.so.1> <jexec> <jail-name> <command...>
      */
     char cmd[4096];
-    int pos = snprintf(cmd, sizeof(cmd),
-        "./bsdulator %s/libexec/ld-elf.so.1 %s/usr/sbin/jexec %s",
-        jail->path,   /* ld-elf.so.1 from container */
-        jail->path,   /* jexec binary from container */
-        jail->name);  /* jail name to attach to */
+    int pos;
+    
+    if (jail->netns[0]) {
+        pos = snprintf(cmd, sizeof(cmd),
+            "./bsdulator --netns %s %s/libexec/ld-elf.so.1 %s/usr/sbin/jexec %s",
+            jail->netns,
+            jail->path,
+            jail->path,
+            jail->name);
+    } else {
+        pos = snprintf(cmd, sizeof(cmd),
+            "./bsdulator %s/libexec/ld-elf.so.1 %s/usr/sbin/jexec %s",
+            jail->path,
+            jail->path,
+            jail->name);
+    }
     
     /* Add the command and arguments */
     for (int i = 2; i < argc && pos < (int)sizeof(cmd) - 1; i++) {

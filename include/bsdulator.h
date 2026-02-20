@@ -58,5 +58,7 @@ int bsdulator_run(const char *binary, char *const argv[], char *const envp[]);
 void bsdulator_set_debug(int level);
 void bsdulator_set_freebsd_root(const char *path);
 const char *bsdulator_get_freebsd_root(void);
+void bsdulator_set_netns(const char *netns_name);
+const char *bsdulator_get_netns(void);
 
 #endif /* BSDULATOR_H */

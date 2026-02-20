@@ -70,8 +70,17 @@ FreeBSD jails were the original container technology (introduced in 2000, 13 yea
 ### Developer Experience  
 - **⚡ Fast Startup** — Jails start in milliseconds, not seconds
 - **📊 Resource Limits** — CPU, memory, and I/O constraints via rctl
-- **🔍 Introspection** — `lochs top`, `lochs logs`, `lochs inspect`
+- **🔍 Introspection** — `lochs ps`, `lochs logs`, `lochs exec`
 - **🎯 GPU Passthrough** — NVIDIA/AMD GPU access for ML workloads (Zernel)
+
+### Currently Implemented (v0.3)
+- **🏗️ Lochfile Build** — `FROM`, `COPY`, `RUN`, `ENV`, `LABEL`, `EXPOSE`, `CMD`, `WORKDIR`
+- **📋 Compose** — `lochs compose up/down/ps/exec` with dependency resolution
+- **🌐 Networking** — `lochs network create/rm/ls`, `--network` flag, bridge creation
+- **🚪 Port Forwarding** — `-p 8080:80` using socat
+- **📁 Volume Mounts** — `-v /host:/container[:ro]` with bind mounts
+- **🌍 Environment** — `-e KEY=value` injected at container start
+- **📜 Logs** — `lochs logs [-f] [-n N]` with follow mode
 
 ---
 
@@ -1232,35 +1241,44 @@ make lint
 
 ## Roadmap
 
-### v0.2 (Current)
+### v0.2 (Completed)
 - [x] Basic jail lifecycle (create, start, stop, rm)
-- [x] Image pull from registry
+- [x] Image pull from registry  
 - [x] exec into running containers
 - [x] Static IP assignment
 - [x] BSDulator syscall translation
+- [x] JID tracking sync between Lochs and BSDulator
 
-### v0.3 (Next)
-- [ ] Lochfile build system
-- [ ] lochs.yml compose support
-- [ ] Named volumes
-- [ ] Bridge networking with DNS
+### v0.3 (Current - Completed)
+- [x] **Lochfile build system** — `FROM`, `COPY`, `ENV`, `LABEL`, `EXPOSE`, `CMD`, `WORKDIR`
+- [x] **RUN directive** — Execute FreeBSD commands during image build via BSDulator
+- [x] **lochs.yml compose support** — `up`, `down`, `ps`, `exec`, dependency resolution
+- [x] **Port forwarding** — `-p host:container` with socat
+- [x] **Volume mounts** — `-v /host:/container[:ro]` with bind mounts
+- [x] **Environment variables** — `-e KEY=value`, written to `/.lochs_env`
+- [x] **Container logs** — `lochs logs [-f] [-n N] <container>`
+- [x] **Container networking** — `lochs network create/rm/ls`, `--network` flag, bridge creation, IP assignment
+- [x] **Network namespace isolation** — Full Linux netns per container, veth pairs, isolated eth0
+- [x] Image registration for built images
 
-### v0.4
-- [ ] Port forwarding
-- [ ] Resource limits (memory, CPU)
+### v0.4 (Next)
+- [ ] Auto-start command (CMD/command from Lochfile/compose)
+- [ ] Resource limits (memory, CPU via cgroups)
 - [ ] Health checks
 - [ ] Restart policies
+- [ ] Container-to-container networking (ping by name)
 
 ### v0.5
+- [ ] Push to registry (`lochs push`)
 - [ ] macOS support (FreeBSD VM)
 - [ ] Windows support (WSL2)
-- [ ] GUI (Tauri-based)
+- [ ] Named volumes (`lochs volume create`)
 
 ### v1.0
 - [ ] Production-ready stability
 - [ ] Full Docker CLI compatibility
+- [ ] GUI (Tauri-based)
 - [ ] Enterprise features (SSO, audit logs)
-- [ ] Commercial support available
 
 ---
 
@@ -1276,6 +1294,73 @@ BSD 2-Clause License. See [LICENSE](LICENSE) for details.
 - **Wine Project** — For proving syscall translation is viable
 - **Docker** — For popularizing the container workflow we emulate
 - **Netflix, Sony, WhatsApp** — For proving FreeBSD at scale
+
+---
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for the full changelog.
+
+### v0.3.3 (February 2026)
+
+**Features:**
+- Full network namespace isolation for containers
+- Each container gets its own Linux netns (`lochs_<n>`)
+- Isolated eth0 interface with assigned IP from subnet pool
+- veth pair connects container netns to host bridge
+- BSDulator `--netns` flag for namespace entry
+- Child process enters netns after ptrace setup, before execve
+
+**Fixed:**
+- Segfault when running BSDulator inside `ip netns exec` wrapper
+- veth pair creation order and interface configuration
+
+### v0.3.2 (February 2026)
+
+**Features:**
+- Container networking with `lochs network create/rm/ls`
+- `--network` flag for `lochs create` to connect containers to networks
+- Linux bridge creation per network with automatic IP assignment
+- `/etc/hosts` injection for container name resolution
+- veth pair creation for container connectivity
+- Network teardown on container stop
+- RUN directive in Lochfile - execute FreeBSD commands during build
+- Direct binary execution for simple RUN commands
+- Shell fallback for complex RUN commands (pipes, redirects)
+
+### v0.3.1 (February 2026)
+
+**Features:**
+- Volume mounts with `-v /host:/container[:ro]`
+- Environment variables with `-e KEY=value`
+- Container logs with `lochs logs [-f] [-n N] <container>`
+- Logs captured via tee to `/var/lib/lochs/logs/`
+- Auto-unmount volumes on container stop
+
+### v0.3.0 (February 2026)
+
+**Features:**
+- Lochfile build system (`FROM`, `COPY`, `ENV`, `LABEL`, `EXPOSE`, `CMD`, `WORKDIR`)
+- lochs compose multi-container orchestration (`up`, `down`, `ps`, `exec`)
+- YAML parser for compose files (no external dependencies)
+- Dependency resolution with `depends_on`
+- Port forwarding with `-p host:container` using socat
+- Image registration for built images
+
+**Fixes:**
+- JID tracking sync between Lochs and BSDulator state files
+- Structure alignment fix for jail state file reading
+- State file persistence in compose (parent reload after child save)
+
+### v0.2.0 (January 2026)
+
+**Features:**
+- Basic jail lifecycle (create, start, stop, rm)
+- Image pull from FreeBSD mirrors and Dyber registry
+- exec into running containers
+- Static IP assignment
+- VNET support via Linux network namespaces
+- BSDulator syscall translation (200+ syscalls)
 
 ---
 

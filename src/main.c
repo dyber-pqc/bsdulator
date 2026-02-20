@@ -26,6 +26,7 @@
 /* Global state */
 int bsd_debug_level = BSD_DEBUG_ERROR;
 static char *freebsd_root = NULL;
+static char *netns_name = NULL;
 static interceptor_state_t *global_state = NULL;
 
 /* Signal handler for clean shutdown */
@@ -54,6 +55,7 @@ static void print_usage(const char *prog) {
     printf("  -v, --verbose        Increase verbosity (can be repeated)\n");
     printf("  -q, --quiet          Quiet mode (errors only)\n");
     printf("  -r, --root <path>    FreeBSD root filesystem path\n");
+    printf("  -n, --netns <name>   Run in network namespace\n");
     printf("  -s, --stats          Print syscall statistics on exit\n");
     printf("  -t, --trace          Trace all syscalls (very verbose)\n");
     printf("\nExamples:\n");
@@ -71,6 +73,7 @@ static struct option long_options[] = {
     {"verbose", no_argument,       0, 'v'},
     {"quiet",   no_argument,       0, 'q'},
     {"root",    required_argument, 0, 'r'},
+    {"netns",   required_argument, 0, 'n'},
     {"stats",   no_argument,       0, 's'},
     {"trace",   no_argument,       0, 't'},
     {0, 0, 0, 0}
@@ -109,6 +112,10 @@ void bsdulator_cleanup(void) {
     if (freebsd_root) {
         free(freebsd_root);
         freebsd_root = NULL;
+    }
+    if (netns_name) {
+        free(netns_name);
+        netns_name = NULL;
     }
     BSD_INFO("Cleanup complete");
 }
@@ -149,6 +156,19 @@ const char *bsdulator_get_freebsd_root(void) {
     
     /* Default */
     return "./freebsd-root";
+}
+
+/* Set network namespace name */
+void bsdulator_set_netns(const char *name) {
+    if (netns_name) {
+        free(netns_name);
+    }
+    netns_name = name ? strdup(name) : NULL;
+}
+
+/* Get network namespace name */
+const char *bsdulator_get_netns(void) {
+    return netns_name;
 }
 
 /* Run a FreeBSD binary */
@@ -237,7 +257,7 @@ int main(int argc, char *argv[], char *envp[]) {
     }
     
     /* Parse options */
-    while ((opt = getopt_long(argc, argv, "+hVvqr:st", long_options, &opt_idx)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+hVvqr:n:st", long_options, &opt_idx)) != -1) {
         switch (opt) {
             case 'h':
                 print_usage(argv[0]);
@@ -259,6 +279,10 @@ int main(int argc, char *argv[], char *envp[]) {
                 
             case 'r':
                 bsdulator_set_freebsd_root(optarg);
+                break;
+                
+            case 'n':
+                bsdulator_set_netns(optarg);
                 break;
                 
             case 's':

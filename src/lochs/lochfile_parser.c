@@ -23,6 +23,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
@@ -312,16 +313,111 @@ static void lochfile_free(lochfile_context_t *ctx) {
 
 /*
  * Execute a command in the build jail using BSDulator
+ * 
+ * For simple commands, runs the binary directly.
+ * For complex commands (pipes, redirects), uses sh -c.
  */
 static int run_in_jail(const char *build_dir, const char *command) {
-    char cmd[4096];
+    char cmd[8192];
+    char bsdulator_path[1024];
     
-    /* Use BSDulator to run FreeBSD command in the build directory */
+    /* Get absolute path to bsdulator */
+    char cwd[1024];
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+        strcpy(cwd, ".");
+    }
+    snprintf(bsdulator_path, sizeof(bsdulator_path), "%s/bsdulator", cwd);
+    
+    /* Check if bsdulator exists at that path, fall back to PATH */
+    struct stat st;
+    if (stat(bsdulator_path, &st) != 0) {
+        strcpy(bsdulator_path, "/usr/local/bin/bsdulator");
+        if (stat(bsdulator_path, &st) != 0) {
+            strcpy(bsdulator_path, "bsdulator");
+        }
+    }
+    
+    /* Check if command needs shell (has shell metacharacters) */
+    int needs_shell = (strchr(command, '|') != NULL ||
+                       strchr(command, '>') != NULL ||
+                       strchr(command, '<') != NULL ||
+                       strchr(command, '&') != NULL ||
+                       strchr(command, ';') != NULL ||
+                       strchr(command, '$') != NULL ||
+                       strchr(command, '`') != NULL ||
+                       strchr(command, '*') != NULL ||
+                       strchr(command, '?') != NULL);
+    
+    if (!needs_shell) {
+        /* Try to run command directly without shell */
+        char binary[512];
+        char args[4096] = "";
+        char cmd_copy[4096];
+        
+        safe_strcpy(cmd_copy, command, sizeof(cmd_copy));
+        
+        /* Get first token (the binary) */
+        char *space = strchr(cmd_copy, ' ');
+        if (space) {
+            *space = '\0';
+            safe_strcpy(binary, cmd_copy, sizeof(binary));
+            safe_strcpy(args, space + 1, sizeof(args));
+        } else {
+            safe_strcpy(binary, cmd_copy, sizeof(binary));
+        }
+        
+        /* Build full path to binary in build_dir */
+        char full_binary[2048];
+        if (binary[0] == '/') {
+            snprintf(full_binary, sizeof(full_binary), "%s%.500s", build_dir, binary);
+        } else {
+            snprintf(full_binary, sizeof(full_binary), "%s/bin/%.500s", build_dir, binary);
+        }
+        
+        /* Check if binary exists */
+        if (stat(full_binary, &st) == 0) {
+            if (args[0]) {
+                snprintf(cmd, sizeof(cmd),
+                    "%s %s/libexec/ld-elf.so.1 %s %s 2>&1",
+                    bsdulator_path, build_dir, full_binary, args);
+            } else {
+                snprintf(cmd, sizeof(cmd),
+                    "%s %s/libexec/ld-elf.so.1 %s 2>&1",
+                    bsdulator_path, build_dir, full_binary);
+            }
+            
+            int ret = system(cmd);
+            return WIFEXITED(ret) ? WEXITSTATUS(ret) : ret;
+        }
+    }
+    
+    /* Fall back to sh -c for complex commands or if direct exec failed */
+    /* Escape the command for shell */
+    char escaped[4096];
+    const char *src = command;
+    char *dst = escaped;
+    char *end = escaped + sizeof(escaped) - 5;
+    
+    while (*src && dst < end) {
+        if (*src == '\'') {
+            /* Replace ' with '\'' */
+            *dst++ = '\'';
+            *dst++ = '\\';
+            *dst++ = '\'';
+            *dst++ = '\'';
+            src++;
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+    
     snprintf(cmd, sizeof(cmd),
-        "./bsdulator -t %s/libexec/ld-elf.so.1 %s/bin/sh -c '%s'",
-        build_dir, build_dir, command);
+        "%s %s/libexec/ld-elf.so.1 %s/bin/sh -c '%s' 2>&1",
+        bsdulator_path, build_dir, build_dir, escaped);
     
-    return system(cmd);
+    int ret = system(cmd);
+    return WIFEXITED(ret) ? WEXITSTATUS(ret) : ret;
 }
 
 /*

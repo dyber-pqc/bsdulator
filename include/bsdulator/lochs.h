@@ -37,6 +37,8 @@ typedef struct {
 
 #define LOCHS_MAX_VOLUMES 16
 #define LOCHS_MAX_ENV 32
+#define LOCHS_MAX_NETWORKS 16
+#define LOCHS_NETWORK_NAME_MAX 64
 
 /* Managed jail entry (extends raw bsd_jail_t) */
 typedef struct {
@@ -63,7 +65,21 @@ typedef struct {
     char env_keys[LOCHS_MAX_ENV][64];
     char env_values[LOCHS_MAX_ENV][256];
     int env_count;
+    
+    /* Network */
+    char network[LOCHS_NETWORK_NAME_MAX];
+    char netns[32];                 /* Network namespace name */
 } lochs_jail_t;
+
+/* Network definition */
+typedef struct {
+    char name[LOCHS_NETWORK_NAME_MAX];
+    char subnet[64];                /* e.g., "172.20.0.0/16" */
+    char gateway[64];               /* e.g., "172.20.0.1" */
+    char bridge[20];                /* Linux bridge name, e.g., "lochs0" */
+    int next_ip;                    /* Next IP to assign (last octet) */
+    int active;
+} lochs_network_t;
 
 /* Lochfile parsed representation */
 typedef struct {
@@ -120,6 +136,18 @@ int lochs_cmd_version(int argc, char **argv);
 int lochs_cmd_search(int argc, char **argv);
 int lochs_cmd_rmi(int argc, char **argv);
 int lochs_cmd_logs(int argc, char **argv);
+int lochs_cmd_network(int argc, char **argv);
+
+/* Network management */
+int lochs_network_create(const char *name, const char *subnet);
+int lochs_network_remove(const char *name);
+int lochs_network_list(void);
+lochs_network_t *lochs_network_find(const char *name);
+char *lochs_network_assign_ip(const char *network_name);
+int lochs_network_setup_container(const char *container_name, const char *network_name);
+int lochs_network_teardown_container(const char *container_name);
+int lochs_networks_load(void);
+int lochs_networks_save(void);
 
 /* Compose parser */
 int lochs_compose_parse(const char *path, lochs_compose_t *compose);

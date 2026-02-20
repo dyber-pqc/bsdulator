@@ -29,7 +29,8 @@ LOCHS_SRCS = $(SRCDIR)/lochs/lochs_main.c \
              $(SRCDIR)/lochs/lochs_commands.c \
              $(SRCDIR)/lochs/lochs_images.c \
              $(SRCDIR)/lochs/lochs_compose.c \
-             $(SRCDIR)/lochs/lochfile_parser.c
+             $(SRCDIR)/lochs/lochfile_parser.c \
+             $(SRCDIR)/lochs/lochs_network.c
 
 # Lochs CLI object files
 LOCHS_OBJS = $(LOCHS_SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
@@ -82,6 +83,7 @@ $(OBJDIR)/lochs/lochs_commands.o: $(SRCDIR)/lochs/lochs_commands.c $(INCDIR)/bsd
 $(OBJDIR)/lochs/lochs_images.o: $(SRCDIR)/lochs/lochs_images.c $(INCDIR)/bsdulator/lochs.h
 $(OBJDIR)/lochs/lochs_compose.o: $(SRCDIR)/lochs/lochs_compose.c $(SRCDIR)/lochs/lochs_compose.h $(INCDIR)/bsdulator/lochs.h
 $(OBJDIR)/lochs/lochfile_parser.o: $(SRCDIR)/lochs/lochfile_parser.c $(INCDIR)/bsdulator/lochs.h
+$(OBJDIR)/lochs/lochs_network.o: $(SRCDIR)/lochs/lochs_network.c $(INCDIR)/bsdulator/lochs.h
 
 # Clean
 clean:

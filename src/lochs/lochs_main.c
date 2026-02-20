@@ -30,6 +30,7 @@ static lochs_command_t commands[] = {
     {"rmi",     "Remove an image",                      lochs_cmd_rmi},
     {"build",   "Build image from Lochfile",            lochs_cmd_build},
     {"compose", "Manage multi-jail applications",       lochs_cmd_compose},
+    {"network", "Manage container networks",            lochs_cmd_network},
     {"version", "Show version information",             lochs_cmd_version},
     {NULL, NULL, NULL}
 };
@@ -57,6 +58,7 @@ static void print_usage(const char *prog) {
     
     fprintf(stderr, "\n\033[1mOrchestration:\033[0m\n");
     fprintf(stderr, "  %-12s %s\n", "compose", "Manage multi-jail applications (lochs.yml)");
+    fprintf(stderr, "  %-12s %s\n", "network", "Manage container networks");
     
     fprintf(stderr, "\n\033[1mOther:\033[0m\n");
     fprintf(stderr, "  %-12s %s\n", "version", "Show version information");
@@ -108,6 +110,9 @@ int main(int argc, char **argv) {
             
             /* Also load image database */
             lochs_images_load();
+            
+            /* Also load networks */
+            lochs_networks_load();
             
             /* Execute command with remaining args */
             int result = commands[i].handler(argc - 1, argv + 1);

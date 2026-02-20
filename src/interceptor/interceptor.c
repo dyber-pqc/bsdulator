@@ -13,6 +13,8 @@
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
+#include <fcntl.h>
+#include <sched.h>
 #include <sys/types.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
@@ -794,6 +796,9 @@ static int fixup_freebsd_entry(pid_t pid) {
 pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp[]) {
     BSD_TRACE("Spawning process: %s", binary);
     
+    /* Get network namespace name if configured */
+    const char *netns = bsdulator_get_netns();
+    
     pid_t pid = fork();
     
     if (pid < 0) {
@@ -802,10 +807,35 @@ pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp
     }
     
     if (pid == 0) {
+        /* Child process */
+        
+        /* Set up ptrace FIRST - this must happen before namespace switch */
         if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
             perror("ptrace(TRACEME)");
             _exit(127);
         }
+        
+        /* Enter network namespace if specified */
+        if (netns && netns[0]) {
+            char netns_path[256];
+            snprintf(netns_path, sizeof(netns_path), "/var/run/netns/%s", netns);
+            
+            int netns_fd = open(netns_path, O_RDONLY);
+            if (netns_fd < 0) {
+                fprintf(stderr, "Failed to open netns %s: %s\n", netns_path, strerror(errno));
+                _exit(127);
+            }
+            
+            if (setns(netns_fd, CLONE_NEWNET) < 0) {
+                fprintf(stderr, "Failed to enter netns %s: %s\n", netns, strerror(errno));
+                close(netns_fd);
+                _exit(127);
+            }
+            
+            close(netns_fd);
+            BSD_INFO("Entered network namespace: %s", netns);
+        }
+        
         raise(SIGSTOP);
         execve(binary, argv, envp);
         perror("execve");
