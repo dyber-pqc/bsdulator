@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-02-20
+
+### Added
+- **OverlayFS Copy-on-Write (COW) filesystem** for per-container isolation
+  - Each container gets isolated storage via Linux OverlayFS
+  - Base image shared read-only (lowerdir), changes written to container-specific diff (upperdir)
+  - Merged view provides unified filesystem for jail
+  - Storage automatically cleaned up on container removal
+- Unique MAC addresses per container (02:00:00:00:00:XX based on IP)
+- Container-to-container networking verified working
+
+### Fixed
+- `/etc/hosts` duplication issue - now writes clean per-container hosts files
+- Duplicate MAC addresses causing container communication failure
+
+### Technical Details
+- New `lochs_storage.c` module with `lochs_storage_create_container()`, `mount()`, `unmount()`, `destroy()`
+- `lochs_jail_t` extended with `image_path`, `diff_path`, `work_path`, `merged_path`, `overlay_mounted`
+- Storage paths: `/var/lib/lochs/containers/<name>/{diff,work,merged}`
+- ZFS support detection for future native ZFS COW on supported systems
+
 ## [0.3.3] - 2026-02-20
 
 ### Added
@@ -24,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Segfault when running BSDulator inside `ip netns exec` wrapper
 - veth pair creation order (move to netns before bridge attachment)
 - eth0 interface configuration inside network namespace
+- **Duplicate MAC addresses** causing container-to-container communication failure
+  - Now assigns unique locally-administered MACs based on IP (02:00:00:00:00:XX)
+- Container-to-container networking verified working (ping by IP)
 
 ### Technical Details
 - `interceptor_spawn()` now calls `setns()` in child process after `PTRACE_TRACEME`

@@ -391,6 +391,18 @@ int lochs_network_setup_container(const char *container_name, const char *networ
         netns_name, veth_container);
     r = system(cmd);
     
+    /* Step 5b: Set unique MAC address based on assigned IP */
+    /* Use locally administered MAC: 02:00:00:XX:XX:XX where XX comes from IP */
+    unsigned int ip_last_octet = 0;
+    const char *last_dot = strrchr(jail->ip4_addr, '.');
+    if (last_dot) {
+        ip_last_octet = (unsigned int)atoi(last_dot + 1);
+    }
+    snprintf(cmd, sizeof(cmd),
+        "ip netns exec %s ip link set eth0 address 02:00:00:00:00:%02x",
+        netns_name, ip_last_octet & 0xFF);
+    r = system(cmd);
+    
     /* Step 6: Attach host end to bridge */
     snprintf(cmd, sizeof(cmd), 
         "ip link set %s master %s",
@@ -430,14 +442,32 @@ int lochs_network_setup_container(const char *container_name, const char *networ
         netns_name, net->gateway);
     r = system(cmd);
     
-    /* Update /etc/hosts in container for name resolution */
-    char hosts_path[2048];
-    snprintf(hosts_path, sizeof(hosts_path), "%s/etc/hosts", jail->path);
+    /*
+     * Update /etc/hosts for container networking.
+     * 
+     * Since multiple containers may share the same image path (no COW yet),
+     * we create a per-container hosts file in /var/lib/lochs/hosts/ and
+     * then copy it into the container's /etc/hosts.
+     * 
+     * This writes a CLEAN hosts file, not appending.
+     */
     
-    FILE *hosts = fopen(hosts_path, "a");
+    /* Create hosts directory */
+    mkdir("/var/lib/lochs/hosts", 0755);
+    
+    /* Write container-specific hosts file */
+    char hosts_src[256];
+    snprintf(hosts_src, sizeof(hosts_src), "/var/lib/lochs/hosts/%s", container_name);
+    
+    FILE *hosts = fopen(hosts_src, "w");  /* Truncate/create fresh */
     if (hosts) {
+        /* Standard FreeBSD /etc/hosts header */
+        fprintf(hosts, "#\n");
+        fprintf(hosts, "# Host Database\n");
+        fprintf(hosts, "#\n");
+        fprintf(hosts, "::1\t\t\tlocalhost localhost.lochs.local\n");
+        fprintf(hosts, "127.0.0.1\t\tlocalhost localhost.lochs.local\n");
         fprintf(hosts, "\n# Lochs network: %s\n", network_name);
-        fprintf(hosts, "127.0.0.1\tlocalhost\n");
         fprintf(hosts, "%s\t%s\n", jail->ip4_addr, container_name);
         
         /* Add entries for other containers on this network */
@@ -452,21 +482,67 @@ int lochs_network_setup_container(const char *container_name, const char *networ
         }
         
         fclose(hosts);
+        
+        /* Copy to container's /etc/hosts */
+        char hosts_dst[2048];
+        snprintf(hosts_dst, sizeof(hosts_dst), "%s/etc/hosts", jail->path);
+        
+        char cp_cmd[2400];
+        snprintf(cp_cmd, sizeof(cp_cmd), "cp '%s' '%s'", hosts_src, hosts_dst);
+        r = system(cp_cmd);
+        (void)r;
     }
     
-    /* Also update /etc/hosts in other containers on this network */
+    /*
+     * Update hosts files for OTHER containers on this network.
+     * Each container gets its own hosts file regenerated with all peers.
+     */
     extern lochs_jail_t lochs_jails[];
     extern int lochs_jail_count;
     for (int i = 0; i < lochs_jail_count; i++) {
         if (strcmp(lochs_jails[i].network, network_name) == 0 &&
-            strcmp(lochs_jails[i].name, container_name) != 0) {
-            char other_hosts_path[2048];
-            snprintf(other_hosts_path, sizeof(other_hosts_path), 
-                     "%s/etc/hosts", lochs_jails[i].path);
-            FILE *other_hosts = fopen(other_hosts_path, "a");
-            if (other_hosts) {
-                fprintf(other_hosts, "%s\t%s\n", jail->ip4_addr, container_name);
-                fclose(other_hosts);
+            strcmp(lochs_jails[i].name, container_name) != 0 &&
+            lochs_jails[i].ip4_addr[0]) {
+            
+            /* Regenerate hosts file for this peer */
+            char peer_hosts_src[256];
+            snprintf(peer_hosts_src, sizeof(peer_hosts_src), 
+                     "/var/lib/lochs/hosts/%s", lochs_jails[i].name);
+            
+            FILE *peer_hosts = fopen(peer_hosts_src, "w");
+            if (peer_hosts) {
+                fprintf(peer_hosts, "#\n");
+                fprintf(peer_hosts, "# Host Database\n");
+                fprintf(peer_hosts, "#\n");
+                fprintf(peer_hosts, "::1\t\t\tlocalhost localhost.lochs.local\n");
+                fprintf(peer_hosts, "127.0.0.1\t\tlocalhost localhost.lochs.local\n");
+                fprintf(peer_hosts, "\n# Lochs network: %s\n", network_name);
+                
+                /* Add this peer's own entry */
+                fprintf(peer_hosts, "%s\t%s\n", 
+                        lochs_jails[i].ip4_addr, lochs_jails[i].name);
+                
+                /* Add all other containers on this network */
+                for (int j = 0; j < lochs_jail_count; j++) {
+                    if (strcmp(lochs_jails[j].network, network_name) == 0 &&
+                        strcmp(lochs_jails[j].name, lochs_jails[i].name) != 0 &&
+                        lochs_jails[j].ip4_addr[0]) {
+                        fprintf(peer_hosts, "%s\t%s\n", 
+                                lochs_jails[j].ip4_addr, lochs_jails[j].name);
+                    }
+                }
+                
+                fclose(peer_hosts);
+                
+                /* Copy to peer container's /etc/hosts */
+                char peer_hosts_dst[2048];
+                snprintf(peer_hosts_dst, sizeof(peer_hosts_dst), 
+                         "%s/etc/hosts", lochs_jails[i].path);
+                
+                char cp_cmd[2400];
+                snprintf(cp_cmd, sizeof(cp_cmd), "cp '%s' '%s'", 
+                         peer_hosts_src, peer_hosts_dst);
+                r = system(cp_cmd);
             }
         }
     }

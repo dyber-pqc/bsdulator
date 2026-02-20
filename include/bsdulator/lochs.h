@@ -69,6 +69,13 @@ typedef struct {
     /* Network */
     char network[LOCHS_NETWORK_NAME_MAX];
     char netns[32];                 /* Network namespace name */
+    
+    /* Storage - OverlayFS COW */
+    char image_path[LOCHS_MAX_PATH];  /* Base image (lowerdir) */
+    char diff_path[LOCHS_MAX_PATH];   /* Container changes (upperdir) */
+    char work_path[LOCHS_MAX_PATH];   /* OverlayFS work dir */
+    char merged_path[LOCHS_MAX_PATH]; /* Merged view (container root) */
+    int overlay_mounted;              /* Is overlay currently mounted? */
 } lochs_jail_t;
 
 /* Network definition */
@@ -172,5 +179,14 @@ int lochs_state_load(void);
 lochs_jail_t *lochs_jail_find(const char *name);
 int lochs_jail_add(lochs_jail_t *jail);
 int lochs_jail_remove(const char *name);
+
+/* Storage management - OverlayFS COW */
+int lochs_storage_init(void);
+int lochs_storage_create_container(lochs_jail_t *jail, const char *image_path);
+int lochs_storage_mount_container(lochs_jail_t *jail);
+int lochs_storage_unmount_container(lochs_jail_t *jail);
+int lochs_storage_destroy_container(lochs_jail_t *jail);
+int lochs_storage_is_zfs_available(void);
+int lochs_storage_is_overlay_available(void);
 
 #endif /* LOCHS_H */

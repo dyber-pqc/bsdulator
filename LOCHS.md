@@ -1261,12 +1261,16 @@ make lint
 - [x] **Network namespace isolation** — Full Linux netns per container, veth pairs, isolated eth0
 - [x] Image registration for built images
 
-### v0.4 (Next)
+### v0.4 (Current)
+- [x] **OverlayFS Copy-on-Write filesystem** for per-container isolation
+- [x] Container-to-container networking (ping by IP)
+- [x] Unique MAC addresses per container
+- [x] Clean `/etc/hosts` per container (no duplication)
 - [ ] Auto-start command (CMD/command from Lochfile/compose)
 - [ ] Resource limits (memory, CPU via cgroups)
 - [ ] Health checks
 - [ ] Restart policies
-- [ ] Container-to-container networking (ping by name)
+- [ ] Container-to-container networking (ping by name via DNS)
 
 ### v0.5
 - [ ] Push to registry (`lochs push`)
@@ -1300,6 +1304,20 @@ BSD 2-Clause License. See [LICENSE](LICENSE) for details.
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for the full changelog.
+
+### v0.3.4 (February 2026)
+
+**Features:**
+- **OverlayFS Copy-on-Write filesystem** for per-container isolation
+  - Each container gets isolated storage via Linux OverlayFS
+  - Base image shared read-only, changes written to container-specific diff
+  - Merged view provides unified filesystem for jail
+- Unique MAC addresses per container (02:00:00:00:00:XX based on IP)
+- Container-to-container networking verified working
+
+**Fixed:**
+- `/etc/hosts` duplication issue - now writes clean per-container hosts files
+- Duplicate MAC addresses causing container communication failure
 
 ### v0.3.3 (February 2026)
 

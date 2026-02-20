@@ -391,13 +391,22 @@ int lochs_cmd_create(int argc, char **argv) {
     /* Create container entry */
     lochs_jail_t jail = {0};
     safe_strcpy(jail.name, name, sizeof(jail.name));
-    safe_strcpy(jail.path, root_path, sizeof(jail.path));
     safe_strcpy(jail.image, image, sizeof(jail.image));
     if (ip) safe_strcpy(jail.ip4_addr, ip, sizeof(jail.ip4_addr));
     jail.vnet = vnet;
     jail.state = JAIL_STATE_CREATED;
     jail.created_at = time(NULL);
     jail.jid = -1;
+    
+    /*
+     * Set up container storage using OverlayFS COW.
+     * This creates per-container directories for isolated filesystem.
+     */
+    if (lochs_storage_create_container(&jail, root_path) != 0) {
+        fprintf(stderr, "Error: failed to create container storage\n");
+        return 1;
+    }
+    /* jail.path is now set to the merged overlay path */
     
     /* Copy port mappings */
     jail.port_count = port_count;
@@ -430,7 +439,8 @@ int lochs_cmd_create(int argc, char **argv) {
     
     printf("Created container '%s'\n", name);
     printf("  Image: %s\n", image);
-    printf("  Path:  %s\n", root_path);
+    printf("  Base:  %s\n", jail.image_path);
+    printf("  Root:  %s (overlay)\n", jail.path);
     if (ip) printf("  IP:    %s\n", ip);
     if (port_count > 0) {
         printf("  Ports: ");
@@ -538,6 +548,15 @@ int lochs_cmd_start(int argc, char **argv) {
     }
     
     printf("Starting container '%s'...\n", name);
+    
+    /* Mount overlay filesystem if using COW storage */
+    if (jail->image_path[0] && jail->merged_path[0]) {
+        if (lochs_storage_mount_container(jail) != 0) {
+            fprintf(stderr, "Error: failed to mount container filesystem\n");
+            return 1;
+        }
+        printf("  Overlay: mounted\n");
+    }
     
     /* Set up network if configured */
     if (jail->network[0]) {
@@ -759,6 +778,12 @@ int lochs_cmd_stop(int argc, char **argv) {
         fprintf(stderr, "Warning: jail -r returned error, but marking as stopped\n");
     }
     
+    /* Unmount overlay filesystem */
+    if (jail->overlay_mounted) {
+        lochs_storage_unmount_container(jail);
+        printf("  Overlay: unmounted\n");
+    }
+    
     /* Save state */
     lochs_state_save();
     
@@ -800,6 +825,9 @@ int lochs_cmd_rm(int argc, char **argv) {
             return 1;
         }
     }
+    
+    /* Destroy container storage (overlay directories) */
+    lochs_storage_destroy_container(jail);
     
     if (lochs_jail_remove(name) == 0) {
         printf("Removed container '%s'\n", name);
