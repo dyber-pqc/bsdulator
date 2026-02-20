@@ -25,6 +25,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <stdint.h>
+#include <signal.h>
 #include <netinet/in.h>  /* For struct in_addr, in6_addr */
 #include "bsdulator/lochs.h"
 #include "lochs_compose.h"
@@ -152,6 +153,45 @@ static int file_exists(const char *path) {
 }
 
 /*
+ * Parse port mapping string "host:container" or "host:container/proto"
+ * Returns 0 on success, -1 on error
+ */
+static int parse_port_mapping(const char *str, lochs_port_map_t *port) {
+    char buf[64];
+    safe_strcpy(buf, str, sizeof(buf));
+    
+    /* Default protocol */
+    strcpy(port->protocol, "tcp");
+    port->forwarder_pid = 0;
+    
+    /* Check for protocol suffix */
+    char *slash = strchr(buf, '/');
+    if (slash) {
+        *slash = '\0';
+        safe_strcpy(port->protocol, slash + 1, sizeof(port->protocol));
+    }
+    
+    /* Parse host:container */
+    char *colon = strchr(buf, ':');
+    if (!colon) {
+        /* Just a port number - use same for host and container */
+        port->host_port = atoi(buf);
+        port->container_port = port->host_port;
+    } else {
+        *colon = '\0';
+        port->host_port = atoi(buf);
+        port->container_port = atoi(colon + 1);
+    }
+    
+    if (port->host_port <= 0 || port->host_port > 65535 ||
+        port->container_port <= 0 || port->container_port > 65535) {
+        return -1;
+    }
+    
+    return 0;
+}
+
+/*
  * lochs create <n> [options]
  */
 int lochs_cmd_create(int argc, char **argv) {
@@ -160,11 +200,14 @@ int lochs_cmd_create(int argc, char **argv) {
     char *ip = NULL;
     char *path = NULL;
     int vnet = 0;
+    lochs_port_map_t ports[LOCHS_MAX_PORTS];
+    int port_count = 0;
     
     static struct option long_options[] = {
         {"image",   required_argument, 0, 'i'},
         {"ip",      required_argument, 0, 'I'},
-        {"path",    required_argument, 0, 'p'},
+        {"publish", required_argument, 0, 'p'},
+        {"path",    required_argument, 0, 'P'},
         {"vnet",    no_argument,       0, 'n'},
         {"help",    no_argument,       0, 'h'},
         {0, 0, 0, 0}
@@ -173,19 +216,33 @@ int lochs_cmd_create(int argc, char **argv) {
     int opt;
     optind = 1;
     
-    while ((opt = getopt_long(argc, argv, "i:I:p:nh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:I:p:P:nh", long_options, NULL)) != -1) {
         switch (opt) {
             case 'i': image = optarg; break;
             case 'I': ip = optarg; break;
-            case 'p': path = optarg; break;
+            case 'p':
+                if (port_count < LOCHS_MAX_PORTS) {
+                    if (parse_port_mapping(optarg, &ports[port_count]) == 0) {
+                        port_count++;
+                    } else {
+                        fprintf(stderr, "Error: Invalid port mapping '%s'\n", optarg);
+                        return 1;
+                    }
+                }
+                break;
+            case 'P': path = optarg; break;
             case 'n': vnet = 1; break;
             case 'h':
                 printf("Usage: lochs create <n> [options]\n\n");
                 printf("Options:\n");
                 printf("  -i, --image <image>   Base image (default: freebsd:15)\n");
                 printf("  -I, --ip <addr>       IPv4 address for jail\n");
-                printf("  -p, --path <path>     Root filesystem path\n");
+                printf("  -p, --publish <port>  Publish port (host:container or host:container/proto)\n");
+                printf("  -P, --path <path>     Root filesystem path\n");
                 printf("  -n, --vnet            Enable virtual networking\n");
+                printf("\nExamples:\n");
+                printf("  lochs create web -i freebsd:15 -p 8080:80\n");
+                printf("  lochs create db -p 5432:5432/tcp -p 5433:5433/tcp\n");
                 return 0;
             default:
                 return 1;
@@ -247,6 +304,12 @@ int lochs_cmd_create(int argc, char **argv) {
     jail.created_at = time(NULL);
     jail.jid = -1;
     
+    /* Copy port mappings */
+    jail.port_count = port_count;
+    for (int i = 0; i < port_count; i++) {
+        jail.ports[i] = ports[i];
+    }
+    
     if (lochs_jail_add(&jail) != 0) {
         fprintf(stderr, "Error: failed to register container\n");
         return 1;
@@ -256,9 +319,61 @@ int lochs_cmd_create(int argc, char **argv) {
     printf("  Image: %s\n", image);
     printf("  Path:  %s\n", root_path);
     if (ip) printf("  IP:    %s\n", ip);
+    if (port_count > 0) {
+        printf("  Ports: ");
+        for (int i = 0; i < port_count; i++) {
+            printf("%d->%d/%s%s", ports[i].host_port, ports[i].container_port,
+                   ports[i].protocol, (i < port_count - 1) ? ", " : "");
+        }
+        printf("\n");
+    }
     printf("\nRun 'lochs start %s' to start the container.\n", name);
     
     return 0;
+}
+
+/*
+ * Start port forwarding using socat
+ * Returns PID of forwarder process, or -1 on error
+ */
+static pid_t start_port_forward(int host_port, int container_port, const char *protocol) {
+    char cmd[512];
+    
+    /* Use socat for port forwarding */
+    /* TCP: socat TCP-LISTEN:host,fork,reuseaddr TCP:127.0.0.1:container */
+    /* UDP: socat UDP-LISTEN:host,fork,reuseaddr UDP:127.0.0.1:container */
+    
+    if (strcmp(protocol, "udp") == 0) {
+        snprintf(cmd, sizeof(cmd),
+            "socat UDP-LISTEN:%d,fork,reuseaddr UDP:127.0.0.1:%d &"
+            " echo $!",
+            host_port, container_port);
+    } else {
+        snprintf(cmd, sizeof(cmd),
+            "socat TCP-LISTEN:%d,fork,reuseaddr TCP:127.0.0.1:%d &"
+            " echo $!",
+            host_port, container_port);
+    }
+    
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return -1;
+    
+    pid_t pid = 0;
+    if (fscanf(fp, "%d", &pid) != 1) {
+        pid = -1;
+    }
+    pclose(fp);
+    
+    return pid;
+}
+
+/*
+ * Stop port forwarding
+ */
+static void stop_port_forward(pid_t pid) {
+    if (pid > 0) {
+        kill(pid, SIGTERM);
+    }
 }
 
 /*
@@ -337,9 +452,26 @@ int lochs_cmd_start(int argc, char **argv) {
     
     jail->state = JAIL_STATE_RUNNING;
     jail->started_at = time(NULL);
+    
+    /* Start port forwarding */
+    if (jail->port_count > 0) {
+        printf("Setting up port forwarding...\n");
+        for (int i = 0; i < jail->port_count; i++) {
+            lochs_port_map_t *p = &jail->ports[i];
+            p->forwarder_pid = start_port_forward(p->host_port, p->container_port, p->protocol);
+            if (p->forwarder_pid > 0) {
+                printf("  %d -> %d/%s (pid=%d)\n", 
+                       p->host_port, p->container_port, p->protocol, p->forwarder_pid);
+            } else {
+                fprintf(stderr, "  Warning: Failed to forward %d -> %d/%s\n",
+                        p->host_port, p->container_port, p->protocol);
+            }
+        }
+    }
+    
     printf("Container '%s' started (jid=%d)\n", name, jail->jid);
     
-    /* Save state with updated JID */
+    /* Save state with updated JID and port PIDs */
     lochs_state_save();
     
     return 0;
@@ -370,6 +502,18 @@ int lochs_cmd_stop(int argc, char **argv) {
     }
     
     printf("Stopping container '%s'...\n", name);
+    
+    /* Stop port forwarders first */
+    if (jail->port_count > 0) {
+        printf("Stopping port forwarding...\n");
+        for (int i = 0; i < jail->port_count; i++) {
+            lochs_port_map_t *p = &jail->ports[i];
+            if (p->forwarder_pid > 0) {
+                stop_port_forward(p->forwarder_pid);
+                p->forwarder_pid = 0;
+            }
+        }
+    }
     
     /* Use jail -r from the container image */
     char cmd[4096];
@@ -518,10 +662,10 @@ int lochs_cmd_ps(int argc, char **argv) {
         }
     }
     
-    printf("%-15s %-6s %-20s %-15s %s\n", 
-           "NAME", "JID", "IMAGE", "STATUS", "PATH");
-    printf("%-15s %-6s %-20s %-15s %s\n",
-           "----", "---", "-----", "------", "----");
+    printf("%-15s %-6s %-20s %-15s %-20s %s\n", 
+           "NAME", "JID", "IMAGE", "STATUS", "PORTS", "PATH");
+    printf("%-15s %-6s %-20s %-15s %-20s %s\n",
+           "----", "---", "-----", "------", "-----", "----");
     
     for (int i = 0; i < jail_count; i++) {
         lochs_jail_t *j = &jails[i];
@@ -541,11 +685,23 @@ int lochs_cmd_ps(int argc, char **argv) {
             strcpy(jid_str, "-");
         }
         
-        printf("%-15s %-6s %-20s %-15s %s\n",
+        /* Build ports string */
+        char ports_str[64] = "-";
+        if (j->port_count > 0) {
+            int pos = 0;
+            for (int p = 0; p < j->port_count && pos < (int)sizeof(ports_str) - 10; p++) {
+                if (p > 0) pos += snprintf(ports_str + pos, sizeof(ports_str) - (size_t)pos, ",");
+                pos += snprintf(ports_str + pos, sizeof(ports_str) - (size_t)pos, 
+                               "%d->%d", j->ports[p].host_port, j->ports[p].container_port);
+            }
+        }
+        
+        printf("%-15s %-6s %-20s %-15s %-20s %s\n",
                j->name,
                jid_str,
                j->image,
                state_str,
+               ports_str,
                j->path);
     }
     

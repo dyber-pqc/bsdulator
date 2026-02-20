@@ -10,6 +10,7 @@
 #define LOCHS_MAX_PATH 1024
 #define LOCHS_MAX_JAILS 64
 #define LOCHS_MAX_SERVICES 32
+#define LOCHS_MAX_PORTS 16
 
 /* Jail states */
 typedef enum {
@@ -18,6 +19,14 @@ typedef enum {
     JAIL_STATE_STOPPED,
     JAIL_STATE_REMOVED
 } jail_state_t;
+
+/* Port mapping */
+typedef struct {
+    int host_port;
+    int container_port;
+    char protocol[8];               /* "tcp" or "udp" */
+    pid_t forwarder_pid;            /* PID of socat process */
+} lochs_port_map_t;
 
 /* Managed jail entry (extends raw bsd_jail_t) */
 typedef struct {
@@ -31,6 +40,10 @@ typedef struct {
     pid_t pid;                      /* Main process PID */
     time_t created_at;
     time_t started_at;
+    
+    /* Port mappings */
+    lochs_port_map_t ports[LOCHS_MAX_PORTS];
+    int port_count;
 } lochs_jail_t;
 
 /* Lochfile parsed representation */
