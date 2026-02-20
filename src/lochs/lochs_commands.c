@@ -255,6 +255,45 @@ static int parse_port_mapping(const char *str, lochs_port_map_t *port) {
 }
 
 /*
+ * Load image metadata from .lochs_image.conf
+ * Reads CMD, ENTRYPOINT, WORKDIR from built images
+ */
+static void load_image_metadata(lochs_jail_t *jail, const char *image_path) {
+    char conf_path[LOCHS_MAX_PATH + 32];
+    snprintf(conf_path, sizeof(conf_path), "%s/.lochs_image.conf", image_path);
+    
+    FILE *f = fopen(conf_path, "r");
+    if (!f) return;  /* No metadata file - that's OK for pulled images */
+    
+    char line[2048];
+    while (fgets(line, sizeof(line), f)) {
+        /* Skip comments and empty lines */
+        if (line[0] == '#' || line[0] == '\n') continue;
+        
+        /* Remove trailing newline */
+        size_t len = strlen(line);
+        if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
+        
+        /* Parse key=value */
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = line;
+        char *value = eq + 1;
+        
+        if (strcmp(key, "cmd") == 0) {
+            safe_strcpy(jail->cmd, value, sizeof(jail->cmd));
+        } else if (strcmp(key, "entrypoint") == 0) {
+            safe_strcpy(jail->entrypoint, value, sizeof(jail->entrypoint));
+        } else if (strcmp(key, "workdir") == 0) {
+            safe_strcpy(jail->workdir, value, sizeof(jail->workdir));
+        }
+    }
+    
+    fclose(f);
+}
+
+/*
  * lochs create <n> [options]
  */
 int lochs_cmd_create(int argc, char **argv) {
@@ -407,7 +446,10 @@ int lochs_cmd_create(int argc, char **argv) {
         return 1;
     }
     /* jail.path is now set to the merged overlay path */
-    
+
+    /* Load image metadata (CMD, ENTRYPOINT, WORKDIR) */
+    load_image_metadata(&jail, root_path);
+
     /* Copy port mappings */
     jail.port_count = port_count;
     for (int i = 0; i < port_count; i++) {
@@ -692,7 +734,27 @@ int lochs_cmd_start(int argc, char **argv) {
     }
     
     printf("Container '%s' started (jid=%d)\n", name, jail->jid);
-    
+
+    /* Auto-start CMD if configured */
+    if (jail->cmd[0]) {
+        printf("Running CMD: %s\n", jail->cmd);
+        
+        /* Build the exec command */
+        char exec_cmd[4096];
+        if (jail->netns[0]) {
+            snprintf(exec_cmd, sizeof(exec_cmd),
+                "./bsdulator --netns %s %s/libexec/ld-elf.so.1 %s/usr/sbin/jexec %s %s &",
+                jail->netns, jail->path, jail->path, jail->name, jail->cmd);
+        } else {
+            snprintf(exec_cmd, sizeof(exec_cmd),
+                "./bsdulator %s/libexec/ld-elf.so.1 %s/usr/sbin/jexec %s %s &",
+                jail->path, jail->path, jail->name, jail->cmd);
+        }
+        
+        int cmd_ret = system(exec_cmd);
+        (void)cmd_ret;
+    }
+
     /* Save state with updated JID and port PIDs */
     lochs_state_save();
     

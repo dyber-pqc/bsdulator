@@ -76,6 +76,11 @@ typedef struct {
     char work_path[LOCHS_MAX_PATH];   /* OverlayFS work dir */
     char merged_path[LOCHS_MAX_PATH]; /* Merged view (container root) */
     int overlay_mounted;              /* Is overlay currently mounted? */
+
+    /* Auto-start command */
+    char cmd[1024];                   /* CMD from Lochfile */
+    char entrypoint[1024];            /* ENTRYPOINT from Lochfile */
+    char workdir[256];                /* WORKDIR from Lochfile */
 } lochs_jail_t;
 
 /* Network definition */
