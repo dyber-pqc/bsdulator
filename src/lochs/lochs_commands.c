@@ -153,6 +153,65 @@ static int file_exists(const char *path) {
 }
 
 /*
+ * Parse volume mapping string "/host:/container" or "/host:/container:ro"
+ * Returns 0 on success, -1 on error
+ */
+static int parse_volume_mapping(const char *str, lochs_volume_t *vol) {
+    char buf[1024];
+    safe_strcpy(buf, str, sizeof(buf));
+    
+    vol->readonly = 0;
+    
+    /* Check for :ro suffix */
+    char *ro = strstr(buf, ":ro");
+    if (ro && (ro[3] == '\0' || ro[3] == ':')) {
+        vol->readonly = 1;
+        *ro = '\0';
+    }
+    
+    /* Parse host:container */
+    char *colon = strchr(buf, ':');
+    if (!colon) {
+        /* No colon - use same path for both */
+        safe_strcpy(vol->host_path, buf, sizeof(vol->host_path));
+        safe_strcpy(vol->container_path, buf, sizeof(vol->container_path));
+    } else {
+        *colon = '\0';
+        safe_strcpy(vol->host_path, buf, sizeof(vol->host_path));
+        safe_strcpy(vol->container_path, colon + 1, sizeof(vol->container_path));
+    }
+    
+    /* Validate paths start with / */
+    if (vol->host_path[0] != '/' || vol->container_path[0] != '/') {
+        return -1;
+    }
+    
+    return 0;
+}
+
+/*
+ * Parse environment variable "KEY=value"
+ * Returns 0 on success, -1 on error
+ */
+static int parse_env_var(const char *str, char *key, size_t key_size, char *value, size_t value_size) {
+    const char *eq = strchr(str, '=');
+    if (!eq) {
+        /* Just a key, value is empty */
+        safe_strcpy(key, str, key_size);
+        value[0] = '\0';
+        return 0;
+    }
+    
+    size_t klen = (size_t)(eq - str);
+    if (klen >= key_size) klen = key_size - 1;
+    memcpy(key, str, klen);
+    key[klen] = '\0';
+    
+    safe_strcpy(value, eq + 1, value_size);
+    return 0;
+}
+
+/*
  * Parse port mapping string "host:container" or "host:container/proto"
  * Returns 0 on success, -1 on error
  */
@@ -202,12 +261,19 @@ int lochs_cmd_create(int argc, char **argv) {
     int vnet = 0;
     lochs_port_map_t ports[LOCHS_MAX_PORTS];
     int port_count = 0;
+    lochs_volume_t volumes[LOCHS_MAX_VOLUMES];
+    int volume_count = 0;
+    char env_keys[LOCHS_MAX_ENV][64];
+    char env_values[LOCHS_MAX_ENV][256];
+    int env_count = 0;
     
     static struct option long_options[] = {
         {"image",   required_argument, 0, 'i'},
         {"ip",      required_argument, 0, 'I'},
         {"publish", required_argument, 0, 'p'},
         {"path",    required_argument, 0, 'P'},
+        {"volume",  required_argument, 0, 'v'},
+        {"env",     required_argument, 0, 'e'},
         {"vnet",    no_argument,       0, 'n'},
         {"help",    no_argument,       0, 'h'},
         {0, 0, 0, 0}
@@ -216,7 +282,7 @@ int lochs_cmd_create(int argc, char **argv) {
     int opt;
     optind = 1;
     
-    while ((opt = getopt_long(argc, argv, "i:I:p:P:nh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:I:p:P:v:e:nh", long_options, NULL)) != -1) {
         switch (opt) {
             case 'i': image = optarg; break;
             case 'I': ip = optarg; break;
@@ -230,6 +296,25 @@ int lochs_cmd_create(int argc, char **argv) {
                     }
                 }
                 break;
+            case 'v':
+                if (volume_count < LOCHS_MAX_VOLUMES) {
+                    if (parse_volume_mapping(optarg, &volumes[volume_count]) == 0) {
+                        volume_count++;
+                    } else {
+                        fprintf(stderr, "Error: Invalid volume mapping '%s'\n", optarg);
+                        fprintf(stderr, "Format: /host/path:/container/path[:ro]\n");
+                        return 1;
+                    }
+                }
+                break;
+            case 'e':
+                if (env_count < LOCHS_MAX_ENV) {
+                    if (parse_env_var(optarg, env_keys[env_count], sizeof(env_keys[0]),
+                                     env_values[env_count], sizeof(env_values[0])) == 0) {
+                        env_count++;
+                    }
+                }
+                break;
             case 'P': path = optarg; break;
             case 'n': vnet = 1; break;
             case 'h':
@@ -237,12 +322,14 @@ int lochs_cmd_create(int argc, char **argv) {
                 printf("Options:\n");
                 printf("  -i, --image <image>   Base image (default: freebsd:15)\n");
                 printf("  -I, --ip <addr>       IPv4 address for jail\n");
-                printf("  -p, --publish <port>  Publish port (host:container or host:container/proto)\n");
+                printf("  -p, --publish <port>  Publish port (host:container)\n");
+                printf("  -v, --volume <vol>    Mount volume (/host:/container[:ro])\n");
+                printf("  -e, --env <var>       Set environment variable (KEY=value)\n");
                 printf("  -P, --path <path>     Root filesystem path\n");
                 printf("  -n, --vnet            Enable virtual networking\n");
                 printf("\nExamples:\n");
                 printf("  lochs create web -i freebsd:15 -p 8080:80\n");
-                printf("  lochs create db -p 5432:5432/tcp -p 5433:5433/tcp\n");
+                printf("  lochs create app -v /data:/app/data -e DEBUG=1\n");
                 return 0;
             default:
                 return 1;
@@ -310,6 +397,19 @@ int lochs_cmd_create(int argc, char **argv) {
         jail.ports[i] = ports[i];
     }
     
+    /* Copy volume mappings */
+    jail.volume_count = volume_count;
+    for (int i = 0; i < volume_count; i++) {
+        jail.volumes[i] = volumes[i];
+    }
+    
+    /* Copy environment variables */
+    jail.env_count = env_count;
+    for (int i = 0; i < env_count; i++) {
+        safe_strcpy(jail.env_keys[i], env_keys[i], sizeof(jail.env_keys[0]));
+        safe_strcpy(jail.env_values[i], env_values[i], sizeof(jail.env_values[0]));
+    }
+    
     if (lochs_jail_add(&jail) != 0) {
         fprintf(stderr, "Error: failed to register container\n");
         return 1;
@@ -324,6 +424,20 @@ int lochs_cmd_create(int argc, char **argv) {
         for (int i = 0; i < port_count; i++) {
             printf("%d->%d/%s%s", ports[i].host_port, ports[i].container_port,
                    ports[i].protocol, (i < port_count - 1) ? ", " : "");
+        }
+        printf("\n");
+    }
+    if (volume_count > 0) {
+        printf("  Volumes:\n");
+        for (int i = 0; i < volume_count; i++) {
+            printf("    %s -> %s%s\n", volumes[i].host_path, volumes[i].container_path,
+                   volumes[i].readonly ? " (ro)" : "");
+        }
+    }
+    if (env_count > 0) {
+        printf("  Env:   ");
+        for (int i = 0; i < env_count; i++) {
+            printf("%s=%s%s", env_keys[i], env_values[i], (i < env_count - 1) ? ", " : "");
         }
         printf("\n");
     }
@@ -408,6 +522,54 @@ int lochs_cmd_start(int argc, char **argv) {
     }
     
     printf("Starting container '%s'...\n", name);
+    
+    /* Mount volumes before starting jail */
+    if (jail->volume_count > 0) {
+        printf("Mounting volumes...\n");
+        for (int i = 0; i < jail->volume_count; i++) {
+            lochs_volume_t *v = &jail->volumes[i];
+            char mount_point[1024];
+            char mount_cmd[2048];
+            
+            /* Create mount point in container */
+            snprintf(mount_point, sizeof(mount_point), "%s%s", jail->path, v->container_path);
+            snprintf(mount_cmd, sizeof(mount_cmd), "mkdir -p '%s'", mount_point);
+            int r = system(mount_cmd);
+            (void)r;
+            
+            /* Bind mount the host path */
+            snprintf(mount_cmd, sizeof(mount_cmd), 
+                "mount --bind '%s' '%s'", v->host_path, mount_point);
+            if (system(mount_cmd) == 0) {
+                printf("  %s -> %s%s\n", v->host_path, v->container_path,
+                       v->readonly ? " (ro)" : "");
+                
+                /* Make read-only if requested */
+                if (v->readonly) {
+                    snprintf(mount_cmd, sizeof(mount_cmd),
+                        "mount -o remount,ro,bind '%s'", mount_point);
+                    r = system(mount_cmd);
+                    (void)r;
+                }
+            } else {
+                fprintf(stderr, "  Warning: Failed to mount %s\n", v->host_path);
+            }
+        }
+    }
+    
+    /* Write environment file for container */
+    if (jail->env_count > 0) {
+        char env_file[1024];
+        snprintf(env_file, sizeof(env_file), "%s/.lochs_env", jail->path);
+        FILE *ef = fopen(env_file, "w");
+        if (ef) {
+            for (int i = 0; i < jail->env_count; i++) {
+                fprintf(ef, "export %s='%s'\n", jail->env_keys[i], jail->env_values[i]);
+            }
+            fclose(ef);
+            printf("Environment: %d variable(s) set\n", jail->env_count);
+        }
+    }
     
     /*
      * Build the jail command using binaries FROM THE CONTAINER IMAGE.
@@ -512,6 +674,21 @@ int lochs_cmd_stop(int argc, char **argv) {
                 stop_port_forward(p->forwarder_pid);
                 p->forwarder_pid = 0;
             }
+        }
+    }
+    
+    /* Unmount volumes */
+    if (jail->volume_count > 0) {
+        printf("Unmounting volumes...\n");
+        for (int i = jail->volume_count - 1; i >= 0; i--) {
+            lochs_volume_t *v = &jail->volumes[i];
+            char mount_point[1024];
+            char umount_cmd[2048];
+            
+            snprintf(mount_point, sizeof(mount_point), "%s%s", jail->path, v->container_path);
+            snprintf(umount_cmd, sizeof(umount_cmd), "umount '%s' 2>/dev/null", mount_point);
+            int r = system(umount_cmd);
+            (void)r;
         }
     }
     
@@ -631,7 +808,13 @@ int lochs_cmd_exec(int argc, char **argv) {
         pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos, " %s", argv[i]);
     }
     
-    return system(cmd);
+    /* Capture output to log file as well as displaying it */
+    char log_cmd[4200];
+    snprintf(log_cmd, sizeof(log_cmd), 
+        "mkdir -p /var/lib/lochs/logs && %s 2>&1 | tee -a /var/lib/lochs/logs/%s.log",
+        cmd, name);
+    
+    return system(log_cmd);
 }
 
 /*
@@ -759,6 +942,7 @@ int lochs_state_load(void) {
 
 int lochs_state_save(void) {
     mkdir("/var/lib/lochs", 0755);
+    mkdir("/var/lib/lochs/logs", 0755);
     
     FILE *f = fopen(STATE_FILE, "wb");
     if (!f) {
@@ -952,4 +1136,78 @@ int lochs_cmd_compose(int argc, char **argv) {
     
     compose_free(&compose);
     return ret;
+}
+
+/*
+ * lochs logs [-f] [-n lines] <container>
+ * 
+ * View container logs (stdout/stderr captured during execution)
+ */
+int lochs_cmd_logs(int argc, char **argv) {
+    int follow = 0;
+    int lines = 50;
+    const char *name = NULL;
+    
+    static struct option long_options[] = {
+        {"follow", no_argument,       0, 'f'},
+        {"tail",   required_argument, 0, 'n'},
+        {"help",   no_argument,       0, 'h'},
+        {0, 0, 0, 0}
+    };
+    
+    int opt;
+    optind = 1;
+    
+    while ((opt = getopt_long(argc, argv, "fn:h", long_options, NULL)) != -1) {
+        switch (opt) {
+            case 'f': follow = 1; break;
+            case 'n': lines = atoi(optarg); break;
+            case 'h':
+                printf("Usage: lochs logs [options] <container>\n\n");
+                printf("Options:\n");
+                printf("  -f, --follow      Follow log output\n");
+                printf("  -n, --tail <N>    Number of lines to show (default: 50)\n");
+                return 0;
+            default:
+                return 1;
+        }
+    }
+    
+    if (optind >= argc) {
+        fprintf(stderr, "Error: container name required\n");
+        fprintf(stderr, "Usage: lochs logs [options] <container>\n");
+        return 1;
+    }
+    
+    name = argv[optind];
+    lochs_jail_t *jail = lochs_jail_find(name);
+    
+    if (!jail) {
+        fprintf(stderr, "Error: container '%s' not found\n", name);
+        return 1;
+    }
+    
+    /* Log file is stored in /var/lib/lochs/logs/<name>.log */
+    char log_path[1024];
+    snprintf(log_path, sizeof(log_path), "/var/lib/lochs/logs/%s.log", name);
+    
+    /* Check if log file exists */
+    struct stat st;
+    if (stat(log_path, &st) != 0) {
+        printf("No logs available for container '%s'\n", name);
+        printf("(Logs are captured when running commands with output)\n");
+        return 0;
+    }
+    
+    if (follow) {
+        /* Use tail -f for following */
+        char cmd[1200];
+        snprintf(cmd, sizeof(cmd), "tail -f '%s'", log_path);
+        return system(cmd);
+    } else {
+        /* Show last N lines */
+        char cmd[1200];
+        snprintf(cmd, sizeof(cmd), "tail -n %d '%s'", lines, log_path);
+        return system(cmd);
+    }
 }

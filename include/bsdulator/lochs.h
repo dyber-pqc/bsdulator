@@ -28,6 +28,16 @@ typedef struct {
     pid_t forwarder_pid;            /* PID of socat process */
 } lochs_port_map_t;
 
+/* Volume mount */
+typedef struct {
+    char host_path[512];
+    char container_path[512];
+    int readonly;
+} lochs_volume_t;
+
+#define LOCHS_MAX_VOLUMES 16
+#define LOCHS_MAX_ENV 32
+
 /* Managed jail entry (extends raw bsd_jail_t) */
 typedef struct {
     int jid;
@@ -44,6 +54,15 @@ typedef struct {
     /* Port mappings */
     lochs_port_map_t ports[LOCHS_MAX_PORTS];
     int port_count;
+    
+    /* Volume mounts */
+    lochs_volume_t volumes[LOCHS_MAX_VOLUMES];
+    int volume_count;
+    
+    /* Environment variables */
+    char env_keys[LOCHS_MAX_ENV][64];
+    char env_values[LOCHS_MAX_ENV][256];
+    int env_count;
 } lochs_jail_t;
 
 /* Lochfile parsed representation */
@@ -100,6 +119,7 @@ int lochs_cmd_compose(int argc, char **argv);
 int lochs_cmd_version(int argc, char **argv);
 int lochs_cmd_search(int argc, char **argv);
 int lochs_cmd_rmi(int argc, char **argv);
+int lochs_cmd_logs(int argc, char **argv);
 
 /* Compose parser */
 int lochs_compose_parse(const char *path, lochs_compose_t *compose);
