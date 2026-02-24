@@ -88,7 +88,7 @@ FreeBSD jails were the original container technology (introduced in 2000, 13 yea
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              USER INTERFACE                                  │
+│                              USER INTERFACE                                 │
 │                                                                             │
 │    lochs CLI          lochs.yml           Lochfile          REST API        │
 │    (commands)         (compose)           (build)           (programmatic)  │
@@ -96,17 +96,17 @@ FreeBSD jails were the original container technology (introduced in 2000, 13 yea
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                            LOCHS DAEMON                                      │
+│                            LOCHS DAEMON                                     │
 │                                                                             │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐        │
-│  │   Image     │  │  Container  │  │   Network   │  │   Volume    │        │
-│  │   Manager   │  │   Manager   │  │   Manager   │  │   Manager   │        │
-│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘        │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
+│  │   Image     │  │  Container  │  │   Network   │  │   Volume    │         │
+│  │   Manager   │  │   Manager   │  │   Manager   │  │   Manager   │         │
+│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘         │
 │                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────┐       │
-│  │                      State Database                              │       │
-│  │                   /var/lib/lochs/*.dat                           │       │
-│  └─────────────────────────────────────────────────────────────────┘       │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │                      State Database                             │        │
+│  │                   /var/lib/lochs/*.dat                          │        │
+│  └─────────────────────────────────────────────────────────────────┘        │
 └──────────────────────────────┬──────────────────────────────────────────────┘
                                │
           ┌────────────────────┼────────────────────┐
@@ -929,27 +929,27 @@ BSDulator is the syscall translation engine that enables FreeBSD binaries to run
 ┌─────────────────────────────────────────────────────────────────┐
 │                    FreeBSD Binary (ELF)                         │
 │                                                                 │
-│   Calls FreeBSD syscall (e.g., syscall 5 = open)               │
+│        Calls FreeBSD syscall (e.g., syscall 5 = open)           │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                       BSDulator                                  │
+│                       BSDulator                                 │
 │                                                                 │
 │   1. ptrace intercepts syscall                                  │
-│   2. Reads FreeBSD syscall number (5)                          │
-│   3. Looks up in translation table → Linux syscall 2 (open)    │
-│   4. Translates arguments (flags, paths)                       │
-│   5. Rewrites registers with Linux values                      │
-│   6. Lets Linux kernel execute                                 │
-│   7. Translates return value back to FreeBSD format            │
+│   2. Reads FreeBSD syscall number (5)                           │
+│   3. Looks up in translation table → Linux syscall 2 (open)     │
+│   4. Translates arguments (flags, paths)                        │
+│   5. Rewrites registers with Linux values                       │
+│   6. Lets Linux kernel execute                                  │
+│   7. Translates return value back to FreeBSD format             │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                      Linux Kernel                                │
+│                      Linux Kernel                               │
 │                                                                 │
-│   Executes translated syscall                                   │
+│                 Executes translated syscall                     │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
