@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🏔️ Lochs
+<img src="lochs-logo.png" alt="Lochs" width="280">
 
 **FreeBSD jails, everywhere. Docker-like simplicity.**
 

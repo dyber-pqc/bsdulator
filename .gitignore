@@ -13,6 +13,29 @@
 /freebsd-root/
 base.txz
 
+# Secrets and credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.csr
+*.keystore
+*.jks
+credentials.json
+secrets.json
+*.secret
+token
+.token
+.secrets
+wrangler.toml
+
+# API keys and tokens
+.cloudflare
+.wrangler/
+
 # Editor files
 *.swp
 *.swo
@@ -35,6 +58,7 @@ vgcore.*
 # OS files
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # Distribution
 *.tar.gz
@@ -42,8 +66,9 @@ Thumbs.db
 *.deb
 *.rpm
 
-# Backup Files
+# Backup files
 *.bak
-*.bak2
-*.bak3
 *.bak*
+
+# Docker
+.docker/

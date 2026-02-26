@@ -1,134 +1,145 @@
-# BSDulator
+<div align="center">
 
-**FreeBSD Binary Compatibility Layer for Linux**
+<img src="lochs-logo.png" alt="Lochs" width="280">
 
-BSDulator enables running unmodified FreeBSD binaries on Linux by intercepting and translating FreeBSD system calls to their Linux equivalents. Similar to how Wine runs Windows applications on Linux, or how FreeBSD's Linuxulator runs Linux binaries on FreeBSD—but in reverse.
+# BSDulator + Lochs
 
-## 🎉 Current Status: FreeBSD Jails with Full Network Isolation!
+**FreeBSD containers, everywhere.**
 
-BSDulator now provides **complete FreeBSD jail support with virtual networking**, bringing FreeBSD's powerful jail containerization to Linux. This is the first implementation of FreeBSD jails outside of FreeBSD itself.
+Run FreeBSD jails on Linux with Docker-like simplicity.
 
-### What Works
+[![License](https://img.shields.io/badge/license-Source%20Available-blue?style=flat-square)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20WSL2-38bdf8?style=flat-square)]()
+[![FreeBSD](https://img.shields.io/badge/FreeBSD-15.0-AB2B28?style=flat-square&logo=freebsd&logoColor=white)]()
+[![Website](https://img.shields.io/badge/lochs.dev-visit-red?style=flat-square)](https://lochs.dev)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?style=flat-square&logo=discord&logoColor=white)](https://discord.gg/km3VGfUW)
 
-| Feature | Examples | Status |
-|---------|----------|--------|
-| Static binaries | `/rescue/echo`, `/rescue/ls`, `/rescue/cat`, `/rescue/sh` | ✅ **Working** |
-| Dynamic binaries | `/bin/echo`, `/bin/ls`, `/bin/cat`, `/bin/sh` | ✅ **Working** |
-| FreeBSD Shell | `/bin/sh` with pipes, redirects | ✅ **Working** |
-| Shared libraries | `libc.so.7`, `ld-elf.so.1` | ✅ **Loading** |
-| **Jail creation** | `jail -c name=test path=./freebsd-root ip4.addr=10.0.0.1 persist` | ✅ **Working** |
-| **Jail listing** | `jls`, `jls -v`, `jls jid name ip4.addr path` | ✅ **Working** |
-| **Jail execution** | `jexec 1 /bin/sh -c "echo hello"` | ✅ **Working** |
-| **Jail exec flags** | `jexec -l`, `jexec -U root`, `jexec -u root` | ✅ **Working** |
-| **Jail removal** | `jail -r 1` | ✅ **Working** |
-| **Jail IP assignment** | `ip4.addr=192.168.1.10` parameter | ✅ **Working** |
-| **Virtual networking** | `vnet` parameter with bridge networking | ✅ **Working** |
-| **Inter-jail networking** | Jail-to-jail and host-to-jail communication | ✅ **Working** |
-| **Multiple jails** | Create, manage, and remove multiple concurrent jails | ✅ **Working** |
+</div>
+
+---
+
+## Install
 
 ```bash
-# Run FreeBSD binaries
-./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/bin/echo "Hello from FreeBSD!"
-./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/bin/ls -la /
-./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/bin/sh -c 'pwd; echo test'
-
-# Create and manage FreeBSD jails on Linux!
-./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jail -c name=myjail path=./freebsd-root ip4.addr=10.0.0.1 persist
-./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jls
-./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jls jid name ip4.addr path
-sudo ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jexec 1 /bin/sh -c "echo Hello from inside the jail!"
-sudo ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jexec -U root 1 /bin/sh -c "id"
-./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jail -r 1
-
-# Create jail with virtual network stack (VNET)
-sudo ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jail \
-    -c name=webserver path=./freebsd-root ip4.addr=10.0.0.10 vnet persist
-
-# Test network connectivity
-ping 10.0.0.10  # Host to jail - works!
-ip netns exec bsdjail_1 ping 10.0.0.20  # Jail to jail - works!
+curl -fsSL https://lochs.dev/install.sh | sudo bash
 ```
 
-## Features
-
-- **Full Syscall Translation**: 200+ FreeBSD syscalls translated to Linux equivalents
-- **Complete FreeBSD Jail Support**: Create, list, execute, and remove jails with IP assignment
-- **Virtual Network Stack (VNET)**: Full network isolation using Linux network namespaces
-- **Bridge Networking**: Automatic bridge setup for inter-jail and host-to-jail communication
-- **Jail IP Assignment**: Assign IPv4 addresses to jails via `ip4.addr` parameter
-- **Jail Execution Flags**: Full support for `jexec -l`, `-U`, and `-u` flags
-- **Dynamic Binary Support**: Loads FreeBSD shared libraries and dynamic linker
-- **Path Translation**: Automatically redirects FreeBSD system paths to local root
-- **ABI Translation**: Handles differences in flags, structures, errno values, and signals
-- **TLS Emulation**: Full Thread Local Storage setup for FreeBSD binaries
-- **Persistent Jails**: Jail state persists across BSDulator invocations
-- **Verbose Tracing**: Detailed syscall tracing for debugging
-
-## System Requirements
-
-| Requirement | Details |
-|-------------|---------|
-| **OS** | Linux (kernel 3.8+) |
-| **Architecture** | x86_64 only |
-| **Privileges** | Root/sudo for jail features |
-| **Packages** | `iproute2` (for networking) |
-| **Tested On** | Ubuntu 24.04, WSL2, Debian 12, Fedora 39 |
-
-Run the compatibility checker to verify your system:
-
-```bash
-./scripts/check_compat.sh
-```
-
-## Building
-
-```bash
-# Clone or download the source
-cd bsdulator
-
-# Build optimized release
-make
-
-# Or build with debug symbols
-make debug
-
-# Clean and rebuild
-make clean && make
-```
+This installs the BSDulator engine, the Lochs CLI, and fetches the FreeBSD 15.0-RELEASE base system.
 
 ## Quick Start
 
 ```bash
-# 1. Check system compatibility
-./scripts/check_compat.sh
+# Create and run a jail
+$ lochs run --name webserver --vnet -p 8080:80 freebsd:15
+  Jail "webserver" created (JID 1) - 10.0.0.10
 
-# 2. Build BSDulator
-make
+# Execute into the jail
+$ lochs exec webserver /bin/sh
+root@webserver:/ # pkg install nginx
 
-# 3. Download FreeBSD base system (~180MB)
-./scripts/setup_freebsd_root.sh
+# List running jails
+$ lochs ps
+JID  NAME        IP           STATUS
+1    webserver   10.0.0.10    running
 
-# 4. Run FreeBSD binaries!
-./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/bin/echo "Hello from FreeBSD!"
-
-# 5. Create a jail with virtual networking!
-sudo ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jail \
-    -c name=test path=./freebsd-root ip4.addr=10.0.0.10 vnet persist
-
-# 6. List jails (with IP addresses)
-./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jls jid name ip4.addr path
-
-# 7. Test network connectivity
-ping 10.0.0.10
-
-# 8. Execute commands in jail (requires sudo for chroot)
-sudo ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jexec 1 /bin/sh -c "whoami; pwd; ls /"
-
-# 9. Remove jail (automatically cleans up networking)
-./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jail -r 1
+# Stop and remove
+$ lochs stop webserver
+$ lochs rm webserver
 ```
 
-## Usage
+## What Is This?
+
+**BSDulator** is a FreeBSD binary compatibility layer for Linux. It intercepts FreeBSD system calls via ptrace and translates them to Linux equivalents in real time — no VMs, no emulation overhead. Think Wine for FreeBSD, or the inverse of FreeBSD's Linuxulator.
+
+**Lochs** (pronounced "locks", like the Scottish lakes) is a Docker-like CLI built on top of BSDulator. It provides familiar container management commands (`run`, `exec`, `ps`, `stop`) for FreeBSD jails running on Linux.
+
+Together, they bring FreeBSD's jail isolation system — the original container technology (2000, 13 years before Docker) — to any Linux host.
+
+## Features
+
+### BSDulator Engine
+- **222 syscalls** translated or emulated ([full matrix](docs/syscalls.md))
+- **Static and dynamic** FreeBSD binary support
+- **FreeBSD jail syscalls** — `jail`, `jail_get`, `jail_set`, `jail_attach`, `jail_remove`
+- **VNET** — full network stack isolation via Linux network namespaces
+- **Bridge networking** — automatic inter-jail and host-to-jail communication
+- **ABI translation** — flags, structures, errno, signals, sockaddr
+- **TLS emulation** — full Thread Local Storage for FreeBSD binaries
+- **Path translation** — FreeBSD system paths redirected to local root
+
+### Lochs CLI
+- **Docker-like commands** — `pull`, `run`, `exec`, `stop`, `rm`, `ps`
+- **Lochfile** — Dockerfile equivalent for building custom jail images
+- **lochs.yml** — Compose files for multi-service deployments
+- **Image registry** — Pull from FreeBSD mirrors or custom registries
+- **Port forwarding** — `-p 8080:80` maps host ports to jail ports
+- **Network management** — `lochs network create/rm/ls`
+
+### Network Architecture
+
+```
+Host System
++---------------------------------------------------------+
+|                                                         |
+|   bsdjail0 (bridge)                                     |
+|   10.0.0.1/24                                           |
+|      |                                                  |
+|      +-- veth0_j1 <------> eth0 (jail1 netns)           |
+|      |                      10.0.0.10/24                |
+|      |                                                  |
+|      +-- veth0_j2 <------> eth0 (jail2 netns)           |
+|                             10.0.0.20/24                |
+|                                                         |
++---------------------------------------------------------+
+```
+
+## Building from Source
+
+```bash
+git clone https://github.com/dyber-pqc/bsdulator.git
+cd bsdulator
+
+# Install dependencies (Ubuntu/Debian)
+sudo apt-get install -y build-essential iproute2 wget
+
+# Build
+make
+
+# Download FreeBSD base system (~180 MB)
+./scripts/setup_freebsd_root.sh
+
+# Verify
+./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/bin/echo "Hello from FreeBSD!"
+```
+
+See [docs/INSTALL.md](docs/INSTALL.md) for platform-specific instructions (Fedora, Arch, Alpine, WSL2, Docker).
+
+## BSDulator Direct Usage
+
+For low-level access without the Lochs CLI:
+
+```bash
+# Static binaries
+./bsdulator ./freebsd-root/rescue/echo "Hello"
+./bsdulator ./freebsd-root/rescue/ls /
+
+# Dynamic binaries (via FreeBSD dynamic linker)
+./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/bin/sh
+
+# Create a jail directly
+sudo ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 \
+    ./freebsd-root/usr/sbin/jail -c name=test path=./freebsd-root ip4.addr=10.0.0.10 vnet persist
+
+# List jails
+./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jls jid name ip4.addr path
+
+# Execute in jail
+sudo ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 \
+    ./freebsd-root/usr/sbin/jexec 1 /bin/sh -c "whoami; pwd; ls /"
+
+# Remove jail
+./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jail -r 1
+```
 
 ```
 Usage: bsdulator [options] <freebsd-binary> [args...]
@@ -147,237 +158,125 @@ Environment:
   BSDULATOR_DEBUG      Debug level (0-4)
 ```
 
-## How It Works
-
-1. **Binary Detection**: Examines ELF OS/ABI field and FreeBSD notes to identify FreeBSD binaries.
-
-2. **Dynamic Linker Setup**: For dynamic binaries, the FreeBSD dynamic linker (`ld-elf.so.1`) loads shared libraries from the FreeBSD root.
-
-3. **Path Translation**: Intercepts file-related syscalls and redirects FreeBSD system paths (`/lib`, `/usr/lib`, `/etc`, etc.) to the local FreeBSD root filesystem.
-
-4. **Syscall Interception**: Uses ptrace to intercept every syscall:
-   - **Entry**: Translates FreeBSD syscall numbers and arguments to Linux equivalents
-   - **Exit**: Translates return values, structures (like stat), and errno values
-
-5. **Jail Emulation**: Implements FreeBSD jail syscalls using:
-   - Persistent jail registry in `/tmp/bsdulator_jails.dat`
-   - Linux `chroot()` for filesystem isolation
-   - Linux network namespaces for network isolation (VNET)
-   - Bridge networking for inter-jail communication
-   - Process tracking for jail attachment
-   - IP address assignment and retrieval
-   - Dynamic linker rewriting for jailed binary execution
-
-6. **TLS Setup**: Creates FreeBSD-compatible Thread Local Storage structures including TCB, DTV, and pthread structures.
-
-## Virtual Network Stack (VNET)
-
-BSDulator implements FreeBSD's VNET (virtual network stack) using Linux network namespaces:
-
-```
-Host System
-┌─────────────────────────────────────────────────────┐
-│                                                     │
-│   bsdjail0 (bridge)                                 │
-│   10.0.0.1/24                                       │
-│      │                                              │
-│      ├── veth0_j1 ◄──────► eth0 (jail1 netns)      │
-│      │                      10.0.0.10/24            │
-│      │                                              │
-│      └── veth0_j2 ◄──────► eth0 (jail2 netns)      │
-│                             10.0.0.20/24            │
-│                                                     │
-└─────────────────────────────────────────────────────┘
-```
-
-**VNET Features:**
-- Each jail gets its own network namespace
-- Isolated network stack (interfaces, routing, iptables)
-- Automatic veth pair creation
-- Bridge for inter-jail communication
-- Host-to-jail connectivity
-- Proper cleanup on jail removal
-
-**Usage:**
-```bash
-# Create two jails with VNET
-sudo ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jail \
-    -c name=jail1 path=./freebsd-root ip4.addr=10.0.0.10 vnet persist
-
-sudo ./bsdulator ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/usr/sbin/jail \
-    -c name=jail2 path=./freebsd-root ip4.addr=10.0.0.20 vnet persist
-
-# Test connectivity
-ping 10.0.0.10                           # Host → Jail1 ✓
-ping 10.0.0.20                           # Host → Jail2 ✓
-ip netns exec bsdjail_1 ping 10.0.0.20   # Jail1 → Jail2 ✓
-```
-
 ## Syscall Support
 
 | Category | Examples | Status |
 |----------|----------|--------|
-| Process | fork, exec, wait, exit, kill, getpid | ✅ Full |
-| File I/O | open, read, write, close, stat, fstat | ✅ Full |
-| Memory | mmap, mprotect, munmap, brk | ✅ Full |
-| Network | socket, bind, connect, send, recv | ✅ Full |
-| Time | gettimeofday, clock_gettime, nanosleep | ✅ Full |
-| Signals | sigaction, sigprocmask, sigfastblock | ✅ Full |
-| IPC | semget, msgget, shmget | ✅ Full |
-| *at syscalls | openat, fstatat, unlinkat, etc. | ✅ Full |
-| Threading | thr_self, thr_exit, thr_kill | ✅ Emulated |
-| sysctl | __sysctl, __sysctlbyname | ✅ Emulated |
-| **Jail** | jail, jail_get, jail_set, jail_attach, jail_remove | ✅ **Full** |
-| **Credentials** | setgroups, credsync | ✅ Emulated |
-| kqueue | kqueue, kevent | ✅ Basic |
-| Capsicum | cap_enter, cap_getmode | ⚠️ Stub |
+| Process | fork, exec, wait, exit, kill, getpid | Full |
+| File I/O | open, read, write, close, stat, fstat | Full |
+| Memory | mmap, mprotect, munmap, brk | Full |
+| Network | socket, bind, connect, send, recv | Full |
+| Time | gettimeofday, clock_gettime, nanosleep | Full |
+| Signals | sigaction, sigprocmask, sigfastblock | Full |
+| IPC | semget, msgget, shmget | Full |
+| *at syscalls | openat, fstatat, unlinkat | Full |
+| Threading | thr_self, thr_exit, thr_kill, _umtx_op | Emulated |
+| sysctl | __sysctl, __sysctlbyname | Emulated |
+| Jail | jail, jail_get, jail_set, jail_attach, jail_remove | Full |
+| kqueue | kqueue, kevent | Basic |
+| Capsicum | cap_enter, cap_getmode | Stub |
 
-## Jail Implementation Details
+222 total syscalls. See [docs/syscalls.md](docs/syscalls.md) for the complete matrix.
 
-BSDulator implements FreeBSD jail syscalls to provide container-like isolation:
+## System Requirements
 
-| Syscall | Number | Description | Implementation |
-|---------|--------|-------------|----------------|
-| `jail` | 338 | Create/modify jail | Allocates JID, stores config |
-| `jail_get` | 506 | Query jail parameters | Returns jail info via iovec |
-| `jail_set` | 507 | Set jail parameters | Updates jail config, IP addresses, VNET |
-| `jail_attach` | 436 | Attach process to jail | Linux chroot() + namespaces + process tracking |
-| `jail_remove` | 508 | Remove a jail | Removes from registry, cleans up networking |
-
-**Jail Features:**
-- Persistent storage across BSDulator invocations
-- Multiple concurrent jails with unique JIDs
-- IPv4 address assignment (`ip4.addr` parameter)
-- Multiple IPs per jail (comma-separated)
-- Virtual network stack (`vnet` parameter)
-- Both static (`/rescue/*`) and dynamic (`/bin/*`) binaries work inside jails
-- Process isolation via chroot
-- Network isolation via Linux network namespaces
-- Full `jexec` flag support (`-l`, `-U`, `-u`)
-- Verbose jail listing (`jls -v`)
-- Proper FreeBSD environment setup (TLS, auxv) for jailed processes
-- Automatic network cleanup on jail removal
-
-**Supported Jail Parameters:**
-- `name` - Jail name/hostname
-- `path` - Root filesystem path
-- `host.hostname` - Hostname
-- `ip4.addr` - IPv4 address(es), comma-separated
-- `vnet` - Enable virtual network stack
-- `persist` - Keep jail alive without processes
-- `jid` - Jail ID (for queries)
-- `cpuset.id` - CPU set ID
-- `osreldate`, `osrelease` - OS version info
-
-## Known Limitations
-
-- **32-bit binaries**: Not supported (x86_64 only)
-- **Performance**: ptrace interception adds overhead (~10-30%)
-- **Some vi features**: Editor has minor issues with temp files
-- **External network**: Jails can communicate with host/each other but not external networks (no NAT configured)
+| Requirement | Details |
+|-------------|---------|
+| **OS** | Linux (kernel 3.8+) |
+| **Architecture** | x86_64 only |
+| **Privileges** | Root/sudo for jail and networking features |
+| **Packages** | `iproute2` (for networking) |
+| **Tested On** | Ubuntu 24.04, WSL2, Debian 12, Fedora 39 |
 
 ## Project Structure
 
 ```
 bsdulator/
-├── src/
-│   ├── main.c                 # Entry point and CLI
-│   ├── interceptor/
-│   │   └── interceptor.c      # ptrace syscall interception, TLS setup
-│   ├── syscall/
-│   │   └── syscall_table.c    # FreeBSD→Linux syscall mapping
-│   ├── loader/
-│   │   └── elf_loader.c       # FreeBSD ELF detection
-│   ├── abi/
-│   │   └── abi_translate.c    # Flags/struct translation
-│   ├── runtime/
-│   │   └── freebsd_runtime.c  # FreeBSD runtime environment, sysctl
-│   └── jail/
-│       └── jail.c             # Jail syscalls, VNET, namespaces
-├── include/
-│   └── bsdulator/
-│       ├── bsdulator.h        # Main header
-│       ├── interceptor.h
-│       ├── syscall.h
-│       ├── loader.h
-│       ├── abi.h
-│       └── jail.h             # Jail structures and functions
-├── scripts/
-│   ├── setup_freebsd_root.sh  # Download FreeBSD base
-│   └── check_compat.sh        # System compatibility checker
-├── freebsd-root/              # FreeBSD filesystem (after setup)
-├── Makefile
-├── LICENSE
-└── README.md
++-- src/
+|   +-- main.c                 # Entry point and CLI
+|   +-- interceptor/           # ptrace syscall interception, TLS setup
+|   +-- syscall/               # FreeBSD -> Linux syscall mapping
+|   +-- loader/                # FreeBSD ELF detection
+|   +-- abi/                   # Flags/struct translation
+|   +-- runtime/               # FreeBSD runtime environment, sysctl
+|   +-- jail/                  # Jail syscalls, VNET, namespaces
+|   +-- lochs/                 # Lochs CLI implementation
++-- include/bsdulator/         # Headers
++-- scripts/                   # Setup and compatibility scripts
++-- examples/                  # Lochfile, lochs.yml, test files
++-- docs/                      # Documentation
++-- Makefile
++-- Dockerfile
 ```
 
 ## Roadmap
 
-### Phase 1: Core Compatibility ✅ Complete
-- [x] Basic syscall translation
-- [x] Static binary support
-- [x] Dynamic binary support
-- [x] Path translation
-- [x] Stat structure translation
-- [x] Shell support
-- [x] TLS emulation
+### Completed
+- [x] 222 FreeBSD syscall translations
+- [x] Static and dynamic binary support
+- [x] FreeBSD shell with pipes and redirects
+- [x] Full jail lifecycle (create, list, exec, remove)
+- [x] VNET with bridge networking
+- [x] Lochs CLI with Lochfile and compose support
 
-### Phase 2: Jail Support ✅ Complete
-- [x] jail syscall (create jails)
-- [x] jail_get (query jail info)
-- [x] jail_set (configure jails)
-- [x] jail_attach (attach process to jail)
-- [x] jail_remove (destroy jails)
-- [x] jls command working
-- [x] jexec command working
-- [x] Multiple concurrent jails
-- [x] Persistent jail storage
+### In Progress
+- [ ] NAT/masquerade for external jail connectivity
+- [ ] Resource limit enforcement (CPU, memory via rctl)
+- [ ] Lochs image registry
+- [ ] `lochs.dev/install.sh` one-line installer
 
-### Phase 3: Networking & Advanced Jails ✅ Complete
-- [x] Jail IP assignment (`ip4.addr` parameter)
-- [x] IP address display in `jls`
-- [x] `jexec -l` (login shell)
-- [x] `jexec -U` / `-u` (user flags)
-- [x] `jls -v` (verbose listing)
-- [x] FreeBSD 15 syscall support (`credsync`, `__realpathat`)
-- [x] Virtual network stack (VNET) using Linux network namespaces
-- [x] Bridge networking (`bsdjail0`)
-- [x] Host-to-jail connectivity
-- [x] Jail-to-jail connectivity
-- [x] Automatic network cleanup on jail removal
-
-### Phase 4: Jailhouse.io Integration (Planned)
-- [ ] CLI wrapper (`jailhouse create/start/exec/stop`)
-- [ ] YAML/TOML configuration files (Prisonfile)
-- [ ] Image registry for pre-built jail images
+### Planned
 - [ ] Web dashboard
-- [ ] Windows/macOS support via VM
-- [ ] Tauri desktop application
+- [ ] macOS support via Hypervisor.framework VM
+- [ ] Windows native support via Hyper-V
+- [ ] GPU passthrough for ML workloads
 
-## Related Projects
+## Documentation
 
-- **[Jailhouse.io](https://jailhouse.io)**: Docker-like container management for FreeBSD jails (uses BSDulator as the compatibility engine)
-- **FreeBSD Linuxulator**: Runs Linux binaries on FreeBSD (the inverse of BSDulator)
-- **Wine**: Runs Windows applications on Linux (similar concept)
+| Document | Description |
+|----------|-------------|
+| [Quick Start](docs/quickstart.md) | 5-minute getting started guide |
+| [Installation](docs/INSTALL.md) | Platform-specific install instructions |
+| [Syscall Matrix](docs/syscalls.md) | Complete syscall support reference |
+| [Architecture](docs/architecture.md) | How BSDulator works under the hood |
+| [Lochs Guide](LOCHS.md) | Full Lochs CLI documentation |
+| [Contributing](CONTRIBUTING.md) | How to contribute |
+| [Changelog](CHANGELOG.md) | Release history |
+
+## Community
+
+- **Website**: [lochs.dev](https://lochs.dev)
+- **Discord**: [Join the server](https://discord.gg/km3VGfUW)
+- **Community Hub**: [dyber.org/community](https://www.dyber.org/community)
+- **GitHub Discussions**: [Ask questions](https://github.com/dyber-pqc/bsdulator/discussions)
+- **Commercial Support**: support@dyber.org
 
 ## Contributing
 
-Contributions welcome! Priority areas:
+Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
+Priority areas:
 1. NAT/masquerade for external jail connectivity
-2. Resource limit enforcement (CPU, memory)
+2. Resource limit enforcement
 3. Additional syscall translations
 4. Test coverage
-5. Documentation
 
 ## License
 
 Source Available License - See [LICENSE](LICENSE) for details.
 
-Core BSDulator source code is available for viewing, modification, and non-commercial use. Commercial use requires a separate license agreement.
+Source code is available for viewing, modification, and non-commercial use. Commercial use requires a separate license. Contact support@dyber.org.
 
 ## Acknowledgments
 
-- FreeBSD Project for the excellent documentation and jail implementation
+- FreeBSD Project for jail architecture and documentation
 - Linux kernel developers for ptrace and namespace infrastructure
 - The Wine project for inspiration on compatibility layers
+
+---
+
+<div align="center">
+
+Built by [Dyber](https://github.com/dyber-pqc) | [lochs.dev](https://lochs.dev)
+
+</div>

@@ -1,0 +1,82 @@
+name: Syscall Support Request
+description: Request support for a FreeBSD syscall
+title: "[Syscall]: "
+labels: ["syscall", "enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Request support for a FreeBSD system call that isn't currently implemented or working correctly.
+
+  - type: input
+    id: syscall_name
+    attributes:
+      label: Syscall Name
+      description: Name of the FreeBSD syscall
+      placeholder: e.g., kqueue, kevent, cap_enter
+    validations:
+      required: true
+
+  - type: input
+    id: syscall_number
+    attributes:
+      label: Syscall Number (FreeBSD)
+      description: The FreeBSD syscall number (if known)
+      placeholder: e.g., 362 for kqueue
+    validations:
+      required: false
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use Case
+      description: What FreeBSD application or binary needs this syscall?
+      placeholder: |
+        Application: nginx
+        When running: ./bsdulator ./freebsd-root/usr/local/sbin/nginx
+        Error: Unsupported syscall 362 (kqueue)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: current_status
+    attributes:
+      label: Current Status
+      description: What happens when this syscall is invoked?
+      options:
+        - Returns ENOSYS (not implemented)
+        - Returns incorrect result
+        - Causes crash/segfault
+        - Stub exists but doesn't work
+        - Unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: documentation
+    attributes:
+      label: Documentation Links
+      description: Links to FreeBSD man pages or documentation for this syscall
+      placeholder: |
+        - https://man.freebsd.org/cgi/man.cgi?query=syscall_name
+    validations:
+      required: false
+
+  - type: textarea
+    id: linux_equivalent
+    attributes:
+      label: Linux Equivalent (if known)
+      description: Is there a similar syscall or mechanism in Linux?
+      placeholder: e.g., epoll for kqueue
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I would be willing to contribute an implementation
+          required: false
+        - label: I can help test the implementation
+          required: false

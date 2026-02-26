@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-#define LOCHS_VERSION "0.1.0"
+#define LOCHS_VERSION "0.3.6"
 #define LOCHS_MAX_NAME 64
 #define LOCHS_MAX_PATH 1024
 #define LOCHS_MAX_SERVICES 32

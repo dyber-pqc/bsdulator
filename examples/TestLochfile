@@ -1,0 +1,6 @@
+FROM freebsd:15.0-minimal
+RUN /bin/echo "Hello from build!"
+RUN /bin/ls /
+COPY hello.sh /app/hello.sh
+ENV BUILD_TEST=success
+CMD ["/bin/sh", "/app/hello.sh"]

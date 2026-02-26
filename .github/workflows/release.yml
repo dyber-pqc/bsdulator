@@ -1,0 +1,136 @@
+# BSDulator Release Workflow
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build Release
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential iproute2 wget
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Build release binary
+        run: |
+          make clean
+          make
+          strip bsdulator
+          strip lochs
+
+      - name: Create release archive
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          mkdir -p dist/bsdulator-${VERSION}
+          
+          # Copy binaries
+          cp bsdulator lochs dist/bsdulator-${VERSION}/
+          
+          # Copy documentation
+          cp README.md CHANGELOG.md LICENSE dist/bsdulator-${VERSION}/
+          
+          # Copy scripts
+          mkdir -p dist/bsdulator-${VERSION}/scripts
+          cp scripts/*.sh dist/bsdulator-${VERSION}/scripts/
+          chmod +x dist/bsdulator-${VERSION}/scripts/*.sh
+          
+          # Copy docs
+          mkdir -p dist/bsdulator-${VERSION}/docs
+          cp docs/*.md dist/bsdulator-${VERSION}/docs/ 2>/dev/null || true
+          
+          # Create tarball
+          cd dist
+          tar -czvf bsdulator-${VERSION}-linux-amd64.tar.gz bsdulator-${VERSION}
+          
+          # Create checksum
+          sha256sum bsdulator-${VERSION}-linux-amd64.tar.gz > bsdulator-${VERSION}-linux-amd64.tar.gz.sha256
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          
+          # Extract changelog for this version
+          if grep -q "## \[${VERSION#v}\]" CHANGELOG.md; then
+            # Extract section between this version and the next
+            sed -n "/## \[${VERSION#v}\]/,/## \[/p" CHANGELOG.md | head -n -1 > release_notes.md
+          else
+            echo "Release ${VERSION}" > release_notes.md
+            echo "" >> release_notes.md
+            echo "See [CHANGELOG.md](CHANGELOG.md) for details." >> release_notes.md
+          fi
+          
+          cat release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}
+          files: |
+            dist/bsdulator-${{ steps.version.outputs.VERSION }}-linux-amd64.tar.gz
+            dist/bsdulator-${{ steps.version.outputs.VERSION }}-linux-amd64.tar.gz.sha256
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.version.outputs.VERSION }}
+          path: dist/*.tar.gz*
+
+  docker-image:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: build-release
+    if: "!contains(github.ref, '-alpha')"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get version
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.VERSION }}
+            ghcr.io/${{ github.repository }}:latest
+          labels: |
+            org.opencontainers.image.title=BSDulator
+            org.opencontainers.image.description=FreeBSD Binary Compatibility Layer for Linux
+            org.opencontainers.image.version=${{ steps.version.outputs.VERSION }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.licenses=Source-Available

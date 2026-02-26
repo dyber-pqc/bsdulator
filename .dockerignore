@@ -1,0 +1,13 @@
+obj/
+*.o
+bsdulator
+lochs
+freebsd-root/
+.git/
+.github/
+docs/
+tests/
+*.md
+LICENSE
+.gitignore
+.dockerignore

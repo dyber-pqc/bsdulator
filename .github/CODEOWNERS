@@ -1,0 +1,8 @@
+# Default owners for everything in the repo
+* @dyber-pqc
+
+# Jail subsystem
+/src/jail/ @dyber-pqc
+
+# Lochs container management
+/src/lochs/ @dyber-pqc
