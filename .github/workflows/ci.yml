@@ -57,7 +57,7 @@ jobs:
           ./lochs --help
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: matrix.compiler == 'gcc' && matrix.build_type == 'release'
         with:
           name: bsdulator-linux-amd64
