@@ -613,22 +613,22 @@ int lochs_cmd_start(int argc, char **argv) {
         printf("Mounting volumes...\n");
         for (int i = 0; i < jail->volume_count; i++) {
             lochs_volume_t *v = &jail->volumes[i];
-            char mount_point[1024];
-            char mount_cmd[2048];
-            
+            char mount_point[2048];
+            char mount_cmd[4096];
+
             /* Create mount point in container */
             snprintf(mount_point, sizeof(mount_point), "%s%s", jail->path, v->container_path);
             snprintf(mount_cmd, sizeof(mount_cmd), "mkdir -p '%s'", mount_point);
             int r = system(mount_cmd);
             (void)r;
-            
+
             /* Bind mount the host path */
-            snprintf(mount_cmd, sizeof(mount_cmd), 
+            snprintf(mount_cmd, sizeof(mount_cmd),
                 "mount --bind '%s' '%s'", v->host_path, mount_point);
             if (system(mount_cmd) == 0) {
                 printf("  %s -> %s%s\n", v->host_path, v->container_path,
                        v->readonly ? " (ro)" : "");
-                
+
                 /* Make read-only if requested */
                 if (v->readonly) {
                     snprintf(mount_cmd, sizeof(mount_cmd),
@@ -644,7 +644,7 @@ int lochs_cmd_start(int argc, char **argv) {
     
     /* Write environment file for container */
     if (jail->env_count > 0) {
-        char env_file[1024];
+        char env_file[2048];
         snprintf(env_file, sizeof(env_file), "%s/.lochs_env", jail->path);
         FILE *ef = fopen(env_file, "w");
         if (ef) {
@@ -804,9 +804,9 @@ int lochs_cmd_stop(int argc, char **argv) {
         printf("Unmounting volumes...\n");
         for (int i = jail->volume_count - 1; i >= 0; i--) {
             lochs_volume_t *v = &jail->volumes[i];
-            char mount_point[1024];
-            char umount_cmd[2048];
-            
+            char mount_point[2048];
+            char umount_cmd[4096];
+
             snprintf(mount_point, sizeof(mount_point), "%s%s", jail->path, v->container_path);
             snprintf(umount_cmd, sizeof(umount_cmd), "umount '%s' 2>/dev/null", mount_point);
             int r = system(umount_cmd);

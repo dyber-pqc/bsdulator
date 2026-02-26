@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   build-release:
@@ -81,7 +82,7 @@ jobs:
           cat release_notes.md
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           body_path: release_notes.md
           draft: false
