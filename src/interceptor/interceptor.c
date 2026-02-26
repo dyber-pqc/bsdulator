@@ -2362,7 +2362,7 @@ int interceptor_run(interceptor_state_t *state) {
                                 /* Copy rest of address (skip Linux's 2-byte family) */
                                 memcpy(fbsd_addr + 2, linux_addr + 2, actual_len - 2);
                                 
-                                BSD_TRACE("recvfrom: translating sockaddr family=%d len=%d",
+                                BSD_TRACE("recvfrom: translating sockaddr family=%u len=%u",
                                           linux_family, actual_len);
                                 
                                 /* Write FreeBSD sockaddr back */

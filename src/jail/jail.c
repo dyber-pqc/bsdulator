@@ -288,7 +288,7 @@ static int jail_load_state(void) {
     }
     
     if (header.version != JAIL_STATE_VERSION) {
-        BSD_WARN("Incompatible jail state version: %d", header.version);
+        BSD_WARN("Incompatible jail state version: %u", header.version);
         fclose(f);
         return -1;
     }
