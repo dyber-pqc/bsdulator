@@ -2062,10 +2062,29 @@ int interceptor_run(interceptor_state_t *state) {
                 
                 const char *name = syscall_name((int)state->syscall_nr);
                 BSD_WARN("ENTER FreeBSD syscall %llu (%s) -> Linux %d",
-                          (unsigned long long)state->syscall_nr,
-                          name ? name : "unknown",
-                          linux_nr);
-                
+                (unsigned long long)state->syscall_nr,
+                name ? name : "unknown",
+                linux_nr);
+
+                /* Debug logging for socket syscall to diagnose DNS issues */
+                if ((int)state->syscall_nr == FBSD_SYS_socket) {
+                    BSD_INFO("==> socket: domain=%llu type=%llu protocol=%llu",
+                             (unsigned long long)state->args[0],
+                             (unsigned long long)state->args[1],
+                             (unsigned long long)state->args[2]);
+                }
+
+                /* Debug logging for recvfrom to diagnose DNS issues */
+                if ((int)state->syscall_nr == FBSD_SYS_recvfrom) {
+                    BSD_INFO("==> recvfrom: fd=%llu buf=0x%llx len=%llu flags=0x%llx addr=0x%llx addrlen=0x%llx",
+                             (unsigned long long)state->args[0],
+                             (unsigned long long)state->args[1],
+                             (unsigned long long)state->args[2],
+                             (unsigned long long)state->args[3],
+                             (unsigned long long)state->args[4],
+                             (unsigned long long)state->args[5]);
+                }
+
                 /* Special logging for readlink to debug ENOENT causing abort */
                 if ((int)state->syscall_nr == FBSD_SYS_readlink) {
                     char path_buf[512];
@@ -2168,6 +2187,7 @@ int interceptor_run(interceptor_state_t *state) {
                             /* Map FreeBSD socket syscall numbers to Linux equivalents */
                             int actual_linux_nr = -1;
                             switch ((int)state->syscall_nr) {
+                                case FBSD_SYS_socket:     actual_linux_nr = 41; break;  /* SYS_socket */
                                 case FBSD_SYS_connect:    actual_linux_nr = 42; break;  /* SYS_connect */
                                 case FBSD_SYS_bind:       actual_linux_nr = 49; break;  /* SYS_bind */
                                 case FBSD_SYS_sendto:     actual_linux_nr = 44; break;  /* SYS_sendto */
@@ -2180,9 +2200,10 @@ int interceptor_run(interceptor_state_t *state) {
                                     break;
                             }
                             
-                            /* For setsockopt/getsockopt, also update the args (optname was translated) */
+                            /* For setsockopt/getsockopt/socket, also update the args (translated) */
                             if ((int)state->syscall_nr == FBSD_SYS_setsockopt ||
-                                (int)state->syscall_nr == FBSD_SYS_getsockopt) {
+                                (int)state->syscall_nr == FBSD_SYS_getsockopt ||
+                                (int)state->syscall_nr == FBSD_SYS_socket) {
                                 if (interceptor_set_args(state->pid, state->args) < 0) {
                                     BSD_ERROR("Failed to update args for sockopt syscall");
                                 }
@@ -2304,6 +2325,54 @@ int interceptor_run(interceptor_state_t *state) {
                     }
                     }
                     }
+
+                /*
+                 * recvfrom sockaddr translation (Linux -> FreeBSD)
+                 * Linux sockaddr_in: sa_family (2 bytes), sa_data...
+                 * FreeBSD sockaddr_in: sin_len (1 byte), sin_family (1 byte), sa_data...
+                 * We need to shift bytes to add the length prefix.
+                 */
+                if (state->retval >= 0 && (int)state->syscall_nr == FBSD_SYS_recvfrom) {
+                    uint64_t addr_ptr = state->args[4];      /* sockaddr* */
+                    uint64_t addrlen_ptr = state->args[5];   /* socklen_t* */
+                    
+                    if (addr_ptr != 0 && addrlen_ptr != 0) {
+                        /* Read the actual length from addrlen_ptr */
+                        uint32_t actual_len = 0;
+                        struct iovec len_local = { &actual_len, sizeof(actual_len) };
+                        struct iovec len_remote = { (void *)addrlen_ptr, sizeof(actual_len) };
+                        
+                        if (process_vm_readv(state->pid, &len_local, 1, &len_remote, 1, 0) > 0 && actual_len > 0) {
+                            /* Read the Linux sockaddr */
+                            uint8_t linux_addr[128];
+                            if (actual_len > sizeof(linux_addr)) actual_len = sizeof(linux_addr);
+                            
+                            struct iovec addr_local = { linux_addr, actual_len };
+                            struct iovec addr_remote = { (void *)addr_ptr, actual_len };
+                            
+                            if (process_vm_readv(state->pid, &addr_local, 1, &addr_remote, 1, 0) > 0) {
+                                /* Linux sockaddr: family is 2 bytes at offset 0 */
+                                uint16_t linux_family;
+                                memcpy(&linux_family, linux_addr, 2);
+                                
+                                /* Build FreeBSD sockaddr: sin_len (1 byte), sin_family (1 byte), rest */
+                                uint8_t fbsd_addr[128];
+                                fbsd_addr[0] = (uint8_t)actual_len;  /* sin_len */
+                                fbsd_addr[1] = (uint8_t)linux_family; /* sin_family (low byte) */
+                                /* Copy rest of address (skip Linux's 2-byte family) */
+                                memcpy(fbsd_addr + 2, linux_addr + 2, actual_len - 2);
+                                
+                                BSD_TRACE("recvfrom: translating sockaddr family=%d len=%d",
+                                          linux_family, actual_len);
+                                
+                                /* Write FreeBSD sockaddr back */
+                                struct iovec out_local = { fbsd_addr, actual_len };
+                                struct iovec out_remote = { (void *)addr_ptr, actual_len };
+                                process_vm_writev(state->pid, &out_local, 1, &out_remote, 1, 0);
+                            }
+                        }
+                    }
+                }
 
                 /*
                  * Statfs structure translation for fstatfs

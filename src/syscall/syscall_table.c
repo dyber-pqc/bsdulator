@@ -40,6 +40,7 @@ static long emul_sysctlbyname(pid_t pid, uint64_t args[6]);
 static long emul_connect(pid_t pid, uint64_t args[6]);
 static long emul_bind(pid_t pid, uint64_t args[6]);
 static long emul_sendto(pid_t pid, uint64_t args[6]);
+static long emul_socket(pid_t pid, uint64_t args[6]);
 static long emul_setsockopt(pid_t pid, uint64_t args[6]);
 static long emul_getsockopt(pid_t pid, uint64_t args[6]);
 /* Jail syscalls are now implemented in src/jail/jail.c
@@ -263,7 +264,7 @@ int syscall_init(void) {
      * NOTE: bind/connect/sendto need emulation for sockaddr translation!
      * FreeBSD sockaddr has sin_len field, Linux doesn't.
      */
-    TRANS(FBSD_SYS_socket, SYS_socket, "socket");
+    EMUL(FBSD_SYS_socket, "socket", emul_socket);  /* socket type flag translation */
     EMUL(FBSD_SYS_bind, "bind", emul_bind);  /* sockaddr translation */
     TRANS(FBSD_SYS_listen, SYS_listen, "listen");
     TRANS(FBSD_SYS_accept, SYS_accept, "accept");
@@ -2148,6 +2149,54 @@ static long emul_sendto(pid_t pid, uint64_t args[6]) {
  * FreeBSD and Linux use different values for socket options.
  * Key differences at SOL_SOCKET level:
  */
+
+/*
+ * Socket type flag translation (FreeBSD -> Linux)
+ * FreeBSD and Linux use different flag values for SOCK_CLOEXEC and SOCK_NONBLOCK
+ */
+#define FBSD_SOCK_CLOEXEC   0x10000000
+#define FBSD_SOCK_NONBLOCK  0x20000000
+#define LINUX_SOCK_CLOEXEC  0x80000     /* 02000000 octal */
+#define LINUX_SOCK_NONBLOCK 0x800       /* 04000 octal */
+
+/*
+ * Translate FreeBSD socket type flags to Linux
+ */
+static int translate_socket_type(int fbsd_type) {
+    int base_type = fbsd_type & 0xF;  /* SOCK_STREAM=1, SOCK_DGRAM=2, etc. */
+    int flags = 0;
+    
+    if (fbsd_type & FBSD_SOCK_CLOEXEC) {
+        flags |= LINUX_SOCK_CLOEXEC;
+    }
+    if (fbsd_type & FBSD_SOCK_NONBLOCK) {
+        flags |= LINUX_SOCK_NONBLOCK;
+    }
+    
+    return base_type | flags;
+}
+
+/*
+ * socket - translate FreeBSD socket type flags to Linux
+ */
+static long emul_socket(pid_t pid, uint64_t args[6]) {
+    (void)pid;  /* unused */
+    int domain = (int)args[0];
+    int type = (int)args[1];
+    int protocol = (int)args[2];
+    
+    /* Translate socket type flags */
+    int linux_type = translate_socket_type(type);
+    
+    BSD_TRACE("socket: domain=%d type=0x%x -> 0x%x protocol=%d",
+              domain, type, linux_type, protocol);
+    
+    /* Update args with translated type */
+    args[1] = (uint64_t)linux_type;
+    
+    /* Return -EAGAIN to let syscall proceed with translated args */
+    return -EAGAIN;
+}
 
 /* FreeBSD socket options (from sys/socket.h) */
 #define FBSD_SO_DEBUG        0x0001
