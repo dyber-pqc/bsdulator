@@ -94,7 +94,7 @@ const char *lochs_zfs_get_pool(void) {
     }
 
     /* 3. Auto-detect: use first pool from zpool list */
-    char buf[512];
+    char buf[256];
     if (zfs_run_capture("zpool list -Ho name 2>/dev/null | head -1", buf, sizeof(buf)) == 0) {
         char *nl = strchr(buf, '\n');
         if (nl) *nl = '\0';
@@ -252,7 +252,7 @@ int lochs_zfs_mount_container(lochs_jail_t *jail) {
         return -1;
     }
 
-    char cmd[512];
+    char cmd[2048];
     snprintf(cmd, sizeof(cmd), "zfs mount '%s' 2>/dev/null", jail->zfs_dataset);
     zfs_run(cmd);  /* May already be mounted, that's OK */
 
@@ -265,7 +265,7 @@ int lochs_zfs_mount_container(lochs_jail_t *jail) {
 int lochs_zfs_unmount_container(lochs_jail_t *jail) {
     if (!jail->zfs_dataset[0]) return 0;
 
-    char cmd[512];
+    char cmd[2048];
     snprintf(cmd, sizeof(cmd), "zfs unmount '%s' 2>/dev/null", jail->zfs_dataset);
     zfs_run(cmd);
 
@@ -278,7 +278,7 @@ int lochs_zfs_unmount_container(lochs_jail_t *jail) {
 int lochs_zfs_destroy_container(lochs_jail_t *jail) {
     if (!jail->zfs_dataset[0]) return 0;
 
-    char cmd[512];
+    char cmd[2048];
 
     /* Unmount first */
     lochs_zfs_unmount_container(jail);
@@ -467,7 +467,7 @@ int lochs_zfs_diff(const char *container, const char *snap1, const char *snap2) 
     if (!pool) return -1;
 
     char dataset[512];
-    char cmd[1024];
+    char cmd[2048];
 
     snprintf(dataset, sizeof(dataset), "%s/%s/%s", pool, ZFS_CONTAINERS_DS, container);
 
