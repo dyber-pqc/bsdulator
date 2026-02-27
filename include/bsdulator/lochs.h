@@ -12,6 +12,12 @@
 #define LOCHS_MAX_SERVICES 32
 #define LOCHS_MAX_PORTS 16
 
+/* Storage backend */
+typedef enum {
+    LOCHS_STORAGE_OVERLAY,
+    LOCHS_STORAGE_ZFS
+} lochs_storage_backend_t;
+
 /* Jail states */
 typedef enum {
     JAIL_STATE_CREATED,
@@ -76,6 +82,12 @@ typedef struct {
     char work_path[LOCHS_MAX_PATH];   /* OverlayFS work dir */
     char merged_path[LOCHS_MAX_PATH]; /* Merged view (container root) */
     int overlay_mounted;              /* Is overlay currently mounted? */
+
+    /* Storage backend selection */
+    lochs_storage_backend_t storage_backend;
+    char zfs_dataset[LOCHS_MAX_PATH];   /* ZFS dataset for this container */
+    char zfs_mountpoint[LOCHS_MAX_PATH];/* ZFS mountpoint */
+    char zfs_origin[LOCHS_MAX_PATH];    /* Origin image dataset */
 
     /* Auto-start command */
     char cmd[1024];                   /* CMD from Lochfile */
@@ -149,6 +161,10 @@ int lochs_cmd_search(int argc, char **argv);
 int lochs_cmd_rmi(int argc, char **argv);
 int lochs_cmd_logs(int argc, char **argv);
 int lochs_cmd_network(int argc, char **argv);
+int lochs_cmd_snapshot(int argc, char **argv);
+int lochs_cmd_rollback(int argc, char **argv);
+int lochs_cmd_diff(int argc, char **argv);
+int lochs_cmd_clone(int argc, char **argv);
 
 /* Network management */
 int lochs_network_create(const char *name, const char *subnet);
@@ -185,7 +201,7 @@ lochs_jail_t *lochs_jail_find(const char *name);
 int lochs_jail_add(lochs_jail_t *jail);
 int lochs_jail_remove(const char *name);
 
-/* Storage management - OverlayFS COW */
+/* Storage management */
 int lochs_storage_init(void);
 int lochs_storage_create_container(lochs_jail_t *jail, const char *image_path);
 int lochs_storage_mount_container(lochs_jail_t *jail);
@@ -193,5 +209,21 @@ int lochs_storage_unmount_container(lochs_jail_t *jail);
 int lochs_storage_destroy_container(lochs_jail_t *jail);
 int lochs_storage_is_zfs_available(void);
 int lochs_storage_is_overlay_available(void);
+lochs_storage_backend_t lochs_storage_detect_backend(void);
+
+/* ZFS storage operations (lochs_zfs.c) */
+int lochs_zfs_init(void);
+int lochs_zfs_create_container(lochs_jail_t *jail, const char *image_path);
+int lochs_zfs_mount_container(lochs_jail_t *jail);
+int lochs_zfs_unmount_container(lochs_jail_t *jail);
+int lochs_zfs_destroy_container(lochs_jail_t *jail);
+int lochs_zfs_import_image(const char *image_path, const char *image_name);
+int lochs_zfs_snapshot_create(const char *container, const char *snap_name);
+int lochs_zfs_snapshot_list(const char *container);
+int lochs_zfs_snapshot_delete(const char *container, const char *snap_name);
+int lochs_zfs_rollback(const char *container, const char *snap_name);
+int lochs_zfs_diff(const char *container, const char *snap1, const char *snap2);
+int lochs_zfs_clone(const char *src_container, const char *snap_name, const char *new_name);
+const char *lochs_zfs_get_pool(void);
 
 #endif /* LOCHS_H */

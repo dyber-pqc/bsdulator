@@ -1359,3 +1359,202 @@ int lochs_cmd_logs(int argc, char **argv) {
         return system(cmd);
     }
 }
+
+/* ============================================================================
+ * ZFS Snapshot Commands
+ * ============================================================================ */
+
+static int require_zfs_backend(lochs_jail_t *jail) {
+    if (jail->storage_backend != LOCHS_STORAGE_ZFS) {
+        fprintf(stderr, "Error: Container '%s' is not using ZFS storage backend.\n", jail->name);
+        fprintf(stderr, "ZFS commands require containers created with ZFS backend.\n");
+        fprintf(stderr, "Set LOCHS_STORAGE_BACKEND=zfs or ensure ZFS is available.\n");
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * lochs snapshot create <container> [name]
+ * lochs snapshot ls <container>
+ * lochs snapshot rm <container> <name>
+ */
+int lochs_cmd_snapshot(int argc, char **argv) {
+    if (argc < 3) {
+        printf("Usage: lochs snapshot <command> <container> [options]\n\n");
+        printf("Commands:\n");
+        printf("  create <container> [name]  Create a snapshot (auto-names if omitted)\n");
+        printf("  ls <container>             List snapshots\n");
+        printf("  rm <container> <name>      Delete a snapshot\n");
+        return 1;
+    }
+
+    const char *subcmd = argv[1];
+    const char *container = argv[2];
+
+    if (strcmp(subcmd, "create") == 0) {
+        lochs_jail_t *jail = lochs_jail_find(container);
+        if (!jail) {
+            fprintf(stderr, "Error: container '%s' not found\n", container);
+            return 1;
+        }
+        if (require_zfs_backend(jail) != 0) return 1;
+
+        const char *snap_name = (argc > 3) ? argv[3] : NULL;
+        return lochs_zfs_snapshot_create(container, snap_name);
+
+    } else if (strcmp(subcmd, "ls") == 0 || strcmp(subcmd, "list") == 0) {
+        lochs_jail_t *jail = lochs_jail_find(container);
+        if (!jail) {
+            fprintf(stderr, "Error: container '%s' not found\n", container);
+            return 1;
+        }
+        if (require_zfs_backend(jail) != 0) return 1;
+
+        return lochs_zfs_snapshot_list(container);
+
+    } else if (strcmp(subcmd, "rm") == 0 || strcmp(subcmd, "delete") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "Usage: lochs snapshot rm <container> <snapshot-name>\n");
+            return 1;
+        }
+        lochs_jail_t *jail = lochs_jail_find(container);
+        if (!jail) {
+            fprintf(stderr, "Error: container '%s' not found\n", container);
+            return 1;
+        }
+        if (require_zfs_backend(jail) != 0) return 1;
+
+        return lochs_zfs_snapshot_delete(container, argv[3]);
+
+    } else {
+        fprintf(stderr, "Unknown snapshot command: %s\n", subcmd);
+        fprintf(stderr, "Valid commands: create, ls, rm\n");
+        return 1;
+    }
+}
+
+/*
+ * lochs rollback <container> <snapshot>
+ */
+int lochs_cmd_rollback(int argc, char **argv) {
+    if (argc < 3) {
+        printf("Usage: lochs rollback <container> <snapshot>\n\n");
+        printf("Rollback a container to a previous snapshot.\n");
+        printf("WARNING: The container must be stopped. All changes newer\n");
+        printf("than the snapshot will be destroyed.\n");
+        return 1;
+    }
+
+    const char *container = argv[1];
+    const char *snap_name = argv[2];
+
+    lochs_jail_t *jail = lochs_jail_find(container);
+    if (!jail) {
+        fprintf(stderr, "Error: container '%s' not found\n", container);
+        return 1;
+    }
+    if (require_zfs_backend(jail) != 0) return 1;
+
+    if (jail->state == JAIL_STATE_RUNNING) {
+        fprintf(stderr, "Error: container '%s' is running.\n", container);
+        fprintf(stderr, "Stop it first with: lochs stop %s\n", container);
+        return 1;
+    }
+
+    return lochs_zfs_rollback(container, snap_name);
+}
+
+/*
+ * lochs diff <container> <snapshot> [snapshot2]
+ */
+int lochs_cmd_diff(int argc, char **argv) {
+    if (argc < 3) {
+        printf("Usage: lochs diff <container> <snapshot> [snapshot2]\n\n");
+        printf("Show file changes since a snapshot, or between two snapshots.\n");
+        printf("  M = Modified, + = Added, - = Removed, R = Renamed\n");
+        return 1;
+    }
+
+    const char *container = argv[1];
+    const char *snap1 = argv[2];
+    const char *snap2 = (argc > 3) ? argv[3] : NULL;
+
+    lochs_jail_t *jail = lochs_jail_find(container);
+    if (!jail) {
+        fprintf(stderr, "Error: container '%s' not found\n", container);
+        return 1;
+    }
+    if (require_zfs_backend(jail) != 0) return 1;
+
+    return lochs_zfs_diff(container, snap1, snap2);
+}
+
+/*
+ * lochs clone <source-container> <snapshot> <new-name>
+ */
+int lochs_cmd_clone(int argc, char **argv) {
+    if (argc < 4) {
+        printf("Usage: lochs clone <source> <snapshot> <new-name>\n\n");
+        printf("Create a new container by cloning a snapshot.\n");
+        printf("The new container inherits the source's configuration.\n");
+        return 1;
+    }
+
+    const char *src = argv[1];
+    const char *snap = argv[2];
+    const char *new_name = argv[3];
+
+    lochs_jail_t *src_jail = lochs_jail_find(src);
+    if (!src_jail) {
+        fprintf(stderr, "Error: source container '%s' not found\n", src);
+        return 1;
+    }
+    if (require_zfs_backend(src_jail) != 0) return 1;
+
+    /* Check new name doesn't conflict */
+    if (lochs_jail_find(new_name)) {
+        fprintf(stderr, "Error: container '%s' already exists\n", new_name);
+        return 1;
+    }
+
+    /* Do the ZFS clone */
+    if (lochs_zfs_clone(src, snap, new_name) != 0)
+        return 1;
+
+    /* Create a new jail entry copying source config */
+    lochs_jail_t new_jail;
+    memcpy(&new_jail, src_jail, sizeof(lochs_jail_t));
+
+    /* Override name and state */
+    snprintf(new_jail.name, sizeof(new_jail.name), "%s", new_name);
+    new_jail.state = JAIL_STATE_CREATED;
+    new_jail.jid = -1;
+    new_jail.pid = 0;
+    new_jail.created_at = time(NULL);
+    new_jail.started_at = 0;
+    new_jail.overlay_mounted = 0;
+
+    /* Update ZFS paths for the new container */
+    const char *pool = lochs_zfs_get_pool();
+    if (pool) {
+        snprintf(new_jail.zfs_dataset, sizeof(new_jail.zfs_dataset),
+                 "%s/lochs/containers/%s", pool, new_name);
+        snprintf(new_jail.zfs_mountpoint, sizeof(new_jail.zfs_mountpoint),
+                 "/var/lib/lochs/zfs/containers/%s", new_name);
+        snprintf(new_jail.path, sizeof(new_jail.path),
+                 "%s", new_jail.zfs_mountpoint);
+        snprintf(new_jail.merged_path, sizeof(new_jail.merged_path),
+                 "%s", new_jail.zfs_mountpoint);
+    }
+
+    /* Clear port forwarder PIDs */
+    for (int i = 0; i < new_jail.port_count; i++) {
+        new_jail.ports[i].forwarder_pid = 0;
+    }
+
+    lochs_jail_add(&new_jail);
+    printf("Container '%s' created from %s@%s\n", new_name, src, snap);
+
+    return 0;
+}

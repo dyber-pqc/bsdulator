@@ -31,6 +31,10 @@ static lochs_command_t commands[] = {
     {"build",   "Build image from Lochfile",            lochs_cmd_build},
     {"compose", "Manage multi-jail applications",       lochs_cmd_compose},
     {"network", "Manage container networks",            lochs_cmd_network},
+    {"snapshot","Manage container snapshots (ZFS)",      lochs_cmd_snapshot},
+    {"rollback","Rollback container to a snapshot",      lochs_cmd_rollback},
+    {"diff",    "Show changes between snapshots",        lochs_cmd_diff},
+    {"clone",   "Clone container from a snapshot",       lochs_cmd_clone},
     {"version", "Show version information",             lochs_cmd_version},
     {NULL, NULL, NULL}
 };
@@ -59,7 +63,13 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "\n\033[1mOrchestration:\033[0m\n");
     fprintf(stderr, "  %-12s %s\n", "compose", "Manage multi-jail applications (lochs.yml)");
     fprintf(stderr, "  %-12s %s\n", "network", "Manage container networks");
-    
+
+    fprintf(stderr, "\n\033[1mZFS Snapshots:\033[0m\n");
+    fprintf(stderr, "  %-12s %s\n", "snapshot", "Manage container snapshots (create/ls/rm)");
+    fprintf(stderr, "  %-12s %s\n", "rollback", "Rollback container to a snapshot");
+    fprintf(stderr, "  %-12s %s\n", "diff", "Show changes between snapshots");
+    fprintf(stderr, "  %-12s %s\n", "clone", "Clone container from a snapshot");
+
     fprintf(stderr, "\n\033[1mOther:\033[0m\n");
     fprintf(stderr, "  %-12s %s\n", "version", "Show version information");
     
