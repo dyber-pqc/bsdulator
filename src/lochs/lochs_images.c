@@ -75,42 +75,30 @@ static lochs_official_image_t official_images[] = {
      */
     {
         "freebsd", "14",
-        FREEBSD_MIRROR_URL "/14.2-RELEASE/base.txz",
-        "FreeBSD 14.2-RELEASE base system",
+        FREEBSD_MIRROR_URL "/14.3-RELEASE/base.txz",
+        "FreeBSD 14.3-RELEASE base system",
         180
     },
     {
-        "freebsd", "14.2",
-        FREEBSD_MIRROR_URL "/14.2-RELEASE/base.txz",
-        "FreeBSD 14.2-RELEASE base system",
-        180
-    },
-    {
-        "freebsd", "14.1",
-        FREEBSD_MIRROR_URL "/14.1-RELEASE/base.txz",
-        "FreeBSD 14.1-RELEASE base system",
+        "freebsd", "14.3",
+        FREEBSD_MIRROR_URL "/14.3-RELEASE/base.txz",
+        "FreeBSD 14.3-RELEASE base system",
         180
     },
     {
         "freebsd", "14-minimal",
-        DYBER_IMAGES_URL "/v14.2/freebsd-14.2-minimal.txz",
-        "Minimal FreeBSD 14.2 (stripped)",
+        DYBER_IMAGES_URL "/v14.3/freebsd-14.3-minimal.txz",
+        "Minimal FreeBSD 14.3 (stripped)",
         50
     },
-    
+
     /*
      * FreeBSD 13.x
      */
     {
         "freebsd", "13",
-        FREEBSD_MIRROR_URL "/13.4-RELEASE/base.txz",
-        "FreeBSD 13.4-RELEASE base system",
-        170
-    },
-    {
-        "freebsd", "13.4",
-        FREEBSD_MIRROR_URL "/13.4-RELEASE/base.txz",
-        "FreeBSD 13.4-RELEASE base system",
+        FREEBSD_MIRROR_URL "/13.5-RELEASE/base.txz",
+        "FreeBSD 13.5-RELEASE base system",
         170
     },
     {
@@ -295,7 +283,23 @@ static int download_file(const char *url, const char *dest) {
         unlink(dest);
         return -1;
     }
-    
+
+    /* Validate download - check it's not an HTML error page */
+    FILE *check = fopen(dest, "rb");
+    if (check) {
+        char header[16];
+        size_t nread = fread(header, 1, sizeof(header), check);
+        fclose(check);
+        if (nread >= 5 && (memcmp(header, "<html", 5) == 0 ||
+                           memcmp(header, "<!DOC", 5) == 0 ||
+                           memcmp(header, "<HTML", 5) == 0)) {
+            fprintf(stderr, "Error: Download returned an HTML page instead of an archive.\n");
+            fprintf(stderr, "The mirror URL may be outdated or the release was removed.\n");
+            unlink(dest);
+            return -1;
+        }
+    }
+
     return 0;
 }
 
