@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6.1] - 2026-02-27
+
+### Fixed
+- CI/CD pipeline fixes for GitHub Actions
+  - Fixed `-Wformat-truncation` errors in gcc debug builds (buffer sizes in lochs_commands.c, lochfile_parser.c)
+  - Fixed `printf` format specifiers for unsigned ints in interceptor.c and jail.c
+  - Fixed `set -e` + `((WARN++))` bash arithmetic bug in check_compat.sh
+  - Fixed script execute permissions (all .sh files now 755)
+  - Made test suite stats check non-blocking
+  - Removed CodeQL security scan (requires repo-level enablement)
+- Updated GitHub Actions workflow permissions
+- Bumped `softprops/action-gh-release` from v1 to v2
+
+### Changed
+- Production readiness: added CODE_OF_CONDUCT, SECURITY.md, SUPPORT.md, CONTRIBUTING.md
+- Added Dockerfile, .dockerignore, install script, documentation
+- Updated README with badges, quick start, and architecture overview
+- Deployed install script to lochs.dev
+
 ## [0.3.6] - 2026-02-20
 
 ### Added
