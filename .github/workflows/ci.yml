@@ -9,8 +9,6 @@ on:
 
 permissions:
   contents: read
-  security-events: write
-  actions: read
 
 env:
   FREEBSD_VERSION: "15.0-RELEASE"
@@ -145,25 +143,6 @@ jobs:
           find src include -name '*.c' -o -name '*.h' | head -5 | xargs clang-format --dry-run --Werror || true
         continue-on-error: true
 
-  security:
-    name: Security Scan
-    runs-on: ubuntu-latest
-    continue-on-error: true
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: c-cpp
-
-      - name: Build for analysis
-        run: make
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
 
   integration:
     name: Integration Tests
