@@ -312,12 +312,16 @@ static int extract_tarball(const char *tarball, const char *dest) {
     
     mkdir(dest, 0755);
     
+    /* --warning=no-unknown-keyword suppresses FreeBSD SCHILY.fflags noise */
     if (strstr(tarball, ".txz") || strstr(tarball, ".tar.xz")) {
-        n = snprintf(cmd, sizeof(cmd), "tar -xJf '%s' -C '%s'", tarball, dest);
+        n = snprintf(cmd, sizeof(cmd),
+            "tar --warning=no-unknown-keyword -xJf '%s' -C '%s'", tarball, dest);
     } else if (strstr(tarball, ".tgz") || strstr(tarball, ".tar.gz")) {
-        n = snprintf(cmd, sizeof(cmd), "tar -xzf '%s' -C '%s'", tarball, dest);
+        n = snprintf(cmd, sizeof(cmd),
+            "tar --warning=no-unknown-keyword -xzf '%s' -C '%s'", tarball, dest);
     } else {
-        n = snprintf(cmd, sizeof(cmd), "tar -xf '%s' -C '%s'", tarball, dest);
+        n = snprintf(cmd, sizeof(cmd),
+            "tar --warning=no-unknown-keyword -xf '%s' -C '%s'", tarball, dest);
     }
     
     if (n >= (int)sizeof(cmd)) {
@@ -327,8 +331,49 @@ static int extract_tarball(const char *tarball, const char *dest) {
     
     printf("Extracting to %s...\n", dest);
     int ret = system(cmd);
-    
+
     return (ret == 0) ? 0 : -1;
+}
+
+/*
+ * Strip a FreeBSD image to reduce size (~830MB -> ~300MB).
+ * Removes docs, debug symbols, includes, games, etc.
+ */
+static void strip_image(const char *path) {
+    char cmd[2048];
+    int r;
+
+    printf("Stripping image (removing docs, debug symbols, etc.)...\n");
+
+    static const char *strip_dirs[] = {
+        "usr/share/doc", "usr/share/man", "usr/share/info",
+        "usr/share/examples", "usr/lib/debug",
+        "usr/include/c++", "usr/share/nls",
+        "usr/games", "usr/share/games",
+        "usr/share/zoneinfo/posix", "usr/share/zoneinfo/right",
+        NULL
+    };
+
+    for (int i = 0; strip_dirs[i]; i++) {
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s'/%s 2>/dev/null", path, strip_dirs[i]);
+        r = system(cmd);
+        (void)r;
+    }
+
+    /* Clean caches */
+    snprintf(cmd, sizeof(cmd),
+        "rm -rf '%s'/var/db/pkg/* '%s'/var/cache/* '%s'/tmp/* 2>/dev/null",
+        path, path, path);
+    r = system(cmd);
+    (void)r;
+
+    /* Remove non-English locales */
+    snprintf(cmd, sizeof(cmd),
+        "find '%s'/usr/share/locale -mindepth 1 -maxdepth 1 -type d "
+        "! -name 'C' ! -name 'en_US*' -exec rm -rf {} + 2>/dev/null; true",
+        path);
+    r = system(cmd);
+    (void)r;
 }
 
 /*
@@ -413,7 +458,12 @@ int lochs_image_pull(const char *image_name) {
         fprintf(stderr, "Error: Failed to extract image\n");
         return -1;
     }
-    
+
+    /* Strip bloat from full base images */
+    if (strstr(tag, "minimal") == NULL && strstr(tag, "rescue") == NULL) {
+        strip_image(image_path);
+    }
+
     /* Get actual size */
     size_t actual_size = get_dir_size(image_path);
     
