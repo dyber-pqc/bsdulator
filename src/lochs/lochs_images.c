@@ -117,7 +117,134 @@ static lochs_official_image_t official_images[] = {
         "FreeBSD rescue/recovery environment",
         15
     },
-    
+
+    /*
+     * Application images - purpose-built, smaller than base
+     * Built from freebsd:15.0-minimal + only the required packages
+     */
+
+    /* nginx */
+    {
+        "nginx", "latest",
+        DYBER_IMAGES_URL "/v1.0/nginx-1.26-freebsd15.0.txz",
+        "nginx web server on FreeBSD",
+        55
+    },
+    {
+        "nginx", "1.26",
+        DYBER_IMAGES_URL "/v1.0/nginx-1.26-freebsd15.0.txz",
+        "nginx 1.26 web server on FreeBSD",
+        55
+    },
+
+    /* postgresql */
+    {
+        "postgresql", "latest",
+        DYBER_IMAGES_URL "/v1.0/postgresql-16-freebsd15.0.txz",
+        "PostgreSQL 16 database on FreeBSD",
+        70
+    },
+    {
+        "postgresql", "16",
+        DYBER_IMAGES_URL "/v1.0/postgresql-16-freebsd15.0.txz",
+        "PostgreSQL 16 database on FreeBSD",
+        70
+    },
+    {
+        "postgresql", "15",
+        DYBER_IMAGES_URL "/v1.0/postgresql-15-freebsd15.0.txz",
+        "PostgreSQL 15 database on FreeBSD",
+        70
+    },
+    {
+        "postgres", "latest",
+        DYBER_IMAGES_URL "/v1.0/postgresql-16-freebsd15.0.txz",
+        "PostgreSQL 16 database on FreeBSD (alias)",
+        70
+    },
+
+    /* redis */
+    {
+        "redis", "latest",
+        DYBER_IMAGES_URL "/v1.0/redis-7.2-freebsd15.0.txz",
+        "Redis 7.2 in-memory data store on FreeBSD",
+        45
+    },
+    {
+        "redis", "7.2",
+        DYBER_IMAGES_URL "/v1.0/redis-7.2-freebsd15.0.txz",
+        "Redis 7.2 in-memory data store on FreeBSD",
+        45
+    },
+
+    /* python */
+    {
+        "python", "latest",
+        DYBER_IMAGES_URL "/v1.0/python-3.11-freebsd15.0.txz",
+        "Python 3.11 runtime on FreeBSD",
+        60
+    },
+    {
+        "python", "3.11",
+        DYBER_IMAGES_URL "/v1.0/python-3.11-freebsd15.0.txz",
+        "Python 3.11 runtime on FreeBSD",
+        60
+    },
+
+    /* node */
+    {
+        "node", "latest",
+        DYBER_IMAGES_URL "/v1.0/node-22-freebsd15.0.txz",
+        "Node.js 22 LTS runtime on FreeBSD",
+        65
+    },
+    {
+        "node", "22",
+        DYBER_IMAGES_URL "/v1.0/node-22-freebsd15.0.txz",
+        "Node.js 22 LTS runtime on FreeBSD",
+        65
+    },
+    {
+        "node", "lts",
+        DYBER_IMAGES_URL "/v1.0/node-22-freebsd15.0.txz",
+        "Node.js 22 LTS runtime on FreeBSD",
+        65
+    },
+
+    /* go */
+    {
+        "go", "latest",
+        DYBER_IMAGES_URL "/v1.0/go-1.22-freebsd15.0.txz",
+        "Go 1.22 programming language on FreeBSD",
+        80
+    },
+    {
+        "go", "1.22",
+        DYBER_IMAGES_URL "/v1.0/go-1.22-freebsd15.0.txz",
+        "Go 1.22 programming language on FreeBSD",
+        80
+    },
+    {
+        "golang", "latest",
+        DYBER_IMAGES_URL "/v1.0/go-1.22-freebsd15.0.txz",
+        "Go 1.22 programming language on FreeBSD (alias)",
+        80
+    },
+
+    /* rust */
+    {
+        "rust", "latest",
+        DYBER_IMAGES_URL "/v1.0/rust-1.77-freebsd15.0.txz",
+        "Rust 1.77 programming language on FreeBSD",
+        85
+    },
+    {
+        "rust", "1.77",
+        DYBER_IMAGES_URL "/v1.0/rust-1.77-freebsd15.0.txz",
+        "Rust 1.77 programming language on FreeBSD",
+        85
+    },
+
     {NULL, NULL, NULL, NULL, 0}
 };
 
@@ -615,45 +742,92 @@ char *lochs_image_get_path(const char *image_name) {
 }
 
 /*
+ * Check if image name is an alias (postgres->postgresql, golang->go)
+ */
+static int is_alias(const char *name) {
+    return (strcmp(name, "postgres") == 0 ||
+            strcmp(name, "golang") == 0);
+}
+
+/*
  * Search registry for images
  */
 int lochs_image_search(const char *query) {
-    printf("Searching for '%s'...\n\n", query ? query : "*");
-    printf("%-25s %-8s %s\n", "IMAGE", "SIZE", "DESCRIPTION");
-    printf("%-25s %-8s %s\n", "-----", "----", "-----------");
-    
+    int show_all = (query == NULL || strcmp(query, "*") == 0);
+
+    if (show_all) {
+        printf("\n  \033[1mLochs Image Registry\033[0m\n");
+        printf("  https://github.com/dyber-pqc/lochs-images\n\n");
+    } else {
+        printf("Searching for '%s'...\n\n", query);
+    }
+
     int found = 0;
-    char last_full[128] = "";
-    
+    char last_name[64] = "";
+    const char *current_section = NULL;
+
     for (int i = 0; official_images[i].name != NULL; i++) {
+        /* Skip aliases in listings */
+        if (show_all && is_alias(official_images[i].name))
+            continue;
+
+        /* In full listing: show one entry per image name
+         * In search: show all matching tags */
+        if (show_all && strcmp(official_images[i].name, last_name) == 0)
+            continue;
+
         /* Check if matches query */
-        if (query != NULL && 
+        if (!show_all &&
             strstr(official_images[i].name, query) == NULL &&
             strstr(official_images[i].description, query) == NULL &&
             strstr(official_images[i].tag, query) == NULL) {
             continue;
         }
-        
-        /* Skip duplicates */
-        char full_name[128];
-        snprintf(full_name, sizeof(full_name), "%s:%s", 
-                 official_images[i].name, official_images[i].tag);
-        if (strcmp(full_name, last_full) == 0) {
-            continue;
+
+        /* Section headers for full listing */
+        if (show_all) {
+            const char *section;
+            if (strcmp(official_images[i].name, "freebsd") == 0)
+                section = "Base Images";
+            else
+                section = "Application Images";
+
+            if (current_section == NULL || strcmp(section, current_section) != 0) {
+                current_section = section;
+                if (found > 0) printf("\n");
+                printf("  \033[1;34m%s\033[0m\n", section);
+                printf("  %-20s %-10s %s\n", "NAME", "SIZE", "DESCRIPTION");
+                printf("  %-20s %-10s %s\n", "----", "----", "-----------");
+            }
         }
-        safe_strcpy(last_full, full_name, sizeof(last_full));
-        
-        printf("%-25s %-8zu %s\n",
-               full_name,
-               official_images[i].size_mb,
-               official_images[i].description);
+
+        safe_strcpy(last_name, official_images[i].name, sizeof(last_name));
+
+        char size_str[16];
+        snprintf(size_str, sizeof(size_str), "~%zuMB", official_images[i].size_mb);
+
+        if (show_all) {
+            printf("  %-20s %-10s %s\n",
+                   official_images[i].name,
+                   size_str,
+                   official_images[i].description);
+        } else {
+            char full_name[128];
+            snprintf(full_name, sizeof(full_name), "%s:%s",
+                     official_images[i].name, official_images[i].tag);
+            printf("%-25s %-10s %s\n",
+                   full_name, size_str, official_images[i].description);
+        }
         found++;
     }
-    
+
     if (found == 0) {
         printf("No images found matching '%s'\n", query);
+    } else if (show_all) {
+        printf("\n  Pull an image:  lochs pull <name>\n");
+        printf("  Pull a tag:     lochs pull <name>:<tag>\n\n");
     }
-    
+
     return 0;
 }
 
