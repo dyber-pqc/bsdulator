@@ -318,7 +318,7 @@ static void lochfile_free(lochfile_context_t *ctx) {
  * For complex commands (pipes, redirects), uses sh -c.
  */
 static int run_in_jail(const char *build_dir, const char *command) {
-    char cmd[8192];
+    char cmd[16384];
     char bsdulator_path[2048];
 
     /* Get absolute path to bsdulator */
