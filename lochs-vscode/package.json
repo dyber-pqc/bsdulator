@@ -1,0 +1,76 @@
+{
+  "name": "lochs",
+  "displayName": "Lochs - FreeBSD Jails on Linux",
+  "description": "Lochfile syntax highlighting and file icons for the Lochs container runtime",
+  "version": "0.1.0",
+  "publisher": "dyber-pqc",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dyber-pqc/bsdulator"
+  },
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Themes"
+  ],
+  "keywords": [
+    "lochs",
+    "lochfile",
+    "freebsd",
+    "jail",
+    "bsdulator",
+    "container"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "lochfile",
+        "aliases": [
+          "Lochfile",
+          "lochfile"
+        ],
+        "filenames": [
+          "Lochfile"
+        ],
+        "icon": {
+          "light": "./icons/lochs-icon.svg",
+          "dark": "./icons/lochs-icon.svg"
+        },
+        "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "lochs-compose",
+        "aliases": [
+          "Lochs Compose"
+        ],
+        "filenames": [
+          "lochs.yml",
+          "lochs.yaml",
+          "lochs-compose.yml",
+          "lochs-compose.yaml"
+        ],
+        "icon": {
+          "light": "./icons/lochs-icon.svg",
+          "dark": "./icons/lochs-icon.svg"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "lochfile",
+        "scopeName": "source.lochfile",
+        "path": "./syntaxes/lochfile.tmLanguage.json"
+      }
+    ],
+    "iconThemes": [
+      {
+        "id": "lochs-icons",
+        "label": "Lochs File Icons (Addon)",
+        "path": "./icon-theme.json"
+      }
+    ]
+  }
+}

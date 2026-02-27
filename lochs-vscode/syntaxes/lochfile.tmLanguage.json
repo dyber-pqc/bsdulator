@@ -1,0 +1,80 @@
+{
+  "scopeName": "source.lochfile",
+  "name": "Lochfile",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#from" },
+    { "include": "#directive" },
+    { "include": "#label" },
+    { "include": "#env" },
+    { "include": "#string-double" },
+    { "include": "#string-single" },
+    { "include": "#variable" },
+    { "include": "#json-array" }
+  ],
+  "repository": {
+    "comment": {
+      "match": "#.*$",
+      "name": "comment.line.number-sign.lochfile"
+    },
+    "from": {
+      "match": "^\\s*(FROM)\\s+(\\S+)",
+      "captures": {
+        "1": { "name": "keyword.control.from.lochfile" },
+        "2": { "name": "entity.name.tag.image.lochfile" }
+      }
+    },
+    "directive": {
+      "match": "^\\s*(RUN|CMD|ENTRYPOINT|COPY|ADD|EXPOSE|VOLUME|WORKDIR|ENV|LABEL|ARG|USER|SHELL|HEALTHCHECK|STOPSIGNAL)\\b",
+      "captures": {
+        "1": { "name": "keyword.other.directive.lochfile" }
+      }
+    },
+    "label": {
+      "match": "(\\w+)\\s*=\\s*",
+      "captures": {
+        "1": { "name": "variable.other.label-key.lochfile" }
+      }
+    },
+    "env": {
+      "match": "^\\s*ENV\\s+(\\w+)\\s*=?",
+      "captures": {
+        "1": { "name": "variable.other.env.lochfile" }
+      }
+    },
+    "string-double": {
+      "begin": "\"",
+      "end": "\"",
+      "name": "string.quoted.double.lochfile",
+      "patterns": [
+        { "include": "#variable" },
+        {
+          "match": "\\\\.",
+          "name": "constant.character.escape.lochfile"
+        }
+      ]
+    },
+    "string-single": {
+      "begin": "'",
+      "end": "'",
+      "name": "string.quoted.single.lochfile"
+    },
+    "variable": {
+      "match": "\\$\\{?[a-zA-Z_][a-zA-Z0-9_]*\\}?",
+      "name": "variable.other.env.lochfile"
+    },
+    "json-array": {
+      "begin": "\\[",
+      "end": "\\]",
+      "name": "meta.structure.array.lochfile",
+      "patterns": [
+        { "include": "#string-double" },
+        { "include": "#string-single" },
+        {
+          "match": ",",
+          "name": "punctuation.separator.comma.lochfile"
+        }
+      ]
+    }
+  }
+}

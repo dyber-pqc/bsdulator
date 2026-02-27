@@ -1,0 +1,18 @@
+{
+  "hidesExplorerArrows": false,
+  "iconDefinitions": {
+    "_lochs": {
+      "iconPath": "./icons/lochs-icon.svg"
+    },
+    "_lochs_compose": {
+      "iconPath": "./icons/lochs-icon.svg"
+    }
+  },
+  "fileNames": {
+    "Lochfile": "_lochs",
+    "lochs.yml": "_lochs_compose",
+    "lochs.yaml": "_lochs_compose",
+    "lochs-compose.yml": "_lochs_compose",
+    "lochs-compose.yaml": "_lochs_compose"
+  }
+}

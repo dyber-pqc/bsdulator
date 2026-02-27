@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <!-- Mountain peaks (BSD/FreeBSD vibes) -->
+  <polygon points="16,4 24,20 8,20" fill="#cc3333" opacity="0.9"/>
+  <polygon points="10,10 18,20 2,20" fill="#993333" opacity="0.7"/>
+  <!-- Water/loch at base -->
+  <ellipse cx="16" cy="22" rx="14" ry="4" fill="#336699" opacity="0.8"/>
+  <!-- Reflection shimmer -->
+  <line x1="12" y1="22" x2="20" y2="22" stroke="#5599cc" stroke-width="0.8" opacity="0.6"/>
+  <line x1="10" y1="24" x2="22" y2="24" stroke="#5599cc" stroke-width="0.5" opacity="0.4"/>
+  <!-- Base line -->
+  <rect x="1" y="26" width="30" height="2" rx="1" fill="#cc3333" opacity="0.6"/>
+</svg>
