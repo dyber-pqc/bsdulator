@@ -59,6 +59,24 @@ typedef struct {
     int active;
 } lochs_named_volume_t;
 
+/* Health check states */
+typedef enum {
+    HEALTH_NONE,        /* No healthcheck configured */
+    HEALTH_STARTING,    /* Within start-period grace window */
+    HEALTH_HEALTHY,     /* Last check passed */
+    HEALTH_UNHEALTHY    /* Consecutive failures >= retries */
+} lochs_health_state_t;
+
+/* Health check config (embedded in lochs_jail_t) */
+typedef struct {
+    char cmd[1024];             /* Command to run inside jail */
+    int interval;               /* Seconds between checks (default: 30) */
+    int timeout;                /* Seconds before check killed (default: 30) */
+    int retries;                /* Consecutive failures before unhealthy (default: 3) */
+    int start_period;           /* Grace period after start in seconds (default: 0) */
+    int enabled;                /* 1 if healthcheck is configured */
+} lochs_healthcheck_config_t;
+
 /* Managed jail entry (extends raw bsd_jail_t) */
 typedef struct {
     int jid;
@@ -114,6 +132,10 @@ typedef struct {
     int pids_limit;                   /* Max PIDs (0 = unlimited) */
     int cpu_weight;                   /* CPU weight 1-10000 (0 = default 100) */
     int cgroup_applied;               /* 1 if cgroup limits are active */
+
+    /* Health check */
+    lochs_healthcheck_config_t healthcheck;
+    pid_t health_monitor_pid;         /* PID of background health monitor process */
 } lochs_jail_t;
 
 /* Network definition */
@@ -145,6 +167,14 @@ typedef struct {
     int expose_count;
     char volume_paths[16][512];         /* VOLUME directives */
     int volume_path_count;
+
+    /* Health check from HEALTHCHECK directive */
+    char healthcheck_cmd[1024];
+    int healthcheck_interval;
+    int healthcheck_timeout;
+    int healthcheck_retries;
+    int healthcheck_start_period;
+    int healthcheck_none;               /* 1 if HEALTHCHECK NONE */
 } lochfile_t;
 
 /* lochs.yml service definition */
@@ -280,5 +310,19 @@ int lochs_cgroup_apply_limits(lochs_jail_t *jail);
 int lochs_cgroup_cleanup(lochs_jail_t *jail);
 int64_t lochs_parse_memory_size(const char *str);
 int lochs_parse_cpus(const char *str);
+
+/* Health check management (lochs_health.c) */
+int lochs_cmd_health(int argc, char **argv);
+int lochs_health_monitor_start(lochs_jail_t *jail);
+int lochs_health_monitor_stop(lochs_jail_t *jail);
+int lochs_health_status_read(const char *container_name,
+                             lochs_health_state_t *state,
+                             int *consecutive_failures,
+                             time_t *last_check,
+                             char *last_output, size_t output_size,
+                             int *total_checks,
+                             int *total_failures,
+                             int *restart_count);
+const char *lochs_health_state_str(lochs_health_state_t state);
 
 #endif /* LOCHS_H */

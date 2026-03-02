@@ -301,6 +301,19 @@ static void load_image_metadata(lochs_jail_t *jail, const char *image_path) {
             safe_strcpy(jail->entrypoint, value, sizeof(jail->entrypoint));
         } else if (strcmp(key, "workdir") == 0) {
             safe_strcpy(jail->workdir, value, sizeof(jail->workdir));
+        } else if (strcmp(key, "healthcheck.cmd") == 0) {
+            safe_strcpy(jail->healthcheck.cmd, value, sizeof(jail->healthcheck.cmd));
+            jail->healthcheck.enabled = 1;
+        } else if (strcmp(key, "healthcheck.interval") == 0) {
+            jail->healthcheck.interval = atoi(value);
+        } else if (strcmp(key, "healthcheck.timeout") == 0) {
+            jail->healthcheck.timeout = atoi(value);
+        } else if (strcmp(key, "healthcheck.retries") == 0) {
+            jail->healthcheck.retries = atoi(value);
+        } else if (strcmp(key, "healthcheck.start_period") == 0) {
+            jail->healthcheck.start_period = atoi(value);
+        } else if (strcmp(key, "healthcheck.none") == 0) {
+            jail->healthcheck.enabled = 0;
         }
     }
     
@@ -332,6 +345,11 @@ int lochs_cmd_create(int argc, char **argv) {
     int pids_limit = 0;
     int cpu_weight = 0;
 
+    /* Health check overrides */
+    char *health_cmd = NULL;
+    int health_interval = 0, health_timeout = 0, health_retries = 0, health_start_period = 0;
+    int no_healthcheck = 0;
+
     static struct option long_options[] = {
         {"image",       required_argument, 0, 'i'},
         {"ip",          required_argument, 0, 'I'},
@@ -346,6 +364,12 @@ int lochs_cmd_create(int argc, char **argv) {
         {"memory-swap", required_argument, 0, 'S'},
         {"pids-limit",  required_argument, 0, 'L'},
         {"cpu-weight",  required_argument, 0, 'w'},
+        {"health-cmd",          required_argument, 0, 1001},
+        {"health-interval",     required_argument, 0, 1002},
+        {"health-timeout",      required_argument, 0, 1003},
+        {"health-retries",      required_argument, 0, 1004},
+        {"health-start-period", required_argument, 0, 1005},
+        {"no-healthcheck",      no_argument,       0, 1006},
         {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -426,6 +450,12 @@ int lochs_cmd_create(int argc, char **argv) {
                     return 1;
                 }
                 break;
+            case 1001: health_cmd = optarg; break;
+            case 1002: health_interval = atoi(optarg); break;
+            case 1003: health_timeout = atoi(optarg); break;
+            case 1004: health_retries = atoi(optarg); break;
+            case 1005: health_start_period = atoi(optarg); break;
+            case 1006: no_healthcheck = 1; break;
             case 'h':
                 printf("Usage: lochs create <n> [options]\n\n");
                 printf("Options:\n");
@@ -443,6 +473,13 @@ int lochs_cmd_create(int argc, char **argv) {
                 printf("      --memory-swap <size>  Swap limit (default: 0 when memory set)\n");
                 printf("      --pids-limit <n>      Max number of processes\n");
                 printf("      --cpu-weight <n>      CPU scheduling weight (1-10000)\n");
+                printf("\nHealth Checks:\n");
+                printf("      --health-cmd <cmd>        Health check command\n");
+                printf("      --health-interval <s>     Check interval in seconds (default: 30)\n");
+                printf("      --health-timeout <s>      Check timeout in seconds (default: 30)\n");
+                printf("      --health-retries <n>      Failures before unhealthy (default: 3)\n");
+                printf("      --health-start-period <s> Grace period after start (default: 0)\n");
+                printf("      --no-healthcheck          Disable image healthcheck\n");
                 printf("\nExamples:\n");
                 printf("  lochs create web -i freebsd:15 -p 8080:80\n");
                 printf("  lochs create app -v /data:/app/data -e DEBUG=1\n");
@@ -518,8 +555,25 @@ int lochs_cmd_create(int argc, char **argv) {
     }
     /* jail.path is now set to the merged overlay path */
 
-    /* Load image metadata (CMD, ENTRYPOINT, WORKDIR) */
+    /* Load image metadata (CMD, ENTRYPOINT, WORKDIR, HEALTHCHECK) */
     load_image_metadata(&jail, root_path);
+
+    /* CLI health flags override image healthcheck */
+    if (no_healthcheck) {
+        memset(&jail.healthcheck, 0, sizeof(jail.healthcheck));
+    } else if (health_cmd) {
+        safe_strcpy(jail.healthcheck.cmd, health_cmd, sizeof(jail.healthcheck.cmd));
+        jail.healthcheck.enabled = 1;
+        jail.healthcheck.interval = health_interval > 0 ? health_interval : 30;
+        jail.healthcheck.timeout = health_timeout > 0 ? health_timeout : 30;
+        jail.healthcheck.retries = health_retries > 0 ? health_retries : 3;
+        jail.healthcheck.start_period = health_start_period;
+    } else if (jail.healthcheck.enabled) {
+        /* Set defaults for image healthcheck if values missing */
+        if (jail.healthcheck.interval <= 0) jail.healthcheck.interval = 30;
+        if (jail.healthcheck.timeout <= 0) jail.healthcheck.timeout = 30;
+        if (jail.healthcheck.retries <= 0) jail.healthcheck.retries = 3;
+    }
 
     /* Copy port mappings */
     jail.port_count = port_count;
@@ -622,8 +676,15 @@ int lochs_cmd_create(int argc, char **argv) {
         }
         printf("\n");
     }
+    if (jail.healthcheck.enabled) {
+        printf("  Health: every %ds, timeout %ds, %d retries\n",
+               jail.healthcheck.interval, jail.healthcheck.timeout,
+               jail.healthcheck.retries);
+        if (jail.healthcheck.start_period > 0)
+            printf("          start-period %ds\n", jail.healthcheck.start_period);
+    }
     printf("\nRun 'lochs start %s' to start the container.\n", name);
-    
+
     return 0;
 }
 
@@ -932,6 +993,16 @@ int lochs_cmd_start(int argc, char **argv) {
         (void)cmd_ret;
     }
 
+    /* Start health check monitor if configured */
+    if (jail->healthcheck.enabled && jail->healthcheck.cmd[0]) {
+        if (lochs_health_monitor_start(jail) == 0) {
+            printf("  Health monitor: started (interval=%ds, retries=%d)\n",
+                   jail->healthcheck.interval, jail->healthcheck.retries);
+        } else {
+            fprintf(stderr, "  Warning: Failed to start health monitor\n");
+        }
+    }
+
     /* Save state with updated JID and port PIDs */
     lochs_state_save();
     
@@ -963,7 +1034,13 @@ int lochs_cmd_stop(int argc, char **argv) {
     }
     
     printf("Stopping container '%s'...\n", name);
-    
+
+    /* Stop health check monitor */
+    if (jail->health_monitor_pid > 0) {
+        lochs_health_monitor_stop(jail);
+        printf("  Health monitor: stopped\n");
+    }
+
     /* Stop port forwarders first */
     if (jail->port_count > 0) {
         printf("Stopping port forwarding...\n");
@@ -1175,10 +1252,10 @@ int lochs_cmd_ps(int argc, char **argv) {
         }
     }
     
-    printf("%-15s %-6s %-20s %-15s %-20s %-15s %s\n",
-           "NAME", "JID", "IMAGE", "STATUS", "PORTS", "LIMITS", "PATH");
-    printf("%-15s %-6s %-20s %-15s %-20s %-15s %s\n",
-           "----", "---", "-----", "------", "-----", "------", "----");
+    printf("%-15s %-6s %-20s %-15s %-12s %-20s %-15s %s\n",
+           "NAME", "JID", "IMAGE", "STATUS", "HEALTH", "PORTS", "LIMITS", "PATH");
+    printf("%-15s %-6s %-20s %-15s %-12s %-20s %-15s %s\n",
+           "----", "---", "-----", "------", "------", "-----", "------", "----");
 
     for (int i = 0; i < jail_count; i++) {
         lochs_jail_t *j = &jails[i];
@@ -1244,11 +1321,37 @@ int lochs_cmd_ps(int argc, char **argv) {
             }
         }
 
-        printf("%-15s %-6s %-20s %-15s %-20s %-15s %s\n",
+        /* Build health status string */
+        char health_str[32] = "-";
+        if (j->healthcheck.enabled && j->state == JAIL_STATE_RUNNING) {
+            lochs_health_state_t hstate;
+            if (lochs_health_status_read(j->name, &hstate, NULL, NULL,
+                                          NULL, 0, NULL, NULL, NULL) == 0) {
+                switch (hstate) {
+                    case HEALTH_HEALTHY:
+                        snprintf(health_str, sizeof(health_str), "\033[32mhealthy\033[0m");
+                        break;
+                    case HEALTH_UNHEALTHY:
+                        snprintf(health_str, sizeof(health_str), "\033[31munhealthy\033[0m");
+                        break;
+                    case HEALTH_STARTING:
+                        snprintf(health_str, sizeof(health_str), "\033[33mstarting\033[0m");
+                        break;
+                    default:
+                        strcpy(health_str, "-");
+                        break;
+                }
+            }
+        } else if (j->healthcheck.enabled) {
+            strcpy(health_str, "off");
+        }
+
+        printf("%-15s %-6s %-20s %-15s %-12s %-20s %-15s %s\n",
                j->name,
                jid_str,
                j->image,
                state_str,
+               health_str,
                ports_str,
                limits_str,
                j->path);

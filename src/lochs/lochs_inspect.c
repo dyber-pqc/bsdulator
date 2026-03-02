@@ -236,6 +236,43 @@ static void inspect_json(lochs_jail_t *jail) {
     printf("    \"CgroupApplied\": %s\n", jail->cgroup_applied ? "true" : "false");
     printf("  },\n");
 
+    /* Health */
+    printf("  \"Health\": {\n");
+    if (jail->healthcheck.enabled) {
+        lochs_health_state_t hstate = HEALTH_NONE;
+        int cons_fail = 0, tot_chk = 0, tot_fail = 0, restarts = 0;
+        time_t last_chk = 0;
+        char last_out[256] = "";
+        lochs_health_status_read(jail->name, &hstate, &cons_fail, &last_chk,
+                                  last_out, sizeof(last_out),
+                                  &tot_chk, &tot_fail, &restarts);
+
+        printf("    \"Status\": \"%s\",\n", lochs_health_state_str(hstate));
+        printf("    \"FailingStreak\": %d,\n", cons_fail);
+
+        format_iso_time(last_chk, time_buf, sizeof(time_buf));
+        printf("    \"LastCheck\": \"%s\",\n", time_buf);
+
+        json_escape(last_out, esc, sizeof(esc));
+        printf("    \"LastOutput\": \"%s\",\n", esc);
+        printf("    \"TotalChecks\": %d,\n", tot_chk);
+        printf("    \"TotalFailures\": %d,\n", tot_fail);
+        printf("    \"RestartCount\": %d,\n", restarts);
+        printf("    \"MonitorPid\": %d,\n", (int)jail->health_monitor_pid);
+        printf("    \"Config\": {\n");
+
+        json_escape(jail->healthcheck.cmd, esc, sizeof(esc));
+        printf("      \"Test\": \"%s\",\n", esc);
+        printf("      \"Interval\": %d,\n", jail->healthcheck.interval);
+        printf("      \"Timeout\": %d,\n", jail->healthcheck.timeout);
+        printf("      \"Retries\": %d,\n", jail->healthcheck.retries);
+        printf("      \"StartPeriod\": %d\n", jail->healthcheck.start_period);
+        printf("    }\n");
+    } else {
+        printf("    \"Status\": \"none\"\n");
+    }
+    printf("  },\n");
+
     /* Storage */
     printf("  \"Storage\": {\n");
     printf("    \"Backend\": \"%s\",\n",
@@ -284,6 +321,50 @@ static void inspect_human(lochs_jail_t *jail) {
     printf("  Started:     %s\n", time_buf);
     if (jail->pid > 0) {
         printf("  PID:         %d\n", (int)jail->pid);
+    }
+
+    /* Health check */
+    if (jail->healthcheck.enabled) {
+        printf("\n  Health Check:\n");
+
+        lochs_health_state_t hstate = HEALTH_NONE;
+        int cons_fail = 0, tot_chk = 0, tot_fail = 0, restarts = 0;
+        time_t last_chk = 0;
+        char last_out[256] = "";
+
+        if (lochs_health_status_read(jail->name, &hstate, &cons_fail, &last_chk,
+                                      last_out, sizeof(last_out),
+                                      &tot_chk, &tot_fail, &restarts) == 0) {
+            const char *color = "";
+            const char *reset = "\033[0m";
+            switch (hstate) {
+                case HEALTH_HEALTHY:   color = "\033[32m"; break;
+                case HEALTH_UNHEALTHY: color = "\033[31m"; break;
+                case HEALTH_STARTING:  color = "\033[33m"; break;
+                default:               reset = ""; break;
+            }
+            printf("    Status:    %s%s%s (%d checks, %d failures, %d restarts)\n",
+                   color, lochs_health_state_str(hstate), reset,
+                   tot_chk, tot_fail, restarts);
+            if (last_chk > 0) {
+                format_human_time(last_chk, time_buf, sizeof(time_buf));
+                printf("    Last:      %s", time_buf);
+                if (last_out[0]) printf(" — %s", last_out);
+                printf("\n");
+            }
+        } else {
+            printf("    Status:    no health data\n");
+        }
+        printf("    Command:   %s\n", jail->healthcheck.cmd);
+        printf("    Schedule:  every %ds, timeout %ds, %d retries\n",
+               jail->healthcheck.interval, jail->healthcheck.timeout,
+               jail->healthcheck.retries);
+        if (jail->healthcheck.start_period > 0) {
+            printf("    Start:     %ds grace period\n", jail->healthcheck.start_period);
+        }
+        if (jail->health_monitor_pid > 0) {
+            printf("    Monitor:   pid=%d\n", (int)jail->health_monitor_pid);
+        }
     }
 
     /* Network */

@@ -34,6 +34,7 @@ static lochs_command_t commands[] = {
     {"network", "Manage container networks",            lochs_cmd_network},
     {"volume",  "Manage named volumes",                 lochs_cmd_volume},
     {"stats",   "Show container resource usage",        lochs_cmd_stats},
+    {"health",  "Check container health",               lochs_cmd_health},
     {"snapshot","Manage container snapshots (ZFS)",      lochs_cmd_snapshot},
     {"rollback","Rollback container to a snapshot",      lochs_cmd_rollback},
     {"diff",    "Show changes between snapshots",        lochs_cmd_diff},
@@ -75,9 +76,11 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  %-12s %s\n", "diff", "Show changes between snapshots");
     fprintf(stderr, "  %-12s %s\n", "clone", "Clone container from a snapshot");
 
-    fprintf(stderr, "\n\033[1mResource Limits:\033[0m\n");
+    fprintf(stderr, "\n\033[1mResource Limits & Health:\033[0m\n");
     fprintf(stderr, "  %-12s %s\n", "stats", "Show container resource usage (cgroups v2)");
+    fprintf(stderr, "  %-12s %s\n", "health", "Check container health status");
     fprintf(stderr, "  Use --cpus, --memory, --pids-limit with 'create' to set limits\n");
+    fprintf(stderr, "  Use --health-cmd with 'create' to configure health checks\n");
 
     fprintf(stderr, "\n\033[1mOther:\033[0m\n");
     fprintf(stderr, "  %-12s %s\n", "version", "Show version information");

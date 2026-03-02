@@ -79,12 +79,20 @@ typedef struct {
     char volume_paths[16][512];
     int volume_count;
 
+    /* Health check */
+    char healthcheck_cmd[1024];
+    int healthcheck_interval;
+    int healthcheck_timeout;
+    int healthcheck_retries;
+    int healthcheck_start_period;
+    int healthcheck_none;
+
     /* Build context directory */
     char context_dir[512];
-    
+
     /* Build directory */
     char build_dir[512];
-    
+
 } lochfile_context_t;
 
 /*
@@ -107,6 +115,17 @@ static char *trim(char *str) {
 static void generate_hash(char *out, size_t out_size) {
     unsigned long hash = (unsigned long)time(NULL) ^ (unsigned long)getpid();
     snprintf(out, out_size, "%08lx%04x", hash, (unsigned)(rand() & 0xFFFF));
+}
+
+/*
+ * Parse duration string: "30s" -> 30, "5m" -> 300, plain number -> seconds
+ */
+static int parse_duration(const char *s) {
+    int val = atoi(s);
+    const char *p = s;
+    while (*p && (isdigit((unsigned char)*p) || *p == '.')) p++;
+    if (*p == 'm') val *= 60;
+    return val > 0 ? val : 30;
 }
 
 /*
@@ -266,10 +285,44 @@ static int parse_line(lochfile_context_t *ctx, const char *line, int line_num) {
             }
         }
     }
+    else if (strcmp(directive, "HEALTHCHECK") == 0) {
+        if (strncmp(args, "NONE", 4) == 0) {
+            ctx->healthcheck_none = 1;
+            ctx->healthcheck_cmd[0] = '\0';
+        } else {
+            /* Set defaults */
+            ctx->healthcheck_interval = 30;
+            ctx->healthcheck_timeout = 30;
+            ctx->healthcheck_retries = 3;
+            ctx->healthcheck_start_period = 0;
+
+            /* Parse options before CMD keyword */
+            const char *p = args;
+            while (*p == '-') {
+                if (strncmp(p, "--interval=", 11) == 0)
+                    ctx->healthcheck_interval = parse_duration(p + 11);
+                else if (strncmp(p, "--timeout=", 10) == 0)
+                    ctx->healthcheck_timeout = parse_duration(p + 10);
+                else if (strncmp(p, "--retries=", 10) == 0)
+                    ctx->healthcheck_retries = atoi(p + 10);
+                else if (strncmp(p, "--start-period=", 15) == 0)
+                    ctx->healthcheck_start_period = parse_duration(p + 15);
+                /* Advance to next token */
+                while (*p && !isspace((unsigned char)*p)) p++;
+                while (*p && isspace((unsigned char)*p)) p++;
+            }
+
+            /* Expect "CMD <command>" */
+            if (strncmp(p, "CMD ", 4) == 0) {
+                safe_strcpy(ctx->healthcheck_cmd, p + 4, sizeof(ctx->healthcheck_cmd));
+            } else {
+                fprintf(stderr, "Lochfile:%d: HEALTHCHECK requires CMD or NONE\n", line_num);
+            }
+        }
+    }
     else if (strcmp(directive, "ARG") == 0 ||
              strcmp(directive, "SHELL") == 0 ||
              strcmp(directive, "STOPSIGNAL") == 0 ||
-             strcmp(directive, "HEALTHCHECK") == 0 ||
              strcmp(directive, "ONBUILD") == 0) {
         /* Recognized but not implemented - just warn */
         fprintf(stderr, "Lochfile:%d: Warning: %s not yet implemented, skipping\n",
@@ -652,6 +705,17 @@ int lochs_build_from_lochfile(const char *lochfile_path, const char *context_dir
                 fprintf(meta, "%s%s", i > 0 ? "," : "", ctx.volume_paths[i]);
             }
             fprintf(meta, "\n");
+        }
+
+        /* Health check */
+        if (ctx.healthcheck_cmd[0]) {
+            fprintf(meta, "healthcheck.cmd=%s\n", ctx.healthcheck_cmd);
+            fprintf(meta, "healthcheck.interval=%d\n", ctx.healthcheck_interval);
+            fprintf(meta, "healthcheck.timeout=%d\n", ctx.healthcheck_timeout);
+            fprintf(meta, "healthcheck.retries=%d\n", ctx.healthcheck_retries);
+            fprintf(meta, "healthcheck.start_period=%d\n", ctx.healthcheck_start_period);
+        } else if (ctx.healthcheck_none) {
+            fprintf(meta, "healthcheck.none=1\n");
         }
 
         fclose(meta);
