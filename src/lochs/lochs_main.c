@@ -23,6 +23,7 @@ static lochs_command_t commands[] = {
     {"exec",    "Execute a command in a jail",          lochs_cmd_exec},
     {"logs",    "View container logs",                  lochs_cmd_logs},
     {"ps",      "List jails",                           lochs_cmd_ps},
+    {"inspect", "Show container details (JSON)",        lochs_cmd_inspect},
     {"images",  "List local images",                    lochs_cmd_images},
     {"pull",    "Pull an image from registry",          lochs_cmd_pull},
     {"push",    "Push an image to registry",            NULL},  /* Future */
@@ -54,7 +55,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  %-12s %s\n", "exec", "Execute a command in a jail");
     fprintf(stderr, "  %-12s %s\n", "logs", "View container logs");
     fprintf(stderr, "  %-12s %s\n", "ps", "List jails");
-    
+    fprintf(stderr, "  %-12s %s\n", "inspect", "Show container details (JSON)");
+
     fprintf(stderr, "\n\033[1mImage Commands:\033[0m\n");
     fprintf(stderr, "  %-12s %s\n", "images", "List local images");
     fprintf(stderr, "  %-12s %s\n", "pull", "Pull an image (e.g., lochs pull freebsd:15)");

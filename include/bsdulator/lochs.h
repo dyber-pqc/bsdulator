@@ -262,6 +262,9 @@ const char *lochs_zfs_get_pool(void);
 int lochs_zfs_volume_create(const char *name);
 int lochs_zfs_volume_destroy(const char *name);
 
+/* Container inspection (lochs_inspect.c) */
+int lochs_cmd_inspect(int argc, char **argv);
+
 /* Resource limits - cgroups v2 (lochs_cgroups.c) */
 int lochs_cmd_stats(int argc, char **argv);
 int lochs_cgroup_is_v2(void);

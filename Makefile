@@ -34,6 +34,7 @@ LOCHS_SRCS = $(SRCDIR)/lochs/lochs_main.c \
              $(SRCDIR)/lochs/lochs_network.c \
              $(SRCDIR)/lochs/lochs_volumes.c \
              $(SRCDIR)/lochs/lochs_cgroups.c \
+             $(SRCDIR)/lochs/lochs_inspect.c \
              $(SRCDIR)/lochs/lochs_storage.c \
              $(SRCDIR)/lochs/lochs_zfs.c
 
@@ -92,6 +93,7 @@ $(OBJDIR)/lochs/lochfile_parser.o: $(SRCDIR)/lochs/lochfile_parser.c $(INCDIR)/b
 $(OBJDIR)/lochs/lochs_network.o: $(SRCDIR)/lochs/lochs_network.c $(INCDIR)/bsdulator/lochs.h
 $(OBJDIR)/lochs/lochs_volumes.o: $(SRCDIR)/lochs/lochs_volumes.c $(INCDIR)/bsdulator/lochs.h
 $(OBJDIR)/lochs/lochs_cgroups.o: $(SRCDIR)/lochs/lochs_cgroups.c $(INCDIR)/bsdulator/lochs.h
+$(OBJDIR)/lochs/lochs_inspect.o: $(SRCDIR)/lochs/lochs_inspect.c $(INCDIR)/bsdulator/lochs.h
 $(OBJDIR)/lochs/lochs_storage.o: $(SRCDIR)/lochs/lochs_storage.c $(INCDIR)/bsdulator/lochs.h
 $(OBJDIR)/lochs/lochs_zfs.o: $(SRCDIR)/lochs/lochs_zfs.c $(INCDIR)/bsdulator/lochs.h
 
