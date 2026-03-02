@@ -37,7 +37,8 @@ LOCHS_SRCS = $(SRCDIR)/lochs/lochs_main.c \
              $(SRCDIR)/lochs/lochs_inspect.c \
              $(SRCDIR)/lochs/lochs_health.c \
              $(SRCDIR)/lochs/lochs_storage.c \
-             $(SRCDIR)/lochs/lochs_zfs.c
+             $(SRCDIR)/lochs/lochs_zfs.c \
+             $(SRCDIR)/lochs/lochs_dashboard.c
 
 # Lochs CLI object files
 LOCHS_OBJS = $(LOCHS_SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
@@ -98,6 +99,7 @@ $(OBJDIR)/lochs/lochs_inspect.o: $(SRCDIR)/lochs/lochs_inspect.c $(INCDIR)/bsdul
 $(OBJDIR)/lochs/lochs_health.o: $(SRCDIR)/lochs/lochs_health.c $(INCDIR)/bsdulator/lochs.h
 $(OBJDIR)/lochs/lochs_storage.o: $(SRCDIR)/lochs/lochs_storage.c $(INCDIR)/bsdulator/lochs.h
 $(OBJDIR)/lochs/lochs_zfs.o: $(SRCDIR)/lochs/lochs_zfs.c $(INCDIR)/bsdulator/lochs.h
+$(OBJDIR)/lochs/lochs_dashboard.o: $(SRCDIR)/lochs/lochs_dashboard.c $(INCDIR)/bsdulator/lochs.h $(SRCDIR)/lochs/lochs_dashboard_html.h
 
 # Clean
 clean:

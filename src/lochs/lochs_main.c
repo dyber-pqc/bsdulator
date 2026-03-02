@@ -40,6 +40,7 @@ static lochs_command_t commands[] = {
     {"diff",    "Show changes between snapshots",        lochs_cmd_diff},
     {"clone",   "Clone container from a snapshot",       lochs_cmd_clone},
     {"version", "Show version information",             lochs_cmd_version},
+    {"dashboard","Web management dashboard",            lochs_cmd_dashboard},
     {NULL, NULL, NULL}
 };
 
@@ -84,6 +85,7 @@ static void print_usage(const char *prog) {
 
     fprintf(stderr, "\n\033[1mOther:\033[0m\n");
     fprintf(stderr, "  %-12s %s\n", "version", "Show version information");
+    fprintf(stderr, "  %-12s %s\n", "dashboard", "Web management dashboard (port 8420)");
     
     fprintf(stderr, "\nRun '%s <command> --help' for more information.\n\n", prog);
 }

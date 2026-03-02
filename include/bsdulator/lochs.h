@@ -325,4 +325,7 @@ int lochs_health_status_read(const char *container_name,
                              int *restart_count);
 const char *lochs_health_state_str(lochs_health_state_t state);
 
+/* Web dashboard (lochs_dashboard.c) */
+int lochs_cmd_dashboard(int argc, char **argv);
+
 #endif /* LOCHS_H */
