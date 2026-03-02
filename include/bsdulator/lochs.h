@@ -35,16 +35,29 @@ typedef struct {
 } lochs_port_map_t;
 
 /* Volume mount */
+#define LOCHS_VOLUME_NAME_MAX 64
+
 typedef struct {
     char host_path[512];
     char container_path[512];
     int readonly;
+    char volume_name[LOCHS_VOLUME_NAME_MAX]; /* Non-empty = named volume */
 } lochs_volume_t;
 
 #define LOCHS_MAX_VOLUMES 16
 #define LOCHS_MAX_ENV 32
 #define LOCHS_MAX_NETWORKS 16
 #define LOCHS_NETWORK_NAME_MAX 64
+#define LOCHS_MAX_NAMED_VOLUMES 64
+
+/* Named volume (managed by Lochs) */
+typedef struct {
+    char name[LOCHS_VOLUME_NAME_MAX];
+    char path[LOCHS_MAX_PATH];
+    char zfs_dataset[LOCHS_MAX_PATH];
+    time_t created_at;
+    int active;
+} lochs_named_volume_t;
 
 /* Managed jail entry (extends raw bsd_jail_t) */
 typedef struct {
@@ -122,6 +135,8 @@ typedef struct {
     int entrypoint_argc;
     int expose_ports[32];
     int expose_count;
+    char volume_paths[16][512];         /* VOLUME directives */
+    int volume_path_count;
 } lochfile_t;
 
 /* lochs.yml service definition */
@@ -177,6 +192,17 @@ int lochs_network_teardown_container(const char *container_name);
 int lochs_networks_load(void);
 int lochs_networks_save(void);
 
+/* Named volume management */
+int lochs_cmd_volume(int argc, char **argv);
+int lochs_volume_create(const char *name);
+int lochs_volume_remove(const char *name);
+int lochs_volume_list(void);
+lochs_named_volume_t *lochs_volume_find(const char *name);
+const char *lochs_volume_get_path(const char *name);
+int lochs_volume_is_in_use(const char *name);
+int lochs_volumes_load(void);
+int lochs_volumes_save(void);
+
 /* Compose parser */
 int lochs_compose_parse(const char *path, lochs_compose_t *compose);
 void lochs_compose_free(lochs_compose_t *compose);
@@ -225,5 +251,7 @@ int lochs_zfs_rollback(const char *container, const char *snap_name);
 int lochs_zfs_diff(const char *container, const char *snap1, const char *snap2);
 int lochs_zfs_clone(const char *src_container, const char *snap_name, const char *new_name);
 const char *lochs_zfs_get_pool(void);
+int lochs_zfs_volume_create(const char *name);
+int lochs_zfs_volume_destroy(const char *name);
 
 #endif /* LOCHS_H */

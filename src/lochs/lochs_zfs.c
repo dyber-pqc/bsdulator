@@ -31,6 +31,7 @@
 #define ZFS_BASE_DS   "lochs"
 #define ZFS_IMAGES_DS "lochs/images"
 #define ZFS_CONTAINERS_DS "lochs/containers"
+#define ZFS_VOLUMES_DS "lochs/volumes"
 
 static char zfs_pool[256] = {0};
 
@@ -120,9 +121,9 @@ int lochs_zfs_init(void) {
     }
 
     char cmd[512];
-    const char *datasets[] = { ZFS_BASE_DS, ZFS_IMAGES_DS, ZFS_CONTAINERS_DS };
+    const char *datasets[] = { ZFS_BASE_DS, ZFS_IMAGES_DS, ZFS_CONTAINERS_DS, ZFS_VOLUMES_DS };
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         /* Check if dataset exists */
         snprintf(cmd, sizeof(cmd), "zfs list -Ho name '%s/%s' >/dev/null 2>&1", pool, datasets[i]);
         if (zfs_run(cmd) != 0) {
@@ -557,5 +558,57 @@ int lochs_zfs_clone(const char *src_container, const char *snap_name, const char
     }
 
     printf("Cloned %s@%s -> %s\n", src_container, snap_name, new_name);
+    return 0;
+}
+
+/*
+ * Create a ZFS dataset for a named volume.
+ */
+int lochs_zfs_volume_create(const char *name) {
+    const char *pool = lochs_zfs_get_pool();
+    if (!pool) return -1;
+
+    char dataset[512];
+    char mountpoint[512];
+    char cmd[2048];
+
+    snprintf(dataset, sizeof(dataset), "%s/%s/%s", pool, ZFS_VOLUMES_DS, name);
+    snprintf(mountpoint, sizeof(mountpoint), "/var/lib/lochs/zfs/volumes/%s", name);
+
+    /* Check if already exists */
+    snprintf(cmd, sizeof(cmd), "zfs list -Ho name '%s' >/dev/null 2>&1", dataset);
+    if (zfs_run(cmd) == 0) {
+        return 0;  /* Already exists */
+    }
+
+    /* Ensure parent dataset exists */
+    lochs_zfs_init();
+
+    snprintf(cmd, sizeof(cmd),
+             "zfs create -o mountpoint='%s' '%s'",
+             mountpoint, dataset);
+    if (zfs_run(cmd) != 0) {
+        fprintf(stderr, "Error: Failed to create ZFS volume dataset %s\n", dataset);
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Destroy a ZFS volume dataset.
+ */
+int lochs_zfs_volume_destroy(const char *name) {
+    const char *pool = lochs_zfs_get_pool();
+    if (!pool) return -1;
+
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), "zfs destroy '%s/%s/%s'",
+             pool, ZFS_VOLUMES_DS, name);
+    if (zfs_run(cmd) != 0) {
+        fprintf(stderr, "Warning: Failed to destroy ZFS volume dataset\n");
+        return -1;
+    }
+
     return 0;
 }

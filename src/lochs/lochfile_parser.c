@@ -74,7 +74,11 @@ typedef struct {
     
     char entrypoint[1024];
     char cmd[1024];
-    
+
+    /* Volume mount points */
+    char volume_paths[16][512];
+    int volume_count;
+
     /* Build context directory */
     char context_dir[512];
     
@@ -231,14 +235,44 @@ static int parse_line(lochfile_context_t *ctx, const char *line, int line_num) {
             ctx->label_count++;
         }
     }
-    else if (strcmp(directive, "VOLUME") == 0 ||
-             strcmp(directive, "ARG") == 0 ||
+    else if (strcmp(directive, "VOLUME") == 0) {
+        /* Parse VOLUME directive - declares default mount points */
+        /* Syntax: VOLUME /path  or  VOLUME ["/path1", "/path2"] */
+        if (args[0] == '[') {
+            /* JSON array format: ["/path1", "/path2"] */
+            char *copy = strdup(args);
+            char *p = copy + 1;  /* Skip [ */
+            char *end = strrchr(p, ']');
+            if (end) *end = '\0';
+            char *saveptr;
+            char *tok = strtok_r(p, ",", &saveptr);
+            while (tok && ctx->volume_count < 16) {
+                /* Strip whitespace and quotes */
+                while (*tok == ' ' || *tok == '"') tok++;
+                char *e = tok + strlen(tok) - 1;
+                while (e > tok && (*e == '"' || *e == ' ')) { *e = '\0'; e--; }
+                if (tok[0] == '/') {
+                    safe_strcpy(ctx->volume_paths[ctx->volume_count], tok, 512);
+                    ctx->volume_count++;
+                }
+                tok = strtok_r(NULL, ",", &saveptr);
+            }
+            free(copy);
+        } else if (args[0] == '/') {
+            /* Simple path format: VOLUME /data */
+            if (ctx->volume_count < 16) {
+                safe_strcpy(ctx->volume_paths[ctx->volume_count], args, 512);
+                ctx->volume_count++;
+            }
+        }
+    }
+    else if (strcmp(directive, "ARG") == 0 ||
              strcmp(directive, "SHELL") == 0 ||
              strcmp(directive, "STOPSIGNAL") == 0 ||
              strcmp(directive, "HEALTHCHECK") == 0 ||
              strcmp(directive, "ONBUILD") == 0) {
         /* Recognized but not implemented - just warn */
-        fprintf(stderr, "Lochfile:%d: Warning: %s not yet implemented, skipping\n", 
+        fprintf(stderr, "Lochfile:%d: Warning: %s not yet implemented, skipping\n",
                 line_num, directive);
     }
     else {
@@ -610,7 +644,16 @@ int lochs_build_from_lochfile(const char *lochfile_path, const char *context_dir
             }
             fprintf(meta, "\n");
         }
-        
+
+        /* Volumes */
+        if (ctx.volume_count > 0) {
+            fprintf(meta, "volumes=");
+            for (int i = 0; i < ctx.volume_count; i++) {
+                fprintf(meta, "%s%s", i > 0 ? "," : "", ctx.volume_paths[i]);
+            }
+            fprintf(meta, "\n");
+        }
+
         fclose(meta);
         printf("  ✓ Created .lochs_image.conf\n");
     }

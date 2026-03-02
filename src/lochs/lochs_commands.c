@@ -163,33 +163,47 @@ static int file_exists(const char *path) {
 static int parse_volume_mapping(const char *str, lochs_volume_t *vol) {
     char buf[1024];
     safe_strcpy(buf, str, sizeof(buf));
-    
+
     vol->readonly = 0;
-    
+    vol->volume_name[0] = '\0';
+
     /* Check for :ro suffix */
     char *ro = strstr(buf, ":ro");
     if (ro && (ro[3] == '\0' || ro[3] == ':')) {
         vol->readonly = 1;
         *ro = '\0';
     }
-    
-    /* Parse host:container */
+
+    /* Parse source:container */
     char *colon = strchr(buf, ':');
     if (!colon) {
-        /* No colon - use same path for both */
+        /* No colon - use same path for both (only valid for absolute paths) */
         safe_strcpy(vol->host_path, buf, sizeof(vol->host_path));
         safe_strcpy(vol->container_path, buf, sizeof(vol->container_path));
     } else {
         *colon = '\0';
-        safe_strcpy(vol->host_path, buf, sizeof(vol->host_path));
         safe_strcpy(vol->container_path, colon + 1, sizeof(vol->container_path));
+
+        if (buf[0] == '/') {
+            /* Absolute path = bind mount */
+            safe_strcpy(vol->host_path, buf, sizeof(vol->host_path));
+        } else {
+            /* Non-absolute path = named volume */
+            safe_strcpy(vol->volume_name, buf, sizeof(vol->volume_name));
+            vol->host_path[0] = '\0';  /* Resolved at start time */
+        }
     }
-    
-    /* Validate paths start with / */
-    if (vol->host_path[0] != '/' || vol->container_path[0] != '/') {
+
+    /* Validate container path starts with / */
+    if (vol->container_path[0] != '/') {
         return -1;
     }
-    
+
+    /* For bind mounts, validate host path starts with / */
+    if (vol->volume_name[0] == '\0' && vol->host_path[0] != '/') {
+        return -1;
+    }
+
     return 0;
 }
 
@@ -369,7 +383,7 @@ int lochs_cmd_create(int argc, char **argv) {
                 printf("  -i, --image <image>   Base image (default: freebsd:15)\n");
                 printf("  -I, --ip <addr>       IPv4 address for jail\n");
                 printf("  -p, --publish <port>  Publish port (host:container)\n");
-                printf("  -v, --volume <vol>    Mount volume (/host:/container[:ro])\n");
+                printf("  -v, --volume <vol>    Mount volume (name:/path or /host:/container[:ro])\n");
                 printf("  -e, --env <var>       Set environment variable (KEY=value)\n");
                 printf("  -N, --network <net>   Connect to network\n");
                 printf("  -P, --path <path>     Root filesystem path\n");
@@ -495,8 +509,14 @@ int lochs_cmd_create(int argc, char **argv) {
     if (volume_count > 0) {
         printf("  Volumes:\n");
         for (int i = 0; i < volume_count; i++) {
-            printf("    %s -> %s%s\n", volumes[i].host_path, volumes[i].container_path,
-                   volumes[i].readonly ? " (ro)" : "");
+            if (volumes[i].volume_name[0]) {
+                printf("    %s -> %s%s (named volume)\n",
+                       volumes[i].volume_name, volumes[i].container_path,
+                       volumes[i].readonly ? " (ro)" : "");
+            } else {
+                printf("    %s -> %s%s\n", volumes[i].host_path, volumes[i].container_path,
+                       volumes[i].readonly ? " (ro)" : "");
+            }
         }
     }
     if (env_count > 0) {
@@ -608,6 +628,31 @@ int lochs_cmd_start(int argc, char **argv) {
         }
     }
     
+    /* Resolve named volumes before mounting */
+    if (jail->volume_count > 0) {
+        lochs_volumes_load();
+        for (int i = 0; i < jail->volume_count; i++) {
+            lochs_volume_t *v = &jail->volumes[i];
+            if (v->volume_name[0] && v->host_path[0] == '\0') {
+                /* Named volume - resolve to host path */
+                const char *vpath = lochs_volume_get_path(v->volume_name);
+                if (!vpath) {
+                    /* Auto-create on first use (Docker behavior) */
+                    printf("  Creating volume '%s'...\n", v->volume_name);
+                    if (lochs_volume_create(v->volume_name) != 0) {
+                        fprintf(stderr, "Error: failed to create volume '%s'\n",
+                                v->volume_name);
+                        continue;
+                    }
+                    vpath = lochs_volume_get_path(v->volume_name);
+                }
+                if (vpath) {
+                    safe_strcpy(v->host_path, vpath, sizeof(v->host_path));
+                }
+            }
+        }
+    }
+
     /* Mount volumes before starting jail */
     if (jail->volume_count > 0) {
         printf("Mounting volumes...\n");
@@ -615,6 +660,13 @@ int lochs_cmd_start(int argc, char **argv) {
             lochs_volume_t *v = &jail->volumes[i];
             char mount_point[2048];
             char mount_cmd[4096];
+
+            /* Skip volumes that couldn't be resolved */
+            if (v->host_path[0] == '\0') {
+                fprintf(stderr, "  Warning: skipping unresolved volume '%s'\n",
+                        v->volume_name);
+                continue;
+            }
 
             /* Create mount point in container */
             snprintf(mount_point, sizeof(mount_point), "%s%s", jail->path, v->container_path);
@@ -626,8 +678,13 @@ int lochs_cmd_start(int argc, char **argv) {
             snprintf(mount_cmd, sizeof(mount_cmd),
                 "mount --bind '%s' '%s'", v->host_path, mount_point);
             if (system(mount_cmd) == 0) {
-                printf("  %s -> %s%s\n", v->host_path, v->container_path,
-                       v->readonly ? " (ro)" : "");
+                if (v->volume_name[0]) {
+                    printf("  %s (%s) -> %s%s\n", v->volume_name, v->host_path,
+                           v->container_path, v->readonly ? " (ro)" : "");
+                } else {
+                    printf("  %s -> %s%s\n", v->host_path, v->container_path,
+                           v->readonly ? " (ro)" : "");
+                }
 
                 /* Make read-only if requested */
                 if (v->readonly) {
