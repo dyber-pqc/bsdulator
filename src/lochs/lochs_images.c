@@ -128,121 +128,115 @@ static lochs_official_image_t official_images[] = {
         "nginx", "latest",
         DYBER_IMAGES_URL "/v1.0/nginx-1.26-freebsd15.0.txz",
         "nginx web server on FreeBSD",
-        55
+        178
     },
     {
         "nginx", "1.26",
         DYBER_IMAGES_URL "/v1.0/nginx-1.26-freebsd15.0.txz",
         "nginx 1.26 web server on FreeBSD",
-        55
+        178
     },
 
     /* postgresql */
     {
         "postgresql", "latest",
-        DYBER_IMAGES_URL "/v1.0/postgresql-16-freebsd15.0.txz",
-        "PostgreSQL 16 database on FreeBSD",
-        70
+        DYBER_IMAGES_URL "/v1.0/postgresql-latest-freebsd15.0.txz",
+        "PostgreSQL database on FreeBSD",
+        510
     },
     {
         "postgresql", "16",
-        DYBER_IMAGES_URL "/v1.0/postgresql-16-freebsd15.0.txz",
-        "PostgreSQL 16 database on FreeBSD",
-        70
-    },
-    {
-        "postgresql", "15",
-        DYBER_IMAGES_URL "/v1.0/postgresql-15-freebsd15.0.txz",
-        "PostgreSQL 15 database on FreeBSD",
-        70
+        DYBER_IMAGES_URL "/v1.0/postgresql-latest-freebsd15.0.txz",
+        "PostgreSQL database on FreeBSD",
+        510
     },
     {
         "postgres", "latest",
-        DYBER_IMAGES_URL "/v1.0/postgresql-16-freebsd15.0.txz",
-        "PostgreSQL 16 database on FreeBSD (alias)",
-        70
+        DYBER_IMAGES_URL "/v1.0/postgresql-latest-freebsd15.0.txz",
+        "PostgreSQL database on FreeBSD (alias)",
+        510
     },
 
     /* redis */
     {
         "redis", "latest",
-        DYBER_IMAGES_URL "/v1.0/redis-7.2-freebsd15.0.txz",
-        "Redis 7.2 in-memory data store on FreeBSD",
-        45
+        DYBER_IMAGES_URL "/v1.0/redis-latest-freebsd15.0.txz",
+        "Redis in-memory data store on FreeBSD",
+        176
     },
     {
         "redis", "7.2",
-        DYBER_IMAGES_URL "/v1.0/redis-7.2-freebsd15.0.txz",
-        "Redis 7.2 in-memory data store on FreeBSD",
-        45
+        DYBER_IMAGES_URL "/v1.0/redis-latest-freebsd15.0.txz",
+        "Redis in-memory data store on FreeBSD",
+        176
     },
 
     /* python */
     {
         "python", "latest",
-        DYBER_IMAGES_URL "/v1.0/python-3.11-freebsd15.0.txz",
-        "Python 3.11 runtime on FreeBSD",
-        60
+        DYBER_IMAGES_URL "/v1.0/python-latest-freebsd15.0.txz",
+        "Python runtime on FreeBSD",
+        214
     },
     {
         "python", "3.11",
-        DYBER_IMAGES_URL "/v1.0/python-3.11-freebsd15.0.txz",
-        "Python 3.11 runtime on FreeBSD",
-        60
+        DYBER_IMAGES_URL "/v1.0/python-latest-freebsd15.0.txz",
+        "Python runtime on FreeBSD",
+        214
     },
 
     /* node */
     {
         "node", "latest",
-        DYBER_IMAGES_URL "/v1.0/node-22-freebsd15.0.txz",
-        "Node.js 22 LTS runtime on FreeBSD",
-        65
+        DYBER_IMAGES_URL "/v1.0/node-latest-freebsd15.0.txz",
+        "Node.js LTS runtime on FreeBSD",
+        244
     },
     {
         "node", "22",
-        DYBER_IMAGES_URL "/v1.0/node-22-freebsd15.0.txz",
-        "Node.js 22 LTS runtime on FreeBSD",
-        65
+        DYBER_IMAGES_URL "/v1.0/node-latest-freebsd15.0.txz",
+        "Node.js LTS runtime on FreeBSD",
+        244
     },
     {
         "node", "lts",
-        DYBER_IMAGES_URL "/v1.0/node-22-freebsd15.0.txz",
-        "Node.js 22 LTS runtime on FreeBSD",
-        65
+        DYBER_IMAGES_URL "/v1.0/node-latest-freebsd15.0.txz",
+        "Node.js LTS runtime on FreeBSD",
+        244
     },
 
     /* go */
     {
         "go", "latest",
-        DYBER_IMAGES_URL "/v1.0/go-1.22-freebsd15.0.txz",
-        "Go 1.22 programming language on FreeBSD",
-        80
+        DYBER_IMAGES_URL "/v1.0/go-latest-freebsd15.0.txz",
+        "Go programming language on FreeBSD",
+        224
     },
     {
         "go", "1.22",
-        DYBER_IMAGES_URL "/v1.0/go-1.22-freebsd15.0.txz",
-        "Go 1.22 programming language on FreeBSD",
-        80
+        DYBER_IMAGES_URL "/v1.0/go-latest-freebsd15.0.txz",
+        "Go programming language on FreeBSD",
+        224
     },
     {
         "golang", "latest",
-        DYBER_IMAGES_URL "/v1.0/go-1.22-freebsd15.0.txz",
-        "Go 1.22 programming language on FreeBSD (alias)",
-        80
+        DYBER_IMAGES_URL "/v1.0/go-latest-freebsd15.0.txz",
+        "Go programming language on FreeBSD (alias)",
+        224
     },
 
     /* rust */
     {
         "rust", "latest",
-        DYBER_IMAGES_URL "/v1.0/rust-1.77-freebsd15.0.txz",
-        "Rust 1.77 programming language on FreeBSD",
-        85
+        DYBER_IMAGES_URL "/v1.0/rust-latest-freebsd15.0.txz",
+        "Rust programming language on FreeBSD",
+        178
     },
     {
         "rust", "1.77",
-        DYBER_IMAGES_URL "/v1.0/rust-1.77-freebsd15.0.txz",
-        "Rust 1.77 programming language on FreeBSD",
-        85
+        DYBER_IMAGES_URL "/v1.0/rust-latest-freebsd15.0.txz",
+        "Rust programming language on FreeBSD",
+        178
     },
 
     {NULL, NULL, NULL, NULL, 0}
@@ -356,7 +350,12 @@ static void parse_image_name(const char *name, char *repo, size_t repo_size,
         safe_strcpy(tag, colon + 1, tag_size);
     } else {
         safe_strcpy(repo, name, repo_size);
-        safe_strcpy(tag, "15", tag_size);  /* Default to latest stable */
+        /* Default tag: "15" for freebsd base, "latest" for everything else */
+        if (strcmp(repo, "freebsd") == 0) {
+            safe_strcpy(tag, "15", tag_size);
+        } else {
+            safe_strcpy(tag, "latest", tag_size);
+        }
     }
 }
 
