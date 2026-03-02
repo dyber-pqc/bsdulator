@@ -106,6 +106,14 @@ typedef struct {
     char cmd[1024];                   /* CMD from Lochfile */
     char entrypoint[1024];            /* ENTRYPOINT from Lochfile */
     char workdir[256];                /* WORKDIR from Lochfile */
+
+    /* Resource limits (cgroups v2) */
+    int cpus_millicores;              /* CPU limit in millicores (1000 = 1 CPU, 0 = unlimited) */
+    int64_t memory_limit;             /* Memory limit in bytes (0 = unlimited) */
+    int64_t memory_swap_limit;        /* Swap limit in bytes (0 = unlimited, -1 = same as memory) */
+    int pids_limit;                   /* Max PIDs (0 = unlimited) */
+    int cpu_weight;                   /* CPU weight 1-10000 (0 = default 100) */
+    int cgroup_applied;               /* 1 if cgroup limits are active */
 } lochs_jail_t;
 
 /* Network definition */
@@ -253,5 +261,21 @@ int lochs_zfs_clone(const char *src_container, const char *snap_name, const char
 const char *lochs_zfs_get_pool(void);
 int lochs_zfs_volume_create(const char *name);
 int lochs_zfs_volume_destroy(const char *name);
+
+/* Resource limits - cgroups v2 (lochs_cgroups.c) */
+int lochs_cmd_stats(int argc, char **argv);
+int lochs_cgroup_is_v2(void);
+int lochs_cgroup_init(void);
+int lochs_cgroup_create(const char *container_name);
+int lochs_cgroup_set_cpu(const char *container_name, int millicores, int weight);
+int lochs_cgroup_set_memory(const char *container_name, int64_t limit, int64_t swap);
+int lochs_cgroup_set_pids(const char *container_name, int limit);
+int lochs_cgroup_add_pid(const char *container_name, pid_t pid);
+int lochs_cgroup_destroy(const char *container_name);
+int lochs_cgroup_get_stats(const char *container_name);
+int lochs_cgroup_apply_limits(lochs_jail_t *jail);
+int lochs_cgroup_cleanup(lochs_jail_t *jail);
+int64_t lochs_parse_memory_size(const char *str);
+int lochs_parse_cpus(const char *str);
 
 #endif /* LOCHS_H */

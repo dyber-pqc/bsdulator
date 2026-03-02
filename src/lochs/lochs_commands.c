@@ -324,24 +324,36 @@ int lochs_cmd_create(int argc, char **argv) {
     char env_keys[LOCHS_MAX_ENV][64];
     char env_values[LOCHS_MAX_ENV][256];
     int env_count = 0;
-    
+
+    /* Resource limits */
+    int cpus_millicores = 0;
+    int64_t memory_limit = 0;
+    int64_t memory_swap_limit = 0;
+    int pids_limit = 0;
+    int cpu_weight = 0;
+
     static struct option long_options[] = {
-        {"image",   required_argument, 0, 'i'},
-        {"ip",      required_argument, 0, 'I'},
-        {"publish", required_argument, 0, 'p'},
-        {"path",    required_argument, 0, 'P'},
-        {"volume",  required_argument, 0, 'v'},
-        {"env",     required_argument, 0, 'e'},
-        {"network", required_argument, 0, 'N'},
-        {"vnet",    no_argument,       0, 'n'},
-        {"help",    no_argument,       0, 'h'},
+        {"image",       required_argument, 0, 'i'},
+        {"ip",          required_argument, 0, 'I'},
+        {"publish",     required_argument, 0, 'p'},
+        {"path",        required_argument, 0, 'P'},
+        {"volume",      required_argument, 0, 'v'},
+        {"env",         required_argument, 0, 'e'},
+        {"network",     required_argument, 0, 'N'},
+        {"vnet",        no_argument,       0, 'n'},
+        {"cpus",        required_argument, 0, 'c'},
+        {"memory",      required_argument, 0, 'm'},
+        {"memory-swap", required_argument, 0, 'S'},
+        {"pids-limit",  required_argument, 0, 'L'},
+        {"cpu-weight",  required_argument, 0, 'w'},
+        {"help",        no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
-    
+
     int opt;
     optind = 1;
-    
-    while ((opt = getopt_long(argc, argv, "i:I:p:P:v:e:N:nh", long_options, NULL)) != -1) {
+
+    while ((opt = getopt_long(argc, argv, "i:I:p:P:v:e:N:nc:m:S:L:w:h", long_options, NULL)) != -1) {
         switch (opt) {
             case 'i': image = optarg; break;
             case 'I': ip = optarg; break;
@@ -377,20 +389,65 @@ int lochs_cmd_create(int argc, char **argv) {
             case 'N': network = optarg; break;
             case 'P': path = optarg; break;
             case 'n': vnet = 1; break;
+            case 'c':
+                cpus_millicores = lochs_parse_cpus(optarg);
+                if (cpus_millicores < 0) {
+                    fprintf(stderr, "Error: invalid CPU value '%s'\n", optarg);
+                    fprintf(stderr, "Examples: --cpus 2, --cpus 0.5, --cpus 1.5\n");
+                    return 1;
+                }
+                break;
+            case 'm':
+                memory_limit = lochs_parse_memory_size(optarg);
+                if (memory_limit < 0) {
+                    fprintf(stderr, "Error: invalid memory value '%s'\n", optarg);
+                    fprintf(stderr, "Examples: --memory 512m, --memory 1g, --memory 256k\n");
+                    return 1;
+                }
+                break;
+            case 'S':
+                memory_swap_limit = lochs_parse_memory_size(optarg);
+                if (memory_swap_limit < 0) {
+                    fprintf(stderr, "Error: invalid swap value '%s'\n", optarg);
+                    return 1;
+                }
+                break;
+            case 'L':
+                pids_limit = atoi(optarg);
+                if (pids_limit <= 0) {
+                    fprintf(stderr, "Error: invalid PID limit '%s'\n", optarg);
+                    return 1;
+                }
+                break;
+            case 'w':
+                cpu_weight = atoi(optarg);
+                if (cpu_weight < 1 || cpu_weight > 10000) {
+                    fprintf(stderr, "Error: CPU weight must be 1-10000\n");
+                    return 1;
+                }
+                break;
             case 'h':
                 printf("Usage: lochs create <n> [options]\n\n");
                 printf("Options:\n");
-                printf("  -i, --image <image>   Base image (default: freebsd:15)\n");
-                printf("  -I, --ip <addr>       IPv4 address for jail\n");
-                printf("  -p, --publish <port>  Publish port (host:container)\n");
-                printf("  -v, --volume <vol>    Mount volume (name:/path or /host:/container[:ro])\n");
-                printf("  -e, --env <var>       Set environment variable (KEY=value)\n");
-                printf("  -N, --network <net>   Connect to network\n");
-                printf("  -P, --path <path>     Root filesystem path\n");
-                printf("  -n, --vnet            Enable virtual networking\n");
+                printf("  -i, --image <image>       Base image (default: freebsd:15)\n");
+                printf("  -I, --ip <addr>           IPv4 address for jail\n");
+                printf("  -p, --publish <port>      Publish port (host:container)\n");
+                printf("  -v, --volume <vol>        Mount volume (name:/path or /host:/container[:ro])\n");
+                printf("  -e, --env <var>           Set environment variable (KEY=value)\n");
+                printf("  -N, --network <net>       Connect to network\n");
+                printf("  -P, --path <path>         Root filesystem path\n");
+                printf("  -n, --vnet                Enable virtual networking\n");
+                printf("\nResource Limits (cgroups v2):\n");
+                printf("  -c, --cpus <n>            CPU limit (e.g., 2, 0.5, 1.5)\n");
+                printf("  -m, --memory <size>       Memory limit (e.g., 512m, 1g, 256k)\n");
+                printf("      --memory-swap <size>  Swap limit (default: 0 when memory set)\n");
+                printf("      --pids-limit <n>      Max number of processes\n");
+                printf("      --cpu-weight <n>      CPU scheduling weight (1-10000)\n");
                 printf("\nExamples:\n");
                 printf("  lochs create web -i freebsd:15 -p 8080:80\n");
                 printf("  lochs create app -v /data:/app/data -e DEBUG=1\n");
+                printf("  lochs create db --cpus 2 --memory 512m --pids-limit 200\n");
+                printf("  lochs create worker -c 0.5 -m 256m\n");
                 return 0;
             default:
                 return 1;
@@ -487,12 +544,20 @@ int lochs_cmd_create(int argc, char **argv) {
     if (network) {
         safe_strcpy(jail.network, network, sizeof(jail.network));
     }
-    
+
+    /* Store resource limits */
+    jail.cpus_millicores = cpus_millicores;
+    jail.memory_limit = memory_limit;
+    jail.memory_swap_limit = memory_swap_limit;
+    jail.pids_limit = pids_limit;
+    jail.cpu_weight = cpu_weight;
+    jail.cgroup_applied = 0;
+
     if (lochs_jail_add(&jail) != 0) {
         fprintf(stderr, "Error: failed to register container\n");
         return 1;
     }
-    
+
     printf("Created container '%s'\n", name);
     printf("  Image: %s\n", image);
     printf("  Base:  %s\n", jail.image_path);
@@ -528,6 +593,34 @@ int lochs_cmd_create(int argc, char **argv) {
     }
     if (network) {
         printf("  Network: %s\n", network);
+    }
+    if (cpus_millicores > 0 || memory_limit > 0 || pids_limit > 0) {
+        printf("  Limits:");
+        if (cpus_millicores > 0) {
+            int whole = cpus_millicores / 1000;
+            int frac = (cpus_millicores % 1000) / 100;
+            if (frac > 0) {
+                printf(" cpu=%d.%d", whole, frac);
+            } else {
+                printf(" cpu=%d", whole);
+            }
+        }
+        if (memory_limit > 0) {
+            if (memory_limit >= (int64_t)1024 * 1024 * 1024) {
+                printf(" mem=%.1fG",
+                       (double)memory_limit / (1024.0 * 1024.0 * 1024.0));
+            } else if (memory_limit >= 1024 * 1024) {
+                printf(" mem=%lldM",
+                       (long long)(memory_limit / (1024 * 1024)));
+            } else {
+                printf(" mem=%lldK",
+                       (long long)(memory_limit / 1024));
+            }
+        }
+        if (pids_limit > 0) {
+            printf(" pids=%d", pids_limit);
+        }
+        printf("\n");
     }
     printf("\nRun 'lochs start %s' to start the container.\n", name);
     
@@ -699,6 +792,12 @@ int lochs_cmd_start(int argc, char **argv) {
         }
     }
     
+    /* Apply cgroup resource limits before starting the jail */
+    if (jail->cpus_millicores > 0 || jail->memory_limit > 0 ||
+        jail->pids_limit > 0 || jail->cpu_weight > 0) {
+        lochs_cgroup_apply_limits(jail);
+    }
+
     /* Write environment file for container */
     if (jail->env_count > 0) {
         char env_file[2048];
@@ -712,22 +811,35 @@ int lochs_cmd_start(int argc, char **argv) {
             printf("Environment: %d variable(s) set\n", jail->env_count);
         }
     }
-    
+
     /*
      * Build the jail command using binaries FROM THE CONTAINER IMAGE.
-     * 
+     *
      * If container has network namespace, pass --netns to bsdulator.
      * BSDulator will enter the namespace in the child process AFTER
      * ptrace setup but BEFORE execve, avoiding ptrace conflicts.
-     * 
+     *
+     * If resource limits are active, we prefix the command with a
+     * cgroup migration: "echo $$ > /sys/fs/cgroup/lochs/<name>/cgroup.procs && ..."
+     * This moves the shell (and all child processes) into the cgroup
+     * BEFORE launching bsdulator, so the jail and all its processes
+     * inherit the resource limits.
+     *
      * Format: ./bsdulator [--netns <ns>] <ld-elf.so.1> <jail> -c name=X path=Y persist
      */
     char cmd[4096];
     int pos = 0;
-    
+
+    /* Prefix with cgroup migration if resource limits are active */
+    if (jail->cgroup_applied) {
+        pos = snprintf(cmd, sizeof(cmd),
+            "echo $$ > /sys/fs/cgroup/lochs/%s/cgroup.procs && ",
+            jail->name);
+    }
+
     /* Start with bsdulator and optional netns */
     if (jail->netns[0]) {
-        pos = snprintf(cmd, sizeof(cmd),
+        pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos,
             "./bsdulator --netns %s %s/libexec/ld-elf.so.1 %s/usr/sbin/jail -c name=%s path=%s",
             jail->netns,
             jail->path,
@@ -735,7 +847,7 @@ int lochs_cmd_start(int argc, char **argv) {
             jail->name,
             jail->path);
     } else {
-        pos = snprintf(cmd, sizeof(cmd),
+        pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos,
             "./bsdulator %s/libexec/ld-elf.so.1 %s/usr/sbin/jail -c name=%s path=%s",
             jail->path,
             jail->path,
@@ -795,19 +907,27 @@ int lochs_cmd_start(int argc, char **argv) {
     /* Auto-start CMD if configured */
     if (jail->cmd[0]) {
         printf("Running CMD: %s\n", jail->cmd);
-        
-        /* Build the exec command */
+
+        /* Build the exec command with cgroup migration if active */
         char exec_cmd[4096];
+        int epos = 0;
+
+        if (jail->cgroup_applied) {
+            epos = snprintf(exec_cmd, sizeof(exec_cmd),
+                "echo $$ > /sys/fs/cgroup/lochs/%s/cgroup.procs && ",
+                jail->name);
+        }
+
         if (jail->netns[0]) {
-            snprintf(exec_cmd, sizeof(exec_cmd),
+            snprintf(exec_cmd + epos, sizeof(exec_cmd) - (size_t)epos,
                 "./bsdulator --netns %s %s/libexec/ld-elf.so.1 %s/usr/sbin/jexec %s %s &",
                 jail->netns, jail->path, jail->path, jail->name, jail->cmd);
         } else {
-            snprintf(exec_cmd, sizeof(exec_cmd),
+            snprintf(exec_cmd + epos, sizeof(exec_cmd) - (size_t)epos,
                 "./bsdulator %s/libexec/ld-elf.so.1 %s/usr/sbin/jexec %s %s &",
                 jail->path, jail->path, jail->name, jail->cmd);
         }
-        
+
         int cmd_ret = system(exec_cmd);
         (void)cmd_ret;
     }
@@ -875,7 +995,7 @@ int lochs_cmd_stop(int argc, char **argv) {
     if (jail->network[0]) {
         lochs_network_teardown_container(name);
     }
-    
+
     /* Use jail -r from the container image */
     char cmd[4096];
     snprintf(cmd, sizeof(cmd),
@@ -883,9 +1003,9 @@ int lochs_cmd_stop(int argc, char **argv) {
         jail->path,
         jail->path,
         jail->name);
-    
+
     int ret = system(cmd);
-    
+
     if (ret == 0) {
         jail->state = JAIL_STATE_STOPPED;
         jail->jid = -1;
@@ -896,7 +1016,12 @@ int lochs_cmd_stop(int argc, char **argv) {
         jail->jid = -1;
         fprintf(stderr, "Warning: jail -r returned error, but marking as stopped\n");
     }
-    
+
+    /* Clean up cgroup resource limits */
+    if (jail->cgroup_applied) {
+        lochs_cgroup_cleanup(jail);
+    }
+
     /* Unmount overlay filesystem */
     if (jail->overlay_mounted) {
         lochs_storage_unmount_container(jail);
@@ -1050,49 +1175,85 @@ int lochs_cmd_ps(int argc, char **argv) {
         }
     }
     
-    printf("%-15s %-6s %-20s %-15s %-20s %s\n", 
-           "NAME", "JID", "IMAGE", "STATUS", "PORTS", "PATH");
-    printf("%-15s %-6s %-20s %-15s %-20s %s\n",
-           "----", "---", "-----", "------", "-----", "----");
-    
+    printf("%-15s %-6s %-20s %-15s %-20s %-15s %s\n",
+           "NAME", "JID", "IMAGE", "STATUS", "PORTS", "LIMITS", "PATH");
+    printf("%-15s %-6s %-20s %-15s %-20s %-15s %s\n",
+           "----", "---", "-----", "------", "-----", "------", "----");
+
     for (int i = 0; i < jail_count; i++) {
         lochs_jail_t *j = &jails[i];
         const char *state_str;
-        
+
         switch (j->state) {
             case JAIL_STATE_CREATED: state_str = "created"; break;
             case JAIL_STATE_RUNNING: state_str = "\033[32mrunning\033[0m"; break;
             case JAIL_STATE_STOPPED: state_str = "stopped"; break;
             default: state_str = "unknown"; break;
         }
-        
+
         char jid_str[16];
         if (j->jid > 0) {
             snprintf(jid_str, sizeof(jid_str), "%d", j->jid);
         } else {
             strcpy(jid_str, "-");
         }
-        
+
         /* Build ports string */
         char ports_str[64] = "-";
         if (j->port_count > 0) {
-            int pos = 0;
-            for (int p = 0; p < j->port_count && pos < (int)sizeof(ports_str) - 10; p++) {
-                if (p > 0) pos += snprintf(ports_str + pos, sizeof(ports_str) - (size_t)pos, ",");
-                pos += snprintf(ports_str + pos, sizeof(ports_str) - (size_t)pos, 
+            int ppos = 0;
+            for (int p = 0; p < j->port_count && ppos < (int)sizeof(ports_str) - 10; p++) {
+                if (p > 0) ppos += snprintf(ports_str + ppos, sizeof(ports_str) - (size_t)ppos, ",");
+                ppos += snprintf(ports_str + ppos, sizeof(ports_str) - (size_t)ppos,
                                "%d->%d", j->ports[p].host_port, j->ports[p].container_port);
             }
         }
-        
-        printf("%-15s %-6s %-20s %-15s %-20s %s\n",
+
+        /* Build resource limits string */
+        char limits_str[64] = "-";
+        if (j->cpus_millicores > 0 || j->memory_limit > 0 || j->pids_limit > 0) {
+            int lpos = 0;
+            if (j->cpus_millicores > 0) {
+                int whole = j->cpus_millicores / 1000;
+                int frac = (j->cpus_millicores % 1000) / 100;
+                if (frac > 0) {
+                    lpos += snprintf(limits_str + lpos, sizeof(limits_str) - (size_t)lpos,
+                                     "%d.%dc", whole, frac);
+                } else {
+                    lpos += snprintf(limits_str + lpos, sizeof(limits_str) - (size_t)lpos,
+                                     "%dc", whole);
+                }
+            }
+            if (j->memory_limit > 0) {
+                if (lpos > 0) limits_str[lpos++] = '/';
+                if (j->memory_limit >= (int64_t)1024 * 1024 * 1024) {
+                    lpos += snprintf(limits_str + lpos, sizeof(limits_str) - (size_t)lpos,
+                                     "%.0fG", (double)j->memory_limit / (1024.0*1024.0*1024.0));
+                } else if (j->memory_limit >= 1024 * 1024) {
+                    lpos += snprintf(limits_str + lpos, sizeof(limits_str) - (size_t)lpos,
+                                     "%lldM", (long long)(j->memory_limit / (1024*1024)));
+                } else {
+                    lpos += snprintf(limits_str + lpos, sizeof(limits_str) - (size_t)lpos,
+                                     "%lldK", (long long)(j->memory_limit / 1024));
+                }
+            }
+            if (j->pids_limit > 0) {
+                if (lpos > 0) limits_str[lpos++] = '/';
+                snprintf(limits_str + lpos, sizeof(limits_str) - (size_t)lpos,
+                         "%dp", j->pids_limit);
+            }
+        }
+
+        printf("%-15s %-6s %-20s %-15s %-20s %-15s %s\n",
                j->name,
                jid_str,
                j->image,
                state_str,
                ports_str,
+               limits_str,
                j->path);
     }
-    
+
     if (jail_count == 0) {
         printf("No containers. Run 'lochs create <n>' to create one.\n");
     }
