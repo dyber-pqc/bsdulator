@@ -1,4 +1,4 @@
-# BSDulator CI/CD Pipeline
+# Lochs CI/CD Pipeline
 name: CI
 
 on:
@@ -38,7 +38,7 @@ jobs:
             wget \
             curl
 
-      - name: Build BSDulator (${{ matrix.compiler }} - ${{ matrix.build_type }})
+      - name: Build (${{ matrix.compiler }} - ${{ matrix.build_type }})
         run: |
           if [ "${{ matrix.compiler }}" = "clang" ]; then
             export CC=clang
@@ -63,7 +63,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: matrix.compiler == 'gcc' && matrix.build_type == 'release'
         with:
-          name: bsdulator-linux-amd64
+          name: lochs-linux-amd64
           path: |
             bsdulator
             lochs
@@ -87,7 +87,7 @@ jobs:
             bridge-utils \
             wget
 
-      - name: Build BSDulator
+      - name: Build
         run: make
 
       - name: Run compatibility checker
@@ -165,7 +165,7 @@ jobs:
             wget \
             socat
 
-      - name: Build BSDulator
+      - name: Build
         run: make
 
       - name: Setup FreeBSD root

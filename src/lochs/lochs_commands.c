@@ -738,32 +738,33 @@ static void stop_port_forward(pid_t pid) {
  * Called from lochs_cmd_start() after overlay mount.
  */
 static int lochs_devfs_setup(lochs_jail_t *jail) {
-    char path[512], cmd[2048];
+    char cmd[2048];
     int r;
 
     /* Create /dev directory tree */
-    snprintf(path, sizeof(path), "%s/dev", jail->path);
-    snprintf(cmd, sizeof(cmd), "mkdir -p '%s/pts' '%s/fd' '%s/shm'",
-        path, path, path);
+    snprintf(cmd, sizeof(cmd), "mkdir -p '%s/dev/pts'", jail->path);
     r = system(cmd);
     if (r != 0) {
         fprintf(stderr, "Warning: failed to create /dev directories\n");
         return -1;
     }
+    snprintf(cmd, sizeof(cmd), "mkdir -p '%s/dev/fd'", jail->path);
+    r = system(cmd); (void)r;
+    snprintf(cmd, sizeof(cmd), "mkdir -p '%s/dev/shm'", jail->path);
+    r = system(cmd); (void)r;
 
     /* Bind-mount standard devices from host */
     static const char *devices[] = {
         "null", "zero", "random", "urandom", "tty", NULL
     };
     for (int i = 0; devices[i]; i++) {
-        char dev_path[600];
-        snprintf(dev_path, sizeof(dev_path), "%s/dev/%s", jail->path, devices[i]);
         /* Create target file for bind mount */
-        snprintf(cmd, sizeof(cmd), "touch '%s' 2>/dev/null", dev_path);
+        snprintf(cmd, sizeof(cmd), "touch '%s/dev/%s' 2>/dev/null",
+            jail->path, devices[i]);
         r = system(cmd); (void)r;
         /* Bind mount from host */
-        snprintf(cmd, sizeof(cmd), "mount --bind /dev/%s '%s' 2>/dev/null",
-            devices[i], dev_path);
+        snprintf(cmd, sizeof(cmd), "mount --bind /dev/%s '%s/dev/%s' 2>/dev/null",
+            devices[i], jail->path, devices[i]);
         r = system(cmd);
         if (r != 0) {
             fprintf(stderr, "  Warning: failed to mount /dev/%s\n", devices[i]);
@@ -780,19 +781,26 @@ static int lochs_devfs_setup(lochs_jail_t *jail) {
     snprintf(cmd, sizeof(cmd), "ln -sf pts/ptmx '%s/dev/ptmx' 2>/dev/null", jail->path);
     r = system(cmd); (void)r;
 
-    /* Create convenience symlinks */
+    /* Create convenience symlinks (one at a time to avoid buffer overflow) */
     snprintf(cmd, sizeof(cmd),
-        "ln -sf /proc/self/fd '%s/dev/fd' 2>/dev/null; "
-        "ln -sf /proc/self/fd/0 '%s/dev/stdin' 2>/dev/null; "
-        "ln -sf /proc/self/fd/1 '%s/dev/stdout' 2>/dev/null; "
-        "ln -sf /proc/self/fd/2 '%s/dev/stderr' 2>/dev/null",
-        jail->path, jail->path, jail->path, jail->path);
+        "ln -sf /proc/self/fd '%s/dev/fd' 2>/dev/null", jail->path);
+    r = system(cmd); (void)r;
+    snprintf(cmd, sizeof(cmd),
+        "ln -sf /proc/self/fd/0 '%s/dev/stdin' 2>/dev/null", jail->path);
+    r = system(cmd); (void)r;
+    snprintf(cmd, sizeof(cmd),
+        "ln -sf /proc/self/fd/1 '%s/dev/stdout' 2>/dev/null", jail->path);
+    r = system(cmd); (void)r;
+    snprintf(cmd, sizeof(cmd),
+        "ln -sf /proc/self/fd/2 '%s/dev/stderr' 2>/dev/null", jail->path);
     r = system(cmd); (void)r;
 
     /* Mount /proc if not already present */
     snprintf(cmd, sizeof(cmd),
-        "mkdir -p '%s/proc' && mount -t proc proc '%s/proc' 2>/dev/null",
-        jail->path, jail->path);
+        "mkdir -p '%s/proc'", jail->path);
+    r = system(cmd); (void)r;
+    snprintf(cmd, sizeof(cmd),
+        "mount -t proc proc '%s/proc' 2>/dev/null", jail->path);
     r = system(cmd); (void)r;
 
     printf("  Devices: /dev mounted\n");

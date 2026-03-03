@@ -1,4 +1,4 @@
-# BSDulator Release Workflow
+# Lochs Release Workflow
 name: Release
 
 on:
@@ -40,29 +40,29 @@ jobs:
       - name: Create release archive
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
-          mkdir -p dist/bsdulator-${VERSION}
+          mkdir -p dist/lochs-${VERSION}
           
           # Copy binaries
-          cp bsdulator lochs dist/bsdulator-${VERSION}/
+          cp bsdulator lochs dist/lochs-${VERSION}/
           
           # Copy documentation
-          cp README.md CHANGELOG.md LICENSE dist/bsdulator-${VERSION}/
+          cp README.md CHANGELOG.md LICENSE dist/lochs-${VERSION}/
           
           # Copy scripts
-          mkdir -p dist/bsdulator-${VERSION}/scripts
-          cp scripts/*.sh dist/bsdulator-${VERSION}/scripts/
-          chmod +x dist/bsdulator-${VERSION}/scripts/*.sh
+          mkdir -p dist/lochs-${VERSION}/scripts
+          cp scripts/*.sh dist/lochs-${VERSION}/scripts/
+          chmod +x dist/lochs-${VERSION}/scripts/*.sh
           
           # Copy docs
-          mkdir -p dist/bsdulator-${VERSION}/docs
-          cp docs/*.md dist/bsdulator-${VERSION}/docs/ 2>/dev/null || true
+          mkdir -p dist/lochs-${VERSION}/docs
+          cp docs/*.md dist/lochs-${VERSION}/docs/ 2>/dev/null || true
           
           # Create tarball
           cd dist
-          tar -czvf bsdulator-${VERSION}-linux-amd64.tar.gz bsdulator-${VERSION}
-          
+          tar -czvf lochs-${VERSION}-linux-amd64.tar.gz lochs-${VERSION}
+
           # Create checksum
-          sha256sum bsdulator-${VERSION}-linux-amd64.tar.gz > bsdulator-${VERSION}-linux-amd64.tar.gz.sha256
+          sha256sum lochs-${VERSION}-linux-amd64.tar.gz > lochs-${VERSION}-linux-amd64.tar.gz.sha256
 
       - name: Generate release notes
         id: release_notes
@@ -88,8 +88,8 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}
           files: |
-            dist/bsdulator-${{ steps.version.outputs.VERSION }}-linux-amd64.tar.gz
-            dist/bsdulator-${{ steps.version.outputs.VERSION }}-linux-amd64.tar.gz.sha256
+            dist/lochs-${{ steps.version.outputs.VERSION }}-linux-amd64.tar.gz
+            dist/lochs-${{ steps.version.outputs.VERSION }}-linux-amd64.tar.gz.sha256
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
@@ -130,8 +130,8 @@ jobs:
             ghcr.io/${{ github.repository }}:${{ steps.version.outputs.VERSION }}
             ghcr.io/${{ github.repository }}:latest
           labels: |
-            org.opencontainers.image.title=BSDulator
-            org.opencontainers.image.description=FreeBSD Binary Compatibility Layer for Linux
+            org.opencontainers.image.title=Lochs
+            org.opencontainers.image.description=FreeBSD Jail Management for Linux
             org.opencontainers.image.version=${{ steps.version.outputs.VERSION }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.licenses=Source-Available
