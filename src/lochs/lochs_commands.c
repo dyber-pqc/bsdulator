@@ -733,8 +733,104 @@ static void stop_port_forward(pid_t pid) {
 }
 
 /*
+ * Set up /dev devices inside the container filesystem.
+ * Uses bind mounts from the host so we don't need CAP_MKNOD.
+ * Called from lochs_cmd_start() after overlay mount.
+ */
+static int lochs_devfs_setup(lochs_jail_t *jail) {
+    char path[512], cmd[2048];
+    int r;
+
+    /* Create /dev directory tree */
+    snprintf(path, sizeof(path), "%s/dev", jail->path);
+    snprintf(cmd, sizeof(cmd), "mkdir -p '%s/pts' '%s/fd' '%s/shm'",
+        path, path, path);
+    r = system(cmd);
+    if (r != 0) {
+        fprintf(stderr, "Warning: failed to create /dev directories\n");
+        return -1;
+    }
+
+    /* Bind-mount standard devices from host */
+    static const char *devices[] = {
+        "null", "zero", "random", "urandom", "tty", NULL
+    };
+    for (int i = 0; devices[i]; i++) {
+        char dev_path[600];
+        snprintf(dev_path, sizeof(dev_path), "%s/dev/%s", jail->path, devices[i]);
+        /* Create target file for bind mount */
+        snprintf(cmd, sizeof(cmd), "touch '%s' 2>/dev/null", dev_path);
+        r = system(cmd); (void)r;
+        /* Bind mount from host */
+        snprintf(cmd, sizeof(cmd), "mount --bind /dev/%s '%s' 2>/dev/null",
+            devices[i], dev_path);
+        r = system(cmd);
+        if (r != 0) {
+            fprintf(stderr, "  Warning: failed to mount /dev/%s\n", devices[i]);
+        }
+    }
+
+    /* Mount devpts for PTY support */
+    snprintf(cmd, sizeof(cmd),
+        "mount -t devpts devpts '%s/dev/pts' -o newinstance,ptmxmode=0666 2>/dev/null",
+        jail->path);
+    r = system(cmd); (void)r;
+
+    /* Create /dev/ptmx symlink */
+    snprintf(cmd, sizeof(cmd), "ln -sf pts/ptmx '%s/dev/ptmx' 2>/dev/null", jail->path);
+    r = system(cmd); (void)r;
+
+    /* Create convenience symlinks */
+    snprintf(cmd, sizeof(cmd),
+        "ln -sf /proc/self/fd '%s/dev/fd' 2>/dev/null; "
+        "ln -sf /proc/self/fd/0 '%s/dev/stdin' 2>/dev/null; "
+        "ln -sf /proc/self/fd/1 '%s/dev/stdout' 2>/dev/null; "
+        "ln -sf /proc/self/fd/2 '%s/dev/stderr' 2>/dev/null",
+        jail->path, jail->path, jail->path, jail->path);
+    r = system(cmd); (void)r;
+
+    /* Mount /proc if not already present */
+    snprintf(cmd, sizeof(cmd),
+        "mkdir -p '%s/proc' && mount -t proc proc '%s/proc' 2>/dev/null",
+        jail->path, jail->path);
+    r = system(cmd); (void)r;
+
+    printf("  Devices: /dev mounted\n");
+    return 0;
+}
+
+/*
+ * Tear down /dev devices and /proc inside the container filesystem.
+ * Called from lochs_cmd_stop() before unmounting volumes/overlay.
+ */
+static void lochs_devfs_teardown(lochs_jail_t *jail) {
+    char cmd[2048];
+    int r;
+
+    /* Unmount /proc */
+    snprintf(cmd, sizeof(cmd), "umount '%s/proc' 2>/dev/null", jail->path);
+    r = system(cmd); (void)r;
+
+    /* Unmount devpts */
+    snprintf(cmd, sizeof(cmd), "umount '%s/dev/pts' 2>/dev/null", jail->path);
+    r = system(cmd); (void)r;
+
+    /* Unmount individual devices */
+    static const char *devices[] = {
+        "null", "zero", "random", "urandom", "tty", NULL
+    };
+    for (int i = 0; devices[i]; i++) {
+        snprintf(cmd, sizeof(cmd), "umount '%s/dev/%s' 2>/dev/null",
+            jail->path, devices[i]);
+        r = system(cmd); (void)r;
+    }
+
+    printf("  Devices: /dev unmounted\n");
+}
+
+/*
  * lochs start <n>
- * 
+ *
  * Starts a FreeBSD jail using the jail binary from the container's image.
  */
 int lochs_cmd_start(int argc, char **argv) {
@@ -872,6 +968,9 @@ int lochs_cmd_start(int argc, char **argv) {
             printf("Environment: %d variable(s) set\n", jail->env_count);
         }
     }
+
+    /* Set up /dev devices inside the container */
+    lochs_devfs_setup(jail);
 
     /*
      * Build the jail command using binaries FROM THE CONTAINER IMAGE.
@@ -1053,6 +1152,9 @@ int lochs_cmd_stop(int argc, char **argv) {
         }
     }
     
+    /* Tear down /dev devices */
+    lochs_devfs_teardown(jail);
+
     /* Unmount volumes */
     if (jail->volume_count > 0) {
         printf("Unmounting volumes...\n");

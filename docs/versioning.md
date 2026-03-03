@@ -1,6 +1,6 @@
 # Versioning Strategy
 
-BSDulator and Lochs follow [Semantic Versioning](https://semver.org/) (SemVer).
+Lochs follows [Semantic Versioning](https://semver.org/) (SemVer).
 
 ## Format
 
@@ -27,7 +27,7 @@ Version constants in source code should match:
 
 ## Pre-1.0
 
-While BSDulator is pre-1.0:
+While Lochs is pre-1.0:
 
 - The API and CLI are not guaranteed stable
 - Minor versions may include breaking changes

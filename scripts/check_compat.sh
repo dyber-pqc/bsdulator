@@ -1,7 +1,7 @@
 #!/bin/bash
 #
-# BSDulator Compatibility Check Script
-# Verifies system requirements for running BSDulator with full jail support
+# Lochs Compatibility Check Script
+# Verifies system requirements for running Lochs with full jail support
 #
 # Usage: ./scripts/check_compat.sh
 #
@@ -23,7 +23,7 @@ WARN=0
 print_header() {
     echo ""
     echo -e "${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║          BSDulator Compatibility Check                       ║${NC}"
+    echo -e "${BLUE}║          Lochs Compatibility Check                            ║${NC}"
     echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -57,7 +57,7 @@ check_os() {
     # Check if Linux
     if [[ "$(uname -s)" != "Linux" ]]; then
         check_fail "Not running Linux (found: $(uname -s))"
-        echo "       BSDulator requires Linux for ptrace and namespace support"
+        echo "       Lochs requires Linux for ptrace and namespace support"
         return 1
     fi
     check_pass "Running Linux"
@@ -148,7 +148,7 @@ check_kernel_features() {
                 check_pass "ptrace scope: 0 (unrestricted)"
                 ;;
             1)
-                check_pass "ptrace scope: 1 (restricted to children - OK for BSDulator)"
+                check_pass "ptrace scope: 1 (restricted to children - OK for Lochs)"
                 ;;
             2|3)
                 check_warn "ptrace scope: $PTRACE_SCOPE (restricted - may need CAP_SYS_PTRACE)"
@@ -276,7 +276,7 @@ check_freebsd_root() {
 
 check_bsdulator() {
     echo ""
-    echo -e "${BLUE}[BSDulator Binary]${NC}"
+    echo -e "${BLUE}[Lochs Binaries]${NC}"
     
     if [[ -x "./bsdulator" ]]; then
         check_pass "bsdulator binary: ./bsdulator"
@@ -306,9 +306,9 @@ print_summary() {
     
     if [[ $FAIL -eq 0 ]]; then
         if [[ $WARN -eq 0 ]]; then
-            echo -e "  ${GREEN}✓ System is fully compatible with BSDulator${NC}"
+            echo -e "  ${GREEN}✓ System is fully compatible with Lochs${NC}"
         else
-            echo -e "  ${GREEN}✓ System is compatible with BSDulator${NC}"
+            echo -e "  ${GREEN}✓ System is compatible with Lochs${NC}"
             echo -e "  ${YELLOW}  (some optional features may be limited)${NC}"
         fi
         echo ""

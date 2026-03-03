@@ -1,0 +1,17 @@
+lochs (0.3.6-1) unstable; urgency=medium
+
+  * Dashboard: bearer token authentication and login modal
+  * Dashboard: TLS support via socat proxy (--ssl-cert/--ssl-key)
+  * Dashboard: network and volume CRUD from web UI
+  * Dashboard: Lochfile editor and build page
+  * Dashboard: resource history charts (CPU/memory/PIDs)
+  * CLI: lochs cp — copy files between host and container
+  * CLI: lochs export/import — tar-based container snapshots
+  * CLI: lochs push — push images to OCI registries
+  * BSDulator: /dev device emulation (/dev/null, /dev/random, etc.)
+  * BSDulator: kqueue/kevent stub framework
+  * BSDulator: improved signal handling (sigaction, sigprocmask)
+  * Infrastructure: systemd service file
+  * Infrastructure: REST API documentation (docs/api.md)
+
+ -- Zachary Kleckner <zach@lochs.dev>  Mon, 03 Mar 2026 00:00:00 +0000

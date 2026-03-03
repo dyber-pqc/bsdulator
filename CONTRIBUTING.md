@@ -1,6 +1,6 @@
-# Contributing to BSDulator
+# Contributing to Lochs
 
-First off, thank you for considering contributing to BSDulator! It's people like you that make BSDulator such a great tool for the FreeBSD and Linux communities.
+First off, thank you for considering contributing to Lochs! It's people like you that make Lochs such a great tool for the FreeBSD and Linux communities.
 
 ## Table of Contents
 
@@ -357,4 +357,4 @@ By contributing, you agree that your contributions will be licensed under the pr
 
 ---
 
-Thank you for contributing to BSDulator! 🎉
+Thank you for contributing to Lochs! 🎉

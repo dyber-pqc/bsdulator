@@ -86,9 +86,9 @@ install_deps() {
     ok "Dependencies installed"
 }
 
-# Download and build BSDulator + Lochs from latest release or source
+# Download and build Lochs from latest release or source
 install_binaries() {
-    info "Installing BSDulator engine and Lochs CLI..."
+    info "Installing Lochs..."
 
     # Try to download pre-built release first
     LATEST_TAG=$(wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' || echo "")
@@ -102,8 +102,7 @@ install_binaries() {
             install -m 755 "${TMPDIR}"/bsdulator-*/bsdulator "$INSTALL_DIR/bsdulator"
             install -m 755 "${TMPDIR}"/bsdulator-*/lochs "$INSTALL_DIR/lochs"
             rm -rf "$TMPDIR"
-            ok "BSDulator engine installed (${LATEST_TAG})"
-            ok "Lochs CLI installed"
+            ok "Lochs installed (${LATEST_TAG})"
             return
         fi
 
@@ -125,8 +124,7 @@ install_binaries() {
     cd /
     rm -rf "$TMPDIR"
 
-    ok "BSDulator engine installed (built from source)"
-    ok "Lochs CLI installed"
+    ok "Lochs installed (built from source)"
 }
 
 # Download FreeBSD base system

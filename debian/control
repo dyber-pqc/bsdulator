@@ -1,0 +1,25 @@
+Source: lochs
+Section: admin
+Priority: optional
+Maintainer: Zachary Kleckner <zach@lochs.dev>
+Build-Depends: debhelper-compat (= 13), gcc, make
+Standards-Version: 4.6.0
+Homepage: https://lochs.dev
+
+Package: lochs
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: socat
+Description: FreeBSD jail management for Linux
+ Lochs is a Docker-like container management CLI for running FreeBSD
+ jails on Linux. It includes the bsdulator engine for ptrace-based
+ FreeBSD syscall translation.
+ .
+ Features include:
+  - Run FreeBSD binaries natively on Linux
+  - Jail creation, networking, and volume management
+  - Image pull/push with OCI-compatible registries
+  - Web dashboard with REST API on port 8420
+  - Compose files for multi-container orchestration
+  - ZFS snapshot integration
+  - Cgroup v2 resource limits and health checks

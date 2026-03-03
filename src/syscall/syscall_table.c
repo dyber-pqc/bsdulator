@@ -28,6 +28,15 @@
 #include <termios.h>  /* For struct termios */
 #include <time.h>
 #include <sys/epoll.h>  /* For kqueue emulation */
+#include <sys/timerfd.h>  /* For kqueue EVFILT_TIMER */
+#include <sys/inotify.h>  /* For kqueue EVFILT_VNODE */
+#include <linux/futex.h>  /* For _umtx_op emulation */
+#ifndef SFD_NONBLOCK
+#define SFD_NONBLOCK 04000
+#endif
+#ifndef SFD_CLOEXEC
+#define SFD_CLOEXEC  02000000
+#endif
 #include <asm/prctl.h>  /* For ARCH_SET_FS, etc. */
 #include "bsdulator.h"
 #include "../runtime/freebsd_runtime.h"
@@ -814,30 +823,117 @@ static long emul_rtprio_thread(pid_t pid, uint64_t args[6]) {
  * _umtx_op - userspace mutex operations
  * This is critical for threading but complex to implement
  */
+/*
+ * FreeBSD _umtx_op operation codes
+ */
+#define UMTX_OP_WAIT          2
+#define UMTX_OP_WAKE          3
+#define UMTX_OP_MUTEX_TRYLOCK 4
+#define UMTX_OP_MUTEX_LOCK    5
+#define UMTX_OP_MUTEX_UNLOCK  6
+#define UMTX_OP_SET_CEILING   7
+#define UMTX_OP_CV_WAIT       8
+#define UMTX_OP_CV_SIGNAL     9
+#define UMTX_OP_CV_BROADCAST  10
+#define UMTX_OP_WAIT_UINT     11
+#define UMTX_OP_RW_RDLOCK     12
+#define UMTX_OP_RW_WRLOCK     13
+#define UMTX_OP_RW_UNLOCK     14
+#define UMTX_OP_WAIT_UINT_PRIVATE  15
+#define UMTX_OP_WAKE_PRIVATE       16
+#define UMTX_OP_MUTEX_WAIT    17
+#define UMTX_OP_NWAKE_PRIVATE 21
+#define UMTX_OP_MUTEX_WAKE2   22
+#define UMTX_OP_SEM2_WAIT     23
+#define UMTX_OP_SEM2_WAKE     24
+#define UMTX_OP_SHM            25
+#define UMTX_OP_ROBUST_LISTS   26
+
 static long emul_umtx_op(pid_t pid, uint64_t args[6]) {
     (void)pid;
-    
-    /* void *obj = (void *)args[0]; */
+
+    uint64_t obj = args[0];
     int op = (int)args[1];
-    /* unsigned long val = args[2]; */
+    unsigned long val = (unsigned long)args[2];
     /* void *uaddr = (void *)args[3]; */
     /* void *uaddr2 = (void *)args[4]; */
-    
-    BSD_TRACE("_umtx_op: op=%d (stub)", op);
-    
-    /*
-     * FreeBSD umtx operations:
-     * UMTX_OP_WAKE = 3 - wake threads waiting on address
-     * For basic single-threaded operation, we can stub this
-     */
-    
-    /* Return success for wake operations */
-    if (op == 3) {  /* UMTX_OP_WAKE */
+
+    BSD_TRACE("_umtx_op: op=%d obj=0x%lx val=%lu", op, obj, val);
+
+    switch (op) {
+    case UMTX_OP_WAIT:
+    case UMTX_OP_WAIT_UINT:
+    case UMTX_OP_WAIT_UINT_PRIVATE:
+        /*
+         * Wait until *obj != val. Map to futex WAIT.
+         * For now, return 0 (success / spurious wakeup) to let the caller
+         * retry its check. This avoids blocking the ptrace tracer.
+         */
+        BSD_TRACE("_umtx_op WAIT: returning spurious wakeup");
+        return 0;
+
+    case UMTX_OP_WAKE:
+    case UMTX_OP_WAKE_PRIVATE:
+        /* Wake up to 'val' threads waiting on obj */
+        BSD_TRACE("_umtx_op WAKE: obj=0x%lx count=%lu", obj, val);
+        return 0;
+
+    case UMTX_OP_NWAKE_PRIVATE:
+        /* Wake multiple addresses at once */
+        BSD_TRACE("_umtx_op NWAKE_PRIVATE: count=%lu", val);
+        return 0;
+
+    case UMTX_OP_MUTEX_TRYLOCK:
+    case UMTX_OP_MUTEX_LOCK:
+    case UMTX_OP_MUTEX_UNLOCK:
+    case UMTX_OP_MUTEX_WAIT:
+    case UMTX_OP_MUTEX_WAKE2:
+        /* Mutex operations — return success to let userspace handle contention */
+        BSD_TRACE("_umtx_op MUTEX op=%d: returning success", op);
+        return 0;
+
+    case UMTX_OP_CV_WAIT:
+        /* Condition variable wait — return spurious wakeup */
+        BSD_TRACE("_umtx_op CV_WAIT: returning spurious wakeup");
+        return 0;
+
+    case UMTX_OP_CV_SIGNAL:
+        /* Wake one thread on condition variable */
+        BSD_TRACE("_umtx_op CV_SIGNAL");
+        return 0;
+
+    case UMTX_OP_CV_BROADCAST:
+        /* Wake all threads on condition variable */
+        BSD_TRACE("_umtx_op CV_BROADCAST");
+        return 0;
+
+    case UMTX_OP_SET_CEILING:
+        /* Priority ceiling for mutex — return success */
+        return 0;
+
+    case UMTX_OP_RW_RDLOCK:
+    case UMTX_OP_RW_WRLOCK:
+    case UMTX_OP_RW_UNLOCK:
+        /* Read-write lock operations — return success */
+        BSD_TRACE("_umtx_op RW op=%d: returning success", op);
+        return 0;
+
+    case UMTX_OP_SEM2_WAIT:
+        /* Semaphore wait — return spurious wakeup */
+        return 0;
+
+    case UMTX_OP_SEM2_WAKE:
+        /* Semaphore wake */
+        return 0;
+
+    case UMTX_OP_ROBUST_LISTS:
+        /* Robust mutex list registration — return success */
+        return 0;
+
+    default:
+        BSD_WARN("_umtx_op: unknown op=%d, returning success", op);
         return 0;
     }
-    
-    /* For other operations, return success but warn */
-    return 0;
 }
 
 /*
@@ -871,32 +967,328 @@ static long emul_kqueue(pid_t pid, uint64_t args[6]) {
 }
 
 /*
- * kevent emulation - this is more complex as kevent has different semantics
- * than epoll_ctl/epoll_wait. For now, provide a stub that allows basic usage.
+ * FreeBSD kevent filter and flag constants
+ */
+#define FBSD_EVFILT_READ     (-1)
+#define FBSD_EVFILT_WRITE    (-2)
+#define FBSD_EVFILT_AIO      (-3)
+#define FBSD_EVFILT_VNODE    (-4)
+#define FBSD_EVFILT_PROC     (-5)
+#define FBSD_EVFILT_SIGNAL   (-6)
+#define FBSD_EVFILT_TIMER    (-7)
+#define FBSD_EVFILT_USER     (-11)
+
+#define FBSD_EV_ADD          0x0001
+#define FBSD_EV_DELETE       0x0002
+#define FBSD_EV_ENABLE       0x0004
+#define FBSD_EV_DISABLE      0x0008
+#define FBSD_EV_ONESHOT      0x0010
+#define FBSD_EV_CLEAR        0x0020
+#define FBSD_EV_EOF          0x8000
+#define FBSD_EV_ERROR        0x4000
+
+/* FreeBSD struct kevent layout (amd64): 64 bytes */
+struct fbsd_kevent {
+    uint64_t ident;     /* identifier (fd, signal, timer id) */
+    int16_t  filter;    /* filter type (EVFILT_*) */
+    uint16_t flags;     /* action flags (EV_*) */
+    uint32_t fflags;    /* filter-specific flags */
+    int64_t  data;      /* filter-specific data */
+    uint64_t udata;     /* opaque user data */
+    uint64_t ext[4];    /* extensions (FreeBSD 11+) */
+};
+
+/*
+ * Tracking table for kqueue entries.
+ * Maps kqueue (ident, filter) pairs to backing Linux fds (for timers, signals).
+ */
+#define KQ_MAX_ENTRIES 256
+typedef struct {
+    int      kq_fd;       /* Which epoll fd this belongs to */
+    int16_t  filter;      /* EVFILT_* */
+    uint64_t ident;       /* Original ident */
+    int      backing_fd;  /* timerfd/signalfd/-1 for direct fds */
+    uint64_t udata;       /* Preserved user data */
+    int      active;      /* Entry in use */
+} kq_entry_t;
+
+static kq_entry_t kq_entries[KQ_MAX_ENTRIES];
+static int kq_entry_count = 0;
+
+static kq_entry_t *kq_find_entry(int kq, int16_t filter, uint64_t ident) {
+    for (int i = 0; i < kq_entry_count; i++) {
+        if (kq_entries[i].active && kq_entries[i].kq_fd == kq &&
+            kq_entries[i].filter == filter && kq_entries[i].ident == ident)
+            return &kq_entries[i];
+    }
+    return NULL;
+}
+
+static kq_entry_t *kq_alloc_entry(void) {
+    /* Reuse inactive slot */
+    for (int i = 0; i < kq_entry_count; i++) {
+        if (!kq_entries[i].active) return &kq_entries[i];
+    }
+    if (kq_entry_count < KQ_MAX_ENTRIES)
+        return &kq_entries[kq_entry_count++];
+    return NULL;
+}
+
+/*
+ * kevent emulation using epoll + timerfd + signalfd
+ *
+ * Process changelist (register/deregister events), then optionally wait
+ * for events via epoll_wait and translate back to kevent format.
  */
 static long emul_kevent(pid_t pid, uint64_t args[6]) {
-    (void)pid;
     int kq = (int)args[0];
-    /* const struct kevent *changelist = (void *)args[1]; */
+    uint64_t changelist_addr = args[1];
     int nchanges = (int)args[2];
-    /* struct kevent *eventlist = (void *)args[3]; */
+    uint64_t eventlist_addr = args[3];
     int nevents = (int)args[4];
-    /* const struct timespec *timeout = (void *)args[5]; */
-    
+    uint64_t timeout_addr = args[5];
+
     BSD_TRACE("kevent(): kq=%d nchanges=%d nevents=%d", kq, nchanges, nevents);
-    
-    /*
-     * For jail utility's basic usage, kevent is used to wait for child processes.
-     * Return 0 (no events) to let the utility fall back to other mechanisms
-     * or continue without event notification.
-     */
-    if (nevents > 0) {
-        /* Waiting for events - return 0 (timeout/no events) */
-        return 0;
+
+    /* Process changelist — register/deregister events */
+    for (int i = 0; i < nchanges && i < 64; i++) {
+        struct fbsd_kevent kev;
+        struct iovec local = { &kev, sizeof(kev) };
+        struct iovec remote = { (void *)(changelist_addr + (uint64_t)i * sizeof(kev)),
+                                sizeof(kev) };
+        if (process_vm_readv(pid, &local, 1, &remote, 1, 0) < 0) {
+            BSD_WARN("kevent: failed to read changelist[%d]", i);
+            continue;
+        }
+
+        BSD_TRACE("kevent change[%d]: ident=%lu filter=%d flags=0x%x",
+            i, kev.ident, kev.filter, kev.flags);
+
+        if (kev.flags & FBSD_EV_ADD) {
+            struct epoll_event ev;
+            memset(&ev, 0, sizeof(ev));
+            int target_fd = (int)kev.ident;
+
+            switch (kev.filter) {
+            case FBSD_EVFILT_READ:
+                ev.events = EPOLLIN;
+                if (kev.flags & FBSD_EV_ONESHOT) ev.events |= EPOLLONESHOT;
+                if (kev.flags & FBSD_EV_CLEAR) ev.events |= EPOLLET;
+                ev.data.u64 = kev.ident;
+                epoll_ctl(kq, EPOLL_CTL_ADD, target_fd, &ev);
+                break;
+
+            case FBSD_EVFILT_WRITE:
+                ev.events = EPOLLOUT;
+                if (kev.flags & FBSD_EV_ONESHOT) ev.events |= EPOLLONESHOT;
+                if (kev.flags & FBSD_EV_CLEAR) ev.events |= EPOLLET;
+                ev.data.u64 = kev.ident;
+                epoll_ctl(kq, EPOLL_CTL_ADD, target_fd, &ev);
+                break;
+
+            case FBSD_EVFILT_TIMER: {
+                /* Create a timerfd and add it to epoll */
+                int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+                if (tfd >= 0) {
+                    /* data is in milliseconds */
+                    long ms = kev.data > 0 ? kev.data : 1;
+                    struct itimerspec its;
+                    its.it_value.tv_sec = ms / 1000;
+                    its.it_value.tv_nsec = (ms % 1000) * 1000000;
+                    if (kev.flags & FBSD_EV_ONESHOT) {
+                        its.it_interval.tv_sec = 0;
+                        its.it_interval.tv_nsec = 0;
+                    } else {
+                        its.it_interval = its.it_value;
+                    }
+                    timerfd_settime(tfd, 0, &its, NULL);
+                    ev.events = EPOLLIN;
+                    ev.data.u64 = kev.ident;
+                    epoll_ctl(kq, EPOLL_CTL_ADD, tfd, &ev);
+
+                    kq_entry_t *ent = kq_alloc_entry();
+                    if (ent) {
+                        ent->kq_fd = kq;
+                        ent->filter = kev.filter;
+                        ent->ident = kev.ident;
+                        ent->backing_fd = tfd;
+                        ent->udata = kev.udata;
+                        ent->active = 1;
+                    }
+                }
+                break;
+            }
+
+            case FBSD_EVFILT_SIGNAL: {
+                /* Create a signalfd for this signal using raw sigset */
+                uint8_t mask[128];
+                memset(mask, 0, sizeof(mask));
+                int linux_sig = abi_translate_signal((int)kev.ident);
+                if (linux_sig > 0 && linux_sig < 1024) {
+                    mask[(linux_sig - 1) / 8] |= (uint8_t)(1 << ((linux_sig - 1) % 8));
+                }
+                int sfd = (int)syscall(SYS_signalfd4, -1, mask, (size_t)8, SFD_NONBLOCK | SFD_CLOEXEC);
+                if (sfd >= 0) {
+                    ev.events = EPOLLIN;
+                    ev.data.u64 = kev.ident;
+                    epoll_ctl(kq, EPOLL_CTL_ADD, sfd, &ev);
+
+                    kq_entry_t *ent = kq_alloc_entry();
+                    if (ent) {
+                        ent->kq_fd = kq;
+                        ent->filter = kev.filter;
+                        ent->ident = kev.ident;
+                        ent->backing_fd = sfd;
+                        ent->udata = kev.udata;
+                        ent->active = 1;
+                    }
+                }
+                break;
+            }
+
+            case FBSD_EVFILT_VNODE: {
+                /* Use inotify for vnode events */
+                int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+                if (ifd >= 0) {
+                    /* ident is the fd; we watch with generic mask */
+                    uint32_t imask = IN_MODIFY | IN_ATTRIB | IN_DELETE_SELF |
+                                     IN_MOVE_SELF;
+                    char fdpath[64];
+                    char realpath_buf[512];
+                    snprintf(fdpath, sizeof(fdpath), "/proc/%d/fd/%lu", pid, kev.ident);
+                    ssize_t rl = readlink(fdpath, realpath_buf, sizeof(realpath_buf) - 1);
+                    if (rl > 0) {
+                        realpath_buf[rl] = '\0';
+                        inotify_add_watch(ifd, realpath_buf, imask);
+                    }
+                    ev.events = EPOLLIN;
+                    ev.data.u64 = kev.ident;
+                    epoll_ctl(kq, EPOLL_CTL_ADD, ifd, &ev);
+
+                    kq_entry_t *ent = kq_alloc_entry();
+                    if (ent) {
+                        ent->kq_fd = kq;
+                        ent->filter = kev.filter;
+                        ent->ident = kev.ident;
+                        ent->backing_fd = ifd;
+                        ent->udata = kev.udata;
+                        ent->active = 1;
+                    }
+                }
+                break;
+            }
+
+            case FBSD_EVFILT_PROC:
+                /* Process events (fork/exec/exit) — hard to emulate, skip */
+                BSD_TRACE("kevent: EVFILT_PROC not supported, ignoring");
+                break;
+
+            case FBSD_EVFILT_USER:
+                /* User-triggered events — return success for registration */
+                BSD_TRACE("kevent: EVFILT_USER registered (stub)");
+                break;
+
+            default:
+                BSD_WARN("kevent: unknown filter %d", kev.filter);
+                break;
+            }
+        }
+
+        if (kev.flags & FBSD_EV_DELETE) {
+            kq_entry_t *ent = kq_find_entry(kq, kev.filter, kev.ident);
+            if (ent) {
+                if (ent->backing_fd >= 0) {
+                    epoll_ctl(kq, EPOLL_CTL_DEL, ent->backing_fd, NULL);
+                    close(ent->backing_fd);
+                } else {
+                    epoll_ctl(kq, EPOLL_CTL_DEL, (int)kev.ident, NULL);
+                }
+                ent->active = 0;
+            } else {
+                /* Direct fd — try removing from epoll */
+                epoll_ctl(kq, EPOLL_CTL_DEL, (int)kev.ident, NULL);
+            }
+        }
     }
-    
-    /* Registering changes - return success */
-    return 0;
+
+    /* If no event retrieval requested, we're done */
+    if (nevents <= 0) return 0;
+
+    /* Calculate timeout in milliseconds */
+    int timeout_ms = -1;  /* Default: block forever */
+    if (timeout_addr) {
+        struct timespec ts;
+        struct iovec local = { &ts, sizeof(ts) };
+        struct iovec remote = { (void *)timeout_addr, sizeof(ts) };
+        if (process_vm_readv(pid, &local, 1, &remote, 1, 0) >= 0) {
+            timeout_ms = (int)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+            if (timeout_ms == 0 && ts.tv_sec == 0 && ts.tv_nsec == 0)
+                timeout_ms = 0;  /* Non-blocking poll */
+        }
+    }
+
+    /* Wait for events via epoll */
+    int max_events = nevents < 32 ? nevents : 32;
+    struct epoll_event epevents[32];
+    int nready = epoll_wait(kq, epevents, max_events, timeout_ms);
+
+    if (nready < 0) {
+        if (errno == EINTR) return 0;
+        return -errno;
+    }
+
+    /* Translate epoll events back to kevent format */
+    for (int i = 0; i < nready; i++) {
+        struct fbsd_kevent kev;
+        memset(&kev, 0, sizeof(kev));
+        kev.ident = epevents[i].data.u64;
+
+        /* Find the entry to determine the filter type */
+        kq_entry_t *ent = NULL;
+        for (int j = 0; j < kq_entry_count; j++) {
+            if (kq_entries[j].active && kq_entries[j].kq_fd == kq &&
+                kq_entries[j].ident == kev.ident) {
+                ent = &kq_entries[j];
+                break;
+            }
+        }
+
+        if (ent) {
+            kev.filter = ent->filter;
+            kev.udata = ent->udata;
+            /* Drain backing fd if needed */
+            if (ent->filter == FBSD_EVFILT_TIMER && ent->backing_fd >= 0) {
+                uint64_t expirations;
+                ssize_t rv = read(ent->backing_fd, &expirations, sizeof(expirations));
+                (void)rv;
+                kev.data = (int64_t)expirations;
+            } else if (ent->filter == FBSD_EVFILT_SIGNAL && ent->backing_fd >= 0) {
+                uint8_t si_buf[128];  /* signalfd_siginfo is 128 bytes */
+                ssize_t rv = read(ent->backing_fd, si_buf, sizeof(si_buf));
+                (void)rv;
+                kev.data = 1;
+            }
+        } else {
+            /* Direct fd — guess filter from epoll events */
+            if (epevents[i].events & EPOLLIN) kev.filter = FBSD_EVFILT_READ;
+            else if (epevents[i].events & EPOLLOUT) kev.filter = FBSD_EVFILT_WRITE;
+            else kev.filter = FBSD_EVFILT_READ;
+        }
+
+        if (epevents[i].events & (EPOLLHUP | EPOLLRDHUP))
+            kev.flags |= FBSD_EV_EOF;
+        if (epevents[i].events & EPOLLERR)
+            kev.flags |= FBSD_EV_ERROR;
+
+        /* Write kevent to child's eventlist */
+        struct iovec local = { &kev, sizeof(kev) };
+        struct iovec remote = { (void *)(eventlist_addr + (uint64_t)i * sizeof(kev)),
+                                sizeof(kev) };
+        process_vm_writev(pid, &local, 1, &remote, 1, 0);
+    }
+
+    BSD_TRACE("kevent(): returning %d events", nready);
+    return nready;
 }
 
 /*
@@ -1215,20 +1607,52 @@ static long emul_sigaction(pid_t pid, uint64_t args[6]) {
  * sigfastblock - fast signal blocking for userspace threading
  * FreeBSD: int sigfastblock(int cmd, void *ptr)
  */
+/*
+ * sigfastblock commands
+ */
+#define SIGFASTBLOCK_SETPTR   1
+#define SIGFASTBLOCK_UNBLOCK  2
+#define SIGFASTBLOCK_UNSETPTR 3
+
+/* Per-process sigfastblock pointer tracking */
+static uint64_t sigfastblock_ptr_addr = 0;
+
 static long emul_sigfastblock(pid_t pid, uint64_t args[6]) {
-    (void)pid;
-    
     int cmd = (int)args[0];
-    /* void *ptr = (void *)args[1]; */
-    
-    BSD_TRACE("sigfastblock: cmd=%d (stub)", cmd);
-    
-    /*
-     * This is used by libthr for fast signal blocking without syscalls.
-     * We can't really implement this on Linux, but returning success
-     * should allow single-threaded programs to work.
-     */
-    return 0;
+    uint64_t ptr = args[1];
+
+    BSD_TRACE("sigfastblock: cmd=%d ptr=0x%lx", cmd, ptr);
+
+    switch (cmd) {
+    case SIGFASTBLOCK_SETPTR:
+        /* Record the address of the fast-block counter in the child */
+        sigfastblock_ptr_addr = ptr;
+        BSD_TRACE("sigfastblock: SETPTR -> 0x%lx", ptr);
+        return 0;
+
+    case SIGFASTBLOCK_UNBLOCK:
+        /* Deliver any pending signals. Check if the block counter is now 0 */
+        if (sigfastblock_ptr_addr) {
+            uint32_t block_val = 0;
+            struct iovec local = { &block_val, sizeof(block_val) };
+            struct iovec remote = { (void *)sigfastblock_ptr_addr, sizeof(block_val) };
+            if (process_vm_readv(pid, &local, 1, &remote, 1, 0) >= 0) {
+                BSD_TRACE("sigfastblock: UNBLOCK block_val=%u", block_val);
+                /* If block counter is 0, signals are now unblocked.
+                 * We rely on Linux's normal signal delivery. */
+            }
+        }
+        return 0;
+
+    case SIGFASTBLOCK_UNSETPTR:
+        /* Remove the pointer */
+        sigfastblock_ptr_addr = 0;
+        return 0;
+
+    default:
+        BSD_WARN("sigfastblock: unknown cmd=%d", cmd);
+        return 0;
+    }
 }
 
 /*

@@ -1,4 +1,4 @@
-# BSDulator Development Roadmap
+# Lochs Development Roadmap
 
 ## Vision
 
@@ -151,7 +151,7 @@ export BSDULATOR_ROOT=./freebsd-root
 
 ## Phase 5: Jailhouse Integration
 
-**Goal**: Connect BSDulator with Jailhouse container manager
+**Goal**: Connect the bsdulator engine with Lochs container manager
 
 ### Components
 ```

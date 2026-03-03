@@ -100,7 +100,7 @@ make
 
 ### WSL2 (Windows Subsystem for Linux)
 
-BSDulator requires WSL2. WSL1 does not support the Linux namespaces needed for jail features.
+Lochs requires WSL2. WSL1 does not support the Linux namespaces needed for jail features.
 
 ```bash
 # Verify you are on WSL2
@@ -164,10 +164,10 @@ sudo make uninstall
 
 ```bash
 # Build the image
-docker build -t bsdulator .
+docker build -t lochs .
 
 # Run with a FreeBSD root filesystem
-docker run --privileged -v /path/to/freebsd-root:/opt/bsdulator/freebsd-root bsdulator \
+docker run --privileged -v /path/to/freebsd-root:/opt/bsdulator/freebsd-root lochs \
     ./freebsd-root/libexec/ld-elf.so.1 ./freebsd-root/bin/echo "Hello"
 ```
 
@@ -175,7 +175,7 @@ docker run --privileged -v /path/to/freebsd-root:/opt/bsdulator/freebsd-root bsd
 
 ## FreeBSD Root Filesystem
 
-BSDulator needs a FreeBSD base system to provide the libraries and binaries it runs.
+Lochs needs a FreeBSD base system to provide the libraries and binaries it runs.
 
 ### Automatic Setup
 
@@ -195,7 +195,7 @@ If you prefer to set it up manually:
    mkdir -p freebsd-root
    tar -xf base.txz -C freebsd-root
    ```
-3. Point BSDulator at it:
+3. Point the engine at it:
    ```bash
    ./bsdulator -r /path/to/freebsd-root ./freebsd-root/bin/echo "Hello"
    # Or use the environment variable
@@ -259,7 +259,7 @@ Your system may restrict ptrace. Fix with:
 echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
 ```
 
-To make it permanent, add `kernel.yama.ptrace_scope = 0` to `/etc/sysctl.d/99-bsdulator.conf`.
+To make it permanent, add `kernel.yama.ptrace_scope = 0` to `/etc/sysctl.d/99-lochs.conf`.
 
 ### Namespace operations fail
 

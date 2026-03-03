@@ -1,8 +1,8 @@
-# BSDulator Architecture
+# Lochs Architecture
 
 ## Overview
 
-BSDulator is a FreeBSD binary compatibility layer for Linux. It allows FreeBSD executables to run on Linux by intercepting system calls and translating them to their Linux equivalents.
+Lochs uses the bsdulator engine internally — a FreeBSD binary compatibility layer for Linux. It allows FreeBSD executables to run on Linux by intercepting system calls and translating them to their Linux equivalents.
 
 ## Execution Flow
 

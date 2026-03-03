@@ -1,0 +1,19 @@
+[Unit]
+Description=Lochs Dashboard - FreeBSD Jail Management Web UI
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+ExecStart=/usr/local/bin/lochs dashboard
+ExecStop=/usr/local/bin/lochs dashboard stop
+PIDFile=/var/lib/lochs/dashboard.pid
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=lochs
+StateDirectory=lochs
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

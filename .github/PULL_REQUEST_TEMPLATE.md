@@ -23,7 +23,7 @@ Fixes #
 
 <!-- Mark relevant options with [x] -->
 
-- [ ] BSDulator core (syscall translation)
+- [ ] Engine core (bsdulator)
 - [ ] Lochs CLI
 - [ ] Jail management
 - [ ] Networking (VNET)

@@ -2,7 +2,7 @@
 
 <img src="lochs-logo.png" alt="Lochs" width="280">
 
-# BSDulator + Lochs
+# Lochs
 
 **FreeBSD containers, everywhere.**
 
@@ -24,7 +24,7 @@ Run FreeBSD jails on Linux with Docker-like simplicity.
 curl -fsSL https://lochs.dev/install.sh | sudo bash
 ```
 
-This installs the BSDulator engine, the Lochs CLI, and fetches the FreeBSD 15.0-RELEASE base system.
+This installs Lochs, the bsdulator engine, and fetches the FreeBSD 15.0-RELEASE base system.
 
 ## Quick Start
 
@@ -49,15 +49,13 @@ $ lochs rm webserver
 
 ## What Is This?
 
-**BSDulator** is a FreeBSD binary compatibility layer for Linux. It intercepts FreeBSD system calls via ptrace and translates them to Linux equivalents in real time — no VMs, no emulation overhead. Think Wine for FreeBSD, or the inverse of FreeBSD's Linuxulator.
+**Lochs** (pronounced "locks", like the Scottish lakes) is a Docker-like container management CLI for FreeBSD jails on Linux. It provides familiar commands (`run`, `exec`, `ps`, `stop`) and brings FreeBSD's jail isolation system — the original container technology (2000, 13 years before Docker) — to any Linux host.
 
-**Lochs** (pronounced "locks", like the Scottish lakes) is a Docker-like CLI built on top of BSDulator. It provides familiar container management commands (`run`, `exec`, `ps`, `stop`) for FreeBSD jails running on Linux.
-
-Together, they bring FreeBSD's jail isolation system — the original container technology (2000, 13 years before Docker) — to any Linux host.
+Under the hood, Lochs uses the **bsdulator** engine, a FreeBSD binary compatibility layer that intercepts system calls via ptrace and translates them to Linux equivalents in real time — no VMs, no emulation overhead. Think Wine for FreeBSD, or the inverse of FreeBSD's Linuxulator.
 
 ## Features
 
-### BSDulator Engine
+### Engine (bsdulator)
 - **222 syscalls** translated or emulated ([full matrix](docs/syscalls.md))
 - **Static and dynamic** FreeBSD binary support
 - **FreeBSD jail syscalls** — `jail`, `jail_get`, `jail_set`, `jail_attach`, `jail_remove`
@@ -114,9 +112,9 @@ make
 
 See [docs/INSTALL.md](docs/INSTALL.md) for platform-specific instructions (Fedora, Arch, Alpine, WSL2, Docker).
 
-## BSDulator Direct Usage
+## Engine Direct Usage
 
-For low-level access without the Lochs CLI:
+For low-level access using the bsdulator engine directly:
 
 ```bash
 # Static binaries
@@ -238,8 +236,8 @@ bsdulator/
 | [Quick Start](docs/quickstart.md) | 5-minute getting started guide |
 | [Installation](docs/INSTALL.md) | Platform-specific install instructions |
 | [Syscall Matrix](docs/syscalls.md) | Complete syscall support reference |
-| [Architecture](docs/architecture.md) | How BSDulator works under the hood |
-| [Lochs Guide](LOCHS.md) | Full Lochs CLI documentation |
+| [Architecture](docs/architecture.md) | How Lochs works under the hood |
+| [Lochs Guide](LOCHS.md) | Full CLI documentation |
 | [Contributing](CONTRIBUTING.md) | How to contribute |
 | [Changelog](CHANGELOG.md) | Release history |
 

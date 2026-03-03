@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# BSDulator Test Suite
+# Lochs Test Suite
 #
 
 BSDULATOR="./bsdulator"
@@ -29,14 +29,14 @@ warn() {
 }
 
 echo "================================================"
-echo "BSDulator Test Suite"
+echo "Lochs Test Suite"
 echo "================================================"
 echo ""
 
 # Check if bsdulator exists
 if [ ! -x "${BSDULATOR}" ]; then
     echo "Error: ${BSDULATOR} not found or not executable"
-    echo "Run 'make' first to build BSDulator"
+    echo "Run 'make' first to build Lochs"
     exit 1
 fi
 

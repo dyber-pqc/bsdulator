@@ -1,6 +1,6 @@
 # Release Checklist
 
-Use this checklist when preparing a new BSDulator/Lochs release.
+Use this checklist when preparing a new Lochs release.
 
 ## Pre-Release
 
@@ -152,7 +152,7 @@ git push origin main --tags
 This triggers `.github/workflows/release.yml` which:
 - Builds release binaries (`bsdulator`, `lochs`)
 - Strips binaries
-- Creates a tarball: `bsdulator-v0.X.Y-linux-amd64.tar.gz`
+- Creates a tarball: `lochs-v0.X.Y-linux-amd64.tar.gz`
 - Generates SHA256 checksum
 - Extracts changelog for release notes
 - Creates a GitHub Release
@@ -165,7 +165,7 @@ This triggers `.github/workflows/release.yml` which:
 - [ ] Release appears at https://github.com/dyber-pqc/bsdulator/releases
 - [ ] Tarball and checksum are attached
 - [ ] Release notes match CHANGELOG entry
-- [ ] Docker image is pushed (check `ghcr.io/dyber-pqc/bsdulator:0.X.Y`)
+- [ ] Docker image is pushed (check `ghcr.io/dyber-pqc/lochs:0.X.Y`)
 
 ### 14. Update lochs.dev Install Script (if needed)
 

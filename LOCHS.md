@@ -31,7 +31,7 @@ FreeBSD jails were the original container technology (introduced in 2000, 13 yea
 
 | Problem | Lochs Solution |
 |---------|----------------|
-| "We have legacy FreeBSD apps but Linux infrastructure" | Run FreeBSD binaries natively on Linux via BSDulator |
+| "We have legacy FreeBSD apps but Linux infrastructure" | Run FreeBSD binaries natively on Linux via the bsdulator engine |
 | "Docker's security model isn't strong enough" | FreeBSD jails provide kernel-level isolation with 24+ years of hardening |
 | "I need FreeBSD's networking stack (pf, CARP)" | Full FreeBSD userland including firewall and HA tools |
 | "ZFS is better than overlayfs" | Native ZFS support on FreeBSD, emulated datasets on Linux |
@@ -62,9 +62,9 @@ FreeBSD jails were the original container technology (introduced in 2000, 13 yea
 - **🔥 pf Firewall** — FreeBSD's packet filter available in jails
 
 ### Cross-Platform
-- **🐧 Linux** — Via BSDulator syscall translation (ptrace-based)
+- **🐧 Linux** — Via bsdulator engine syscall translation (ptrace-based)
 - **🍎 macOS** — Via lightweight FreeBSD VM (Hypervisor.framework)
-- **🪟 Windows** — Via WSL2 + BSDulator or Hyper-V VM
+- **🪟 Windows** — Via WSL2 + bsdulator engine or Hyper-V VM
 - **😈 FreeBSD** — Native jail support (no translation needed)
 
 ### Developer Experience  
@@ -133,7 +133,7 @@ FreeBSD jails were the original container technology (introduced in 2000, 13 yea
 | Component | Description |
 |-----------|-------------|
 | **Lochs CLI** | User-facing command-line interface |
-| **BSDulator** | FreeBSD syscall translation layer for Linux (ptrace-based) |
+| **bsdulator engine** | FreeBSD syscall translation layer for Linux (ptrace-based) |
 | **Image Manager** | Pulls, stores, and manages FreeBSD filesystem images |
 | **Container Manager** | Creates, starts, stops jail instances |
 | **Network Manager** | Configures bridges, veth pairs, IP assignment |
@@ -919,9 +919,9 @@ echo '{"registries": ["myregistry.local:5000"]}' > ~/.lochs/config.json
 
 ---
 
-## BSDulator (Technical Deep Dive)
+## Engine (Technical Deep Dive)
 
-BSDulator is the syscall translation engine that enables FreeBSD binaries to run on Linux.
+The bsdulator engine is the syscall translation engine that enables FreeBSD binaries to run on Linux.
 
 ### How It Works
 
@@ -959,12 +959,12 @@ BSDulator is the syscall translation engine that enables FreeBSD binaries to run
 |----------|----------|-------------------|
 | **Direct** | exit, read, write | Number translation only |
 | **Translated** | open, stat, mmap | Number + argument translation |
-| **Emulated** | jail_*, sysctl, kqueue | Full emulation in BSDulator |
+| **Emulated** | jail_*, sysctl, kqueue | Full emulation in the engine |
 | **Unsupported** | Mach ports, DTrace | Returns ENOSYS |
 
 ### Supported Syscalls
 
-BSDulator supports 200+ FreeBSD syscalls including:
+The engine supports 200+ FreeBSD syscalls including:
 
 - **File I/O**: open, read, write, close, lseek, pread, pwrite, fstat, fstatat
 - **Process**: fork, vfork, execve, wait4, exit, getpid, getppid
@@ -978,7 +978,7 @@ BSDulator supports 200+ FreeBSD syscalls including:
 
 ### Performance
 
-| Operation | Native FreeBSD | BSDulator on Linux | Overhead |
+| Operation | Native FreeBSD | Lochs on Linux | Overhead |
 |-----------|---------------|-------------------|----------|
 | syscall (getpid) | 0.3 µs | 2.1 µs | 7x |
 | file read (4KB) | 1.2 µs | 1.8 µs | 1.5x |
@@ -1246,12 +1246,12 @@ make lint
 - [x] Image pull from registry  
 - [x] exec into running containers
 - [x] Static IP assignment
-- [x] BSDulator syscall translation
-- [x] JID tracking sync between Lochs and BSDulator
+- [x] Engine syscall translation
+- [x] JID tracking sync
 
 ### v0.3 (Current - Completed)
 - [x] **Lochfile build system** — `FROM`, `COPY`, `ENV`, `LABEL`, `EXPOSE`, `CMD`, `WORKDIR`
-- [x] **RUN directive** — Execute FreeBSD commands during image build via BSDulator
+- [x] **RUN directive** — Execute FreeBSD commands during image build via the engine
 - [x] **lochs.yml compose support** — `up`, `down`, `ps`, `exec`, dependency resolution
 - [x] **Port forwarding** — `-p host:container` with socat
 - [x] **Volume mounts** — `-v /host:/container[:ro]` with bind mounts
@@ -1373,11 +1373,11 @@ See [CHANGELOG.md](CHANGELOG.md) for the full changelog.
 - Each container gets its own Linux netns (`lochs_<n>`)
 - Isolated eth0 interface with assigned IP from subnet pool
 - veth pair connects container netns to host bridge
-- BSDulator `--netns` flag for namespace entry
+- Engine `--netns` flag for namespace entry
 - Child process enters netns after ptrace setup, before execve
 
 **Fixed:**
-- Segfault when running BSDulator inside `ip netns exec` wrapper
+- Segfault when running the bsdulator engine inside `ip netns exec` wrapper
 - veth pair creation order and interface configuration
 
 ### v0.3.2 (February 2026)
@@ -1413,7 +1413,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full changelog.
 - Image registration for built images
 
 **Fixes:**
-- JID tracking sync between Lochs and BSDulator state files
+- JID tracking sync between Lochs state files
 - Structure alignment fix for jail state file reading
 - State file persistence in compose (parent reload after child save)
 
@@ -1425,7 +1425,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full changelog.
 - exec into running containers
 - Static IP assignment
 - VNET support via Linux network namespaces
-- BSDulator syscall translation (200+ syscalls)
+- Engine syscall translation (200+ syscalls)
 
 ---
 

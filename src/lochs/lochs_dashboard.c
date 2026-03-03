@@ -37,7 +37,7 @@
 #define DASHBOARD_PID_FILE      "/var/lib/lochs/dashboard.pid"
 #define DASHBOARD_LOG_FILE      "/var/lib/lochs/dashboard.log"
 #define DASHBOARD_MAX_REQUEST   8192
-#define DASHBOARD_MAX_RESPONSE  131072
+#define DASHBOARD_MAX_RESPONSE  262144
 
 #define IMAGES_DB_FILE     "/var/lib/lochs/images.dat"
 #define IMAGES_MAGIC       0x4C494D47
@@ -62,6 +62,21 @@ typedef struct {
 } dashboard_image_t;
 
 static volatile sig_atomic_t dashboard_running = 1;
+
+/* Resolved path to our own binary, used by popen() so the daemon
+ * works even when /usr/local/bin isn't in PATH.  Filled once at
+ * startup by resolve_self(). */
+static char lochs_bin[256] = "lochs";
+
+static void resolve_self(void) {
+    ssize_t n = readlink("/proc/self/exe", lochs_bin, sizeof(lochs_bin) - 1);
+    if (n > 0) {
+        lochs_bin[n] = '\0';
+    } else {
+        /* Fallback: bare name (already initialised) */
+        memcpy(lochs_bin, "lochs", 6);
+    }
+}
 
 /* ====================================================================
  * Helpers
@@ -148,17 +163,106 @@ static long long cgroup_read_cpu_usec(const char *container) {
 }
 
 /* ====================================================================
+ * Stats History Ring Buffer (Phase 6A)
+ * ==================================================================== */
+
+#define STATS_HISTORY_MAX 120   /* ~6 min at 3s polling */
+#define STATS_MAX_CONTAINERS 32
+
+typedef struct {
+    time_t timestamp;
+    long long cpu_usec;
+    long long memory_bytes;
+    long long pids;
+} stats_entry_t;
+
+typedef struct {
+    char name[LOCHS_MAX_NAME];
+    stats_entry_t entries[STATS_HISTORY_MAX];
+    int head;    /* next write position */
+    int count;   /* entries stored */
+} stats_history_t;
+
+static stats_history_t stats_histories[STATS_MAX_CONTAINERS];
+static int stats_history_count = 0;
+
+static stats_history_t *stats_history_get(const char *name) {
+    for (int i = 0; i < stats_history_count; i++) {
+        if (strcmp(stats_histories[i].name, name) == 0)
+            return &stats_histories[i];
+    }
+    if (stats_history_count >= STATS_MAX_CONTAINERS) return NULL;
+    stats_history_t *h = &stats_histories[stats_history_count++];
+    memset(h, 0, sizeof(*h));
+    safe_strcpy(h->name, name, sizeof(h->name));
+    return h;
+}
+
+static void stats_history_record(const char *name, long long cpu, long long mem, long long pids_val) {
+    stats_history_t *h = stats_history_get(name);
+    if (!h) return;
+    stats_entry_t *e = &h->entries[h->head];
+    e->timestamp = time(NULL);
+    e->cpu_usec = cpu;
+    e->memory_bytes = mem;
+    e->pids = pids_val;
+    h->head = (h->head + 1) % STATS_HISTORY_MAX;
+    if (h->count < STATS_HISTORY_MAX) h->count++;
+}
+
+/* ====================================================================
  * HTTP helpers
  * ==================================================================== */
 
 typedef struct {
     char method[8];
     char path[512];
+    char query[256];        /* Query string (after ?) */
+    char body[4096];        /* POST body */
+    int body_len;
     int content_length;
+    char authorization[128]; /* Authorization header value */
 } http_request_t;
 
+/* Extract a quoted string value from JSON: "key":"value" → value */
+static int json_get_str(const char *json, const char *key, char *out, int max) {
+    out[0] = '\0';
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *p = strstr(json, needle);
+    if (!p) return -1;
+    p += strlen(needle);
+    /* Skip :, whitespace, and opening quote */
+    while (*p && (*p == ':' || *p == ' ' || *p == '\t')) p++;
+    if (*p == '"') {
+        p++;
+        int i = 0;
+        while (*p && *p != '"' && i < max - 1) {
+            if (*p == '\\' && *(p + 1)) { p++; }
+            out[i++] = *p++;
+        }
+        out[i] = '\0';
+        return i;
+    }
+    /* Handle boolean/number (unquoted) */
+    int i = 0;
+    while (*p && *p != ',' && *p != '}' && *p != ' ' && i < max - 1)
+        out[i++] = *p++;
+    out[i] = '\0';
+    return i;
+}
+
+/* Validate a string: only safe chars for shell use */
+static int is_safe_name(const char *s) {
+    for (const char *p = s; *p; p++) {
+        if (!(*p >= 'a' && *p <= 'z') && !(*p >= 'A' && *p <= 'Z') &&
+            !(*p >= '0' && *p <= '9') && *p != '-' && *p != '_' &&
+            *p != '.' && *p != ':' && *p != '/') return 0;
+    }
+    return 1;
+}
+
 static int parse_request(const char *raw, int raw_len, http_request_t *req) {
-    (void)raw_len;
     memset(req, 0, sizeof(*req));
 
     /* Parse request line: METHOD /path HTTP/1.x */
@@ -178,13 +282,42 @@ static int parse_request(const char *raw, int raw_len, http_request_t *req) {
     memcpy(req->path, path_start, plen);
     req->path[plen] = '\0';
 
-    /* Strip query string */
+    /* Save query string before stripping */
     char *q = strchr(req->path, '?');
-    if (q) *q = '\0';
+    if (q) {
+        safe_strcpy(req->query, q + 1, sizeof(req->query));
+        *q = '\0';
+    }
 
     /* Strip trailing slash (except root) */
     size_t pl = strlen(req->path);
     if (pl > 1 && req->path[pl - 1] == '/') req->path[pl - 1] = '\0';
+
+    /* Extract body: find \r\n\r\n boundary */
+    const char *body_start = strstr(raw, "\r\n\r\n");
+    if (body_start) {
+        body_start += 4;
+        int remaining = raw_len - (int)(body_start - raw);
+        if (remaining > 0) {
+            if (remaining > (int)sizeof(req->body) - 1)
+                remaining = (int)sizeof(req->body) - 1;
+            memcpy(req->body, body_start, (size_t)remaining);
+            req->body[remaining] = '\0';
+            req->body_len = remaining;
+        }
+    }
+
+    /* Extract Authorization header */
+    const char *auth_hdr = strstr(raw, "Authorization: ");
+    if (!auth_hdr) auth_hdr = strstr(raw, "authorization: ");
+    if (auth_hdr) {
+        auth_hdr += 15; /* Skip "Authorization: " */
+        int ai = 0;
+        while (*auth_hdr && *auth_hdr != '\r' && *auth_hdr != '\n'
+               && ai < (int)sizeof(req->authorization) - 1)
+            req->authorization[ai++] = *auth_hdr++;
+        req->authorization[ai] = '\0';
+    }
 
     return 0;
 }
@@ -193,7 +326,8 @@ static void send_response(int fd, int status, const char *content_type,
                            const char *body, int body_len) {
     char header[512];
     const char *reason = "OK";
-    if (status == 404) reason = "Not Found";
+    if (status == 401) reason = "Unauthorized";
+    else if (status == 404) reason = "Not Found";
     else if (status == 400) reason = "Bad Request";
     else if (status == 500) reason = "Internal Server Error";
 
@@ -271,14 +405,23 @@ static void api_system_info(int fd) {
         fclose(f);
     }
 
+    /* Count volumes from file */
+    int vol_count = 0;
+    f = fopen(VOLUMES_DB_FILE, "rb");
+    if (f) {
+        int cnt = 0;
+        if (fread(&cnt, sizeof(cnt), 1, f) == 1) vol_count = cnt;
+        fclose(f);
+    }
+
     char buf[512];
     int len = snprintf(buf, sizeof(buf),
         "{\"version\":\"%s\",\"containers_total\":%d,"
         "\"containers_running\":%d,\"containers_stopped\":%d,"
         "\"containers_created\":%d,\"images_total\":%d,"
-        "\"networks_total\":%d}",
+        "\"networks_total\":%d,\"volumes_total\":%d}",
         LOCHS_VERSION, lochs_jail_count,
-        running, stopped, created, img_count, net_count);
+        running, stopped, created, img_count, net_count, vol_count);
     send_json(fd, 200, buf, len);
 }
 
@@ -361,8 +504,17 @@ static int serialize_container(char *buf, int pos, int max, lochs_jail_t *j) {
     }
     pos = jappend(buf, pos, max, "],");
 
-    /* Env count */
-    pos = jappend(buf, pos, max, "\"env_count\":%d", j->env_count);
+    /* Env */
+    pos = jappend(buf, pos, max, "\"env_count\":%d,", j->env_count);
+    pos = jappend(buf, pos, max, "\"env\":[");
+    for (int e = 0; e < j->env_count; e++) {
+        char kesc[128], vesc[512];
+        json_esc(kesc, sizeof(kesc), j->env_keys[e]);
+        json_esc(vesc, sizeof(vesc), j->env_values[e]);
+        if (e > 0) pos = jappend(buf, pos, max, ",");
+        pos = jappend(buf, pos, max, "{\"key\":\"%s\",\"value\":\"%s\"}", kesc, vesc);
+    }
+    pos = jappend(buf, pos, max, "]");
     pos = jappend(buf, pos, max, "}");
     return pos;
 }
@@ -424,11 +576,12 @@ static void api_container_action(int fd, const char *path_after) {
     }
 
     /* For restart: stop then start */
-    char cmd[512];
+    char cmd[2048];
     if (strcmp(action, "restart") == 0) {
-        snprintf(cmd, sizeof(cmd), "lochs stop %s 2>&1 && lochs start %s 2>&1", name, name);
+        snprintf(cmd, sizeof(cmd), "%s stop %s 2>&1 && %s start %s 2>&1",
+                 lochs_bin, name, lochs_bin, name);
     } else {
-        snprintf(cmd, sizeof(cmd), "lochs %s %s 2>&1", action, name);
+        snprintf(cmd, sizeof(cmd), "%s %s %s 2>&1", lochs_bin, action, name);
     }
 
     char output[4096] = "";
@@ -515,6 +668,10 @@ static void api_container_stats(int fd, const char *name) {
     if (mem_max < 0 || mem_max > (long long)1024 * 1024 * 1024 * 1024) mem_max = 0;
     if (pids_max < 0 || pids_max > 1000000) pids_max = 0;
 
+    /* Record to history ring buffer */
+    stats_history_record(name, cpu_usec > 0 ? cpu_usec : 0,
+                         mem > 0 ? mem : 0, pids > 0 ? pids : 0);
+
     char buf[512];
     int len = snprintf(buf, sizeof(buf),
         "{\"container\":\"%s\",\"cpu_usage_usec\":%lld,"
@@ -528,6 +685,34 @@ static void api_container_stats(int fd, const char *name) {
         pids > 0 ? pids : 0,
         pids_max);
     send_json(fd, 200, buf, len);
+}
+
+/* GET /api/stats/<name>/history */
+static void api_stats_history(int fd, const char *name) {
+    stats_history_t *h = stats_history_get(name);
+    char *buf = malloc(65536);
+    if (!buf) { send_error(fd, 500, "out of memory"); return; }
+    int pos = 0, max = 65536;
+
+    char esc_name[128];
+    json_esc(esc_name, sizeof(esc_name), name);
+    pos = jappend(buf, pos, max, "{\"container\":\"%s\",\"points\":[", esc_name);
+
+    if (h && h->count > 0) {
+        int start = (h->count == STATS_HISTORY_MAX) ? h->head : 0;
+        for (int i = 0; i < h->count; i++) {
+            int idx = (start + i) % STATS_HISTORY_MAX;
+            stats_entry_t *e = &h->entries[idx];
+            if (i > 0) pos = jappend(buf, pos, max, ",");
+            pos = jappend(buf, pos, max,
+                "{\"t\":%ld,\"cpu\":%lld,\"mem\":%lld,\"pids\":%lld}",
+                (long)e->timestamp, e->cpu_usec, e->memory_bytes, e->pids);
+        }
+    }
+
+    pos = jappend(buf, pos, max, "],\"count\":%d}", h ? h->count : 0);
+    send_json(fd, 200, buf, pos);
+    free(buf);
 }
 
 /* GET /api/images */
@@ -618,6 +803,580 @@ static void api_networks_list(int fd) {
     free(buf);
 }
 
+/* GET /api/volumes */
+static void api_volumes_list(int fd) {
+    lochs_named_volume_t vols[LOCHS_MAX_NAMED_VOLUMES];
+    int vol_count = 0;
+
+    FILE *f = fopen(VOLUMES_DB_FILE, "rb");
+    if (f) {
+        int cnt = 0;
+        if (fread(&cnt, sizeof(cnt), 1, f) == 1) {
+            if (cnt > LOCHS_MAX_NAMED_VOLUMES) cnt = LOCHS_MAX_NAMED_VOLUMES;
+            for (int i = 0; i < cnt; i++) {
+                if (fread(&vols[i], sizeof(lochs_named_volume_t), 1, f) != 1) break;
+                vol_count++;
+            }
+        }
+        fclose(f);
+    }
+
+    char *buf = malloc(32768);
+    if (!buf) { send_error(fd, 500, "out of memory"); return; }
+
+    int pos = 0, max = 32768;
+    pos = jappend(buf, pos, max, "{\"volumes\":[");
+
+    for (int i = 0; i < vol_count; i++) {
+        char name_esc[128], path_esc[1024], zfs_esc[1024];
+        json_esc(name_esc, sizeof(name_esc), vols[i].name);
+        json_esc(path_esc, sizeof(path_esc), vols[i].path);
+        json_esc(zfs_esc, sizeof(zfs_esc), vols[i].zfs_dataset);
+        if (i > 0) pos = jappend(buf, pos, max, ",");
+        pos = jappend(buf, pos, max,
+            "{\"name\":\"%s\",\"path\":\"%s\",\"zfs_dataset\":\"%s\","
+            "\"created_at\":%ld,\"active\":%s}",
+            name_esc, path_esc, zfs_esc,
+            (long)vols[i].created_at,
+            vols[i].active ? "true" : "false");
+    }
+
+    pos = jappend(buf, pos, max, "],\"total\":%d}", vol_count);
+    send_json(fd, 200, buf, pos);
+    free(buf);
+}
+
+/* POST /api/networks — create a network */
+static void api_network_create(int fd, http_request_t *req) {
+    if (req->body_len <= 0) { send_error(fd, 400, "missing body"); return; }
+    char name[64], subnet[64];
+    json_get_str(req->body, "name", name, sizeof(name));
+    json_get_str(req->body, "subnet", subnet, sizeof(subnet));
+    if (!name[0]) { send_error(fd, 400, "missing name"); return; }
+    if (!is_safe_name(name)) { send_error(fd, 400, "invalid name"); return; }
+
+    char cmd[1024];
+    if (subnet[0] && is_safe_name(subnet))
+        snprintf(cmd, sizeof(cmd), "%s network create %s --subnet %s 2>&1",
+                 lochs_bin, name, subnet);
+    else
+        snprintf(cmd, sizeof(cmd), "%s network create %s 2>&1", lochs_bin, name);
+
+    char output[4096] = "";
+    int out_pos = 0;
+    FILE *fp = popen(cmd, "r");
+    if (!fp) { send_error(fd, 500, "failed to execute"); return; }
+    char line[256];
+    while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256)
+        out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
+    int ret = pclose(fp);
+    int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
+
+    char esc_out[4096];
+    json_esc(esc_out, sizeof(esc_out), output);
+    char buf[8192];
+    int len = snprintf(buf, sizeof(buf),
+        "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc_out);
+    send_json(fd, 200, buf, len);
+}
+
+/* DELETE /api/networks/<name> */
+static void api_network_delete(int fd, const char *name) {
+    if (!is_safe_name(name)) { send_error(fd, 400, "invalid name"); return; }
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "%s network rm %s 2>&1", lochs_bin, name);
+
+    char output[4096] = "";
+    int out_pos = 0;
+    FILE *fp = popen(cmd, "r");
+    if (!fp) { send_error(fd, 500, "failed to execute"); return; }
+    char line[256];
+    while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256)
+        out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
+    int ret = pclose(fp);
+    int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
+
+    char esc_out[4096];
+    json_esc(esc_out, sizeof(esc_out), output);
+    char buf[8192];
+    int len = snprintf(buf, sizeof(buf),
+        "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc_out);
+    send_json(fd, 200, buf, len);
+}
+
+/* POST /api/volumes — create a volume */
+static void api_volume_create(int fd, http_request_t *req) {
+    if (req->body_len <= 0) { send_error(fd, 400, "missing body"); return; }
+    char name[64];
+    json_get_str(req->body, "name", name, sizeof(name));
+    if (!name[0]) { send_error(fd, 400, "missing name"); return; }
+    if (!is_safe_name(name)) { send_error(fd, 400, "invalid name"); return; }
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "%s volume create %s 2>&1", lochs_bin, name);
+
+    char output[4096] = "";
+    int out_pos = 0;
+    FILE *fp = popen(cmd, "r");
+    if (!fp) { send_error(fd, 500, "failed to execute"); return; }
+    char line[256];
+    while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256)
+        out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
+    int ret = pclose(fp);
+    int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
+
+    char esc_out[4096];
+    json_esc(esc_out, sizeof(esc_out), output);
+    char buf[8192];
+    int len = snprintf(buf, sizeof(buf),
+        "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc_out);
+    send_json(fd, 200, buf, len);
+}
+
+/* DELETE /api/volumes/<name> */
+static void api_volume_delete(int fd, const char *name) {
+    if (!is_safe_name(name)) { send_error(fd, 400, "invalid name"); return; }
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "%s volume rm %s 2>&1", lochs_bin, name);
+
+    char output[4096] = "";
+    int out_pos = 0;
+    FILE *fp = popen(cmd, "r");
+    if (!fp) { send_error(fd, 500, "failed to execute"); return; }
+    char line[256];
+    while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256)
+        out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
+    int ret = pclose(fp);
+    int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
+
+    char esc_out[4096];
+    json_esc(esc_out, sizeof(esc_out), output);
+    char buf[8192];
+    int len = snprintf(buf, sizeof(buf),
+        "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc_out);
+    send_json(fd, 200, buf, len);
+}
+
+/* POST /api/build — Build from Lochfile content */
+static void api_build(int fd, http_request_t *req) {
+    if (req->body_len <= 0) { send_error(fd, 400, "missing body"); return; }
+    char tag[128], content[4096];
+    json_get_str(req->body, "tag", tag, sizeof(tag));
+    json_get_str(req->body, "content", content, sizeof(content));
+    if (!content[0]) { send_error(fd, 400, "missing Lochfile content"); return; }
+    if (tag[0] && !is_safe_name(tag)) { send_error(fd, 400, "invalid tag"); return; }
+
+    /* Write Lochfile to temp file */
+    char tmppath[128] = "/tmp/lochs_build_XXXXXX";
+    int tmpfd = mkstemp(tmppath);
+    if (tmpfd < 0) { send_error(fd, 500, "failed to create temp file"); return; }
+    ssize_t w = write(tmpfd, content, strlen(content));
+    close(tmpfd);
+    if (w < 0) { unlink(tmppath); send_error(fd, 500, "failed to write temp file"); return; }
+
+    char cmd[2048];
+    if (tag[0])
+        snprintf(cmd, sizeof(cmd), "%s build -f %s -t %s 2>&1", lochs_bin, tmppath, tag);
+    else
+        snprintf(cmd, sizeof(cmd), "%s build -f %s 2>&1", lochs_bin, tmppath);
+
+    char output[8192] = "";
+    int out_pos = 0;
+    FILE *fp = popen(cmd, "r");
+    if (!fp) { unlink(tmppath); send_error(fd, 500, "failed to execute"); return; }
+    char line[256];
+    while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256)
+        out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
+    int ret = pclose(fp);
+    int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
+    unlink(tmppath);
+
+    char *buf = malloc(32768);
+    if (!buf) { send_error(fd, 500, "out of memory"); return; }
+    char esc_out[16384];
+    json_esc(esc_out, sizeof(esc_out), output);
+    int len = snprintf(buf, 32768,
+        "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc_out);
+    send_json(fd, 200, buf, len);
+    free(buf);
+}
+
+/* DELETE /api/images/<spec> */
+static void api_image_delete(int fd, const char *image_spec) {
+    /* Validate: only allow sane characters */
+    for (const char *p = image_spec; *p; p++) {
+        if (!(*p >= 'a' && *p <= 'z') && !(*p >= 'A' && *p <= 'Z') &&
+            !(*p >= '0' && *p <= '9') && *p != ':' && *p != '-' &&
+            *p != '_' && *p != '.' && *p != '/') {
+            send_error(fd, 400, "invalid image name");
+            return;
+        }
+    }
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "%s rmi %s 2>&1", lochs_bin, image_spec);
+
+    char output[4096] = "";
+    int out_pos = 0;
+    FILE *fp = popen(cmd, "r");
+    if (fp) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256) {
+            out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
+        }
+        int ret = pclose(fp);
+        int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
+
+        char esc_out[4096];
+        json_esc(esc_out, sizeof(esc_out), output);
+        char buf[8192];
+        int len = snprintf(buf, sizeof(buf),
+            "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc_out);
+        send_json(fd, 200, buf, len);
+    } else {
+        send_error(fd, 500, "failed to execute command");
+    }
+}
+
+/* POST /api/containers — Create a new container */
+static void api_container_create(int fd, http_request_t *req) {
+    if (req->body_len <= 0) { send_error(fd, 400, "missing body"); return; }
+
+    char name[64], image[64], ports_str[256], memory[32], cpus[32];
+    char env_str[512], pids_str[16], start_val[8];
+    json_get_str(req->body, "name", name, sizeof(name));
+    json_get_str(req->body, "image", image, sizeof(image));
+    json_get_str(req->body, "ports", ports_str, sizeof(ports_str));
+    json_get_str(req->body, "memory", memory, sizeof(memory));
+    json_get_str(req->body, "cpus", cpus, sizeof(cpus));
+    json_get_str(req->body, "env", env_str, sizeof(env_str));
+    json_get_str(req->body, "pids", pids_str, sizeof(pids_str));
+    json_get_str(req->body, "start", start_val, sizeof(start_val));
+
+    if (!name[0]) { send_error(fd, 400, "missing name"); return; }
+    if (!image[0]) { send_error(fd, 400, "missing image"); return; }
+    if (!is_safe_name(name) || !is_safe_name(image)) {
+        send_error(fd, 400, "invalid characters");
+        return;
+    }
+
+    /* Build command */
+    char cmd[2048];
+    int cpos = 0;
+    cpos += snprintf(cmd + cpos, sizeof(cmd) - (size_t)cpos,
+        "%s create %s -i %s", lochs_bin, name, image);
+
+    /* Parse ports: comma-separated "8080:80,3000:3000" */
+    if (ports_str[0]) {
+        char *tok = ports_str, *sep;
+        while ((sep = strchr(tok, ',')) != NULL || tok[0]) {
+            char port_one[32];
+            if (sep) { size_t pl2 = (size_t)(sep - tok); if(pl2>=sizeof(port_one))pl2=sizeof(port_one)-1;
+                memcpy(port_one,tok,pl2);port_one[pl2]='\0'; tok=sep+1; }
+            else { safe_strcpy(port_one, tok, sizeof(port_one)); tok += strlen(tok); }
+            if (port_one[0] && is_safe_name(port_one))
+                cpos += snprintf(cmd + cpos, sizeof(cmd) - (size_t)cpos, " -p %s", port_one);
+            if (!sep) break;
+        }
+    }
+    if (memory[0] && is_safe_name(memory))
+        cpos += snprintf(cmd + cpos, sizeof(cmd) - (size_t)cpos, " --memory %s", memory);
+    if (cpus[0] && is_safe_name(cpus))
+        cpos += snprintf(cmd + cpos, sizeof(cmd) - (size_t)cpos, " --cpus %s", cpus);
+    if (pids_str[0] && is_safe_name(pids_str))
+        cpos += snprintf(cmd + cpos, sizeof(cmd) - (size_t)cpos, " --pids-limit %s", pids_str);
+
+    /* Parse env: comma-separated "KEY=val,KEY2=val2" */
+    if (env_str[0]) {
+        char *tok = env_str, *sep;
+        while ((sep = strchr(tok, ',')) != NULL || tok[0]) {
+            char env_one[128];
+            if (sep) { size_t el = (size_t)(sep - tok); if(el>=sizeof(env_one))el=sizeof(env_one)-1;
+                memcpy(env_one,tok,el);env_one[el]='\0'; tok=sep+1; }
+            else { safe_strcpy(env_one, tok, sizeof(env_one)); tok += strlen(tok); }
+            if (env_one[0])
+                cpos += snprintf(cmd + cpos, sizeof(cmd) - (size_t)cpos, " -e %s", env_one);
+            if (!sep) break;
+        }
+    }
+
+    cpos += snprintf(cmd + cpos, sizeof(cmd) - (size_t)cpos, " 2>&1");
+
+    /* Execute create */
+    char output[4096] = "";
+    int out_pos = 0;
+    FILE *fp = popen(cmd, "r");
+    if (!fp) { send_error(fd, 500, "failed to execute"); return; }
+    char line[256];
+    while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256)
+        out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
+    int ret = pclose(fp);
+    int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
+
+    /* Auto-start if requested */
+    if (ok && strcmp(start_val, "true") == 0) {
+        char start_cmd[1024];
+        snprintf(start_cmd, sizeof(start_cmd), "%s start %s 2>&1", lochs_bin, name);
+        FILE *sf = popen(start_cmd, "r");
+        if (sf) {
+            while (fgets(line, sizeof(line), sf) && out_pos < (int)sizeof(output) - 256)
+                out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
+            int sr = pclose(sf);
+            if (!WIFEXITED(sr) || WEXITSTATUS(sr) != 0) ok = 0;
+        }
+    }
+
+    char esc_out[4096];
+    json_esc(esc_out, sizeof(esc_out), output);
+    char buf[8192];
+    int len = snprintf(buf, sizeof(buf),
+        "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc_out);
+    send_json(fd, 200, buf, len);
+}
+
+/* POST /api/containers/<name>/exec — Execute command in container */
+static void api_container_exec(int fd, const char *name, http_request_t *req) {
+    if (req->body_len <= 0) { send_error(fd, 400, "missing body"); return; }
+
+    char user_cmd[1024];
+    json_get_str(req->body, "cmd", user_cmd, sizeof(user_cmd));
+    if (!user_cmd[0]) { send_error(fd, 400, "missing cmd"); return; }
+
+    /* Find the jail to get its rootfs path — call bsdulator directly
+     * to avoid double-shell quoting issues with lochs exec */
+    lochs_jail_t *jail = lochs_jail_find(name);
+    if (!jail) { send_error(fd, 404, "container not found"); return; }
+    if (jail->state != JAIL_STATE_RUNNING) { send_error(fd, 400, "container not running"); return; }
+
+    /* Sanitize: replace single quotes */
+    for (char *p = user_cmd; *p; p++) { if (*p == '\'') *p = ' '; }
+
+    /* Build bsdulator command directly (same as lochs_cmd_exec):
+     * bsdulator [--netns <ns>] <path>/ld-elf.so.1 <path>/jexec <jail> /bin/sh -c '<cmd>' */
+    char cmd[4096];
+    int pos;
+    if (jail->netns[0]) {
+        pos = snprintf(cmd, sizeof(cmd),
+            "/usr/local/bin/bsdulator --netns %s %s/libexec/ld-elf.so.1 %s/usr/sbin/jexec %s /bin/sh -c '%s'",
+            jail->netns, jail->path, jail->path, jail->name, user_cmd);
+    } else {
+        pos = snprintf(cmd, sizeof(cmd),
+            "/usr/local/bin/bsdulator %s/libexec/ld-elf.so.1 %s/usr/sbin/jexec %s /bin/sh -c '%s'",
+            jail->path, jail->path, jail->name, user_cmd);
+    }
+    (void)pos;
+    /* Append stderr redirect */
+    strncat(cmd, " 2>&1", sizeof(cmd) - strlen(cmd) - 1);
+
+    char output[8192] = "";
+    int out_pos = 0;
+    FILE *fp = popen(cmd, "r");
+    if (!fp) { send_error(fd, 500, "failed to execute"); return; }
+    char line[256];
+    while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256)
+        out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
+    int ret = pclose(fp);
+    int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
+
+    /* Use larger buffer for exec output */
+    char *buf = malloc(32768);
+    if (!buf) { send_error(fd, 500, "out of memory"); return; }
+    char esc_out[16384];
+    json_esc(esc_out, sizeof(esc_out), output);
+    int len = snprintf(buf, 32768,
+        "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc_out);
+    send_json(fd, 200, buf, len);
+    free(buf);
+}
+
+/* POST /api/images/pull — Pull an image */
+static void api_image_pull(int fd, http_request_t *req) {
+    if (req->body_len <= 0) { send_error(fd, 400, "missing body"); return; }
+
+    char image[128];
+    json_get_str(req->body, "image", image, sizeof(image));
+    if (!image[0]) { send_error(fd, 400, "missing image name"); return; }
+    if (!is_safe_name(image)) { send_error(fd, 400, "invalid image name"); return; }
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "%s pull %s 2>&1", lochs_bin, image);
+
+    char output[8192] = "";
+    int out_pos = 0;
+    FILE *fp = popen(cmd, "r");
+    if (!fp) { send_error(fd, 500, "failed to execute"); return; }
+    char line[256];
+    while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256)
+        out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
+    int ret = pclose(fp);
+    int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
+
+    char esc_out[8192];
+    json_esc(esc_out, sizeof(esc_out), output);
+    char *buf = malloc(32768);
+    if (!buf) { send_error(fd, 500, "out of memory"); return; }
+    int len = snprintf(buf, 32768,
+        "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc_out);
+    send_json(fd, 200, buf, len);
+    free(buf);
+}
+
+/* GET /api/logs/<name>/download — Raw log file download */
+static void api_logs_download(int fd, const char *name) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s.log", LOG_DIR, name);
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        send_error(fd, 404, "no logs found");
+        return;
+    }
+
+    /* Read entire file */
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize <= 0 || fsize > 2 * 1024 * 1024) {
+        if (fsize <= 0) { fclose(f); send_error(fd, 404, "empty log"); return; }
+        fsize = 2 * 1024 * 1024; /* cap at 2MB */
+    }
+
+    char *data = malloc((size_t)fsize + 1);
+    if (!data) { fclose(f); send_error(fd, 500, "out of memory"); return; }
+    size_t nread = fread(data, 1, (size_t)fsize, f);
+    fclose(f);
+    data[nread] = '\0';
+
+    /* Send with Content-Disposition header */
+    char header[512];
+    int hlen = snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/plain; charset=utf-8\r\n"
+        "Content-Length: %zu\r\n"
+        "Content-Disposition: attachment; filename=\"%s.log\"\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n\r\n",
+        nread, name);
+    ssize_t w = write(fd, header, (size_t)hlen);
+    (void)w;
+    size_t sent = 0;
+    while (sent < nread) {
+        size_t chunk = nread - sent;
+        if (chunk > 32768) chunk = 32768;
+        w = write(fd, data + sent, chunk);
+        if (w <= 0) break;
+        sent += (size_t)w;
+    }
+    free(data);
+}
+
+/* ====================================================================
+ * TLS Support (Phase 7B) — socat wrapper, no OpenSSL linkage
+ * ==================================================================== */
+
+static pid_t tls_socat_pid = 0;
+
+static int dashboard_start_tls(int http_port, int tls_port,
+                                const char *cert, const char *key) {
+    /* Fork socat to handle TLS termination */
+    char listen_arg[256], connect_arg[128];
+    snprintf(listen_arg, sizeof(listen_arg),
+        "OPENSSL-LISTEN:%d,cert=%s,key=%s,reuseaddr,fork",
+        tls_port, cert, key);
+    snprintf(connect_arg, sizeof(connect_arg),
+        "TCP:127.0.0.1:%d", http_port);
+
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork socat"); return -1; }
+    if (pid == 0) {
+        /* Child: exec socat */
+        execlp("socat", "socat", listen_arg, connect_arg, (char *)NULL);
+        perror("exec socat");
+        _exit(1);
+    }
+    tls_socat_pid = pid;
+    fprintf(stderr, "TLS proxy: socat pid=%d, port %d -> %d\n",
+            pid, tls_port, http_port);
+    return 0;
+}
+
+/* ====================================================================
+ * Authentication (Phase 7C) — bearer token
+ * ==================================================================== */
+
+#define AUTH_TOKEN_FILE "/var/lib/lochs/dashboard.token"
+#define AUTH_TOKEN_LEN  32
+
+static char auth_token[AUTH_TOKEN_LEN + 1] = "";
+static int auth_enabled = 0;
+
+static void auth_init(void) {
+    /* Try to load existing token */
+    FILE *f = fopen(AUTH_TOKEN_FILE, "r");
+    if (f) {
+        if (fgets(auth_token, sizeof(auth_token), f)) {
+            /* Strip newline */
+            size_t len = strlen(auth_token);
+            if (len > 0 && auth_token[len - 1] == '\n')
+                auth_token[len - 1] = '\0';
+            if (auth_token[0]) { auth_enabled = 1; fclose(f); return; }
+        }
+        fclose(f);
+    }
+
+    /* Generate new random token */
+    f = fopen("/dev/urandom", "rb");
+    if (!f) return;
+    unsigned char rbuf[AUTH_TOKEN_LEN / 2];
+    if (fread(rbuf, 1, sizeof(rbuf), f) != sizeof(rbuf)) { fclose(f); return; }
+    fclose(f);
+
+    for (int i = 0; i < (int)sizeof(rbuf); i++)
+        snprintf(auth_token + i * 2, 3, "%02x", rbuf[i]);
+    auth_token[AUTH_TOKEN_LEN] = '\0';
+
+    /* Save token */
+    mkdir("/var/lib/lochs", 0755);
+    f = fopen(AUTH_TOKEN_FILE, "w");
+    if (f) {
+        fprintf(f, "%s\n", auth_token);
+        fclose(f);
+        chmod(AUTH_TOKEN_FILE, 0600);
+    }
+    auth_enabled = 1;
+}
+
+static int auth_check(const char *auth_header) {
+    if (!auth_enabled) return 1; /* Auth not enabled, allow all */
+    if (!auth_header || !auth_header[0]) return 0;
+
+    /* Expect "Bearer <token>" */
+    if (strncmp(auth_header, "Bearer ", 7) != 0) return 0;
+    const char *tok = auth_header + 7;
+    size_t tlen = strlen(auth_token);
+    if (strncmp(tok, auth_token, tlen) == 0) {
+        char c = tok[tlen];
+        if (c == '\r' || c == '\n' || c == '\0' || c == ' ')
+            return 1;
+    }
+    return 0;
+}
+
+/* POST /api/auth — validate token for login */
+static void api_auth_login(int fd, http_request_t *req) {
+    if (!auth_enabled) {
+        send_json(fd, 200, "{\"ok\":true,\"message\":\"auth not enabled\"}", 40);
+        return;
+    }
+    char token[128];
+    json_get_str(req->body, "token", token, sizeof(token));
+    if (token[0] && strcmp(token, auth_token) == 0) {
+        send_json(fd, 200, "{\"ok\":true}", 11);
+    } else {
+        send_error(fd, 401, "invalid token");
+    }
+}
+
 /* ====================================================================
  * Request Router
  * ==================================================================== */
@@ -630,6 +1389,16 @@ static void handle_request(int client_fd, http_request_t *req) {
     if (strcmp(req->method, "OPTIONS") == 0) {
         send_response(client_fd, 200, "text/plain", "", 0);
         return;
+    }
+
+    /* Authentication check for API endpoints (skip /api/auth login) */
+    if (auth_enabled && strncmp(req->path, "/api/", 5) == 0 &&
+        strcmp(req->path, "/api/auth") != 0) {
+        if (!auth_check(req->authorization)) {
+            send_json(client_fd, 401,
+                "{\"ok\":false,\"error\":\"unauthorized\"}", 35);
+            return;
+        }
     }
 
     if (strcmp(req->method, "GET") == 0) {
@@ -657,6 +1426,10 @@ static void handle_request(int client_fd, http_request_t *req) {
             api_networks_list(client_fd);
             return;
         }
+        if (strcmp(req->path, "/api/volumes") == 0) {
+            api_volumes_list(client_fd);
+            return;
+        }
 
         /* /api/containers/<name> */
         if (strncmp(req->path, "/api/containers/", 16) == 0) {
@@ -667,27 +1440,108 @@ static void handle_request(int client_fd, http_request_t *req) {
             }
         }
 
-        /* /api/logs/<name> */
+        /* /api/logs/<name>/download */
         if (strncmp(req->path, "/api/logs/", 10) == 0 && req->path[10]) {
-            api_container_logs(client_fd, req->path + 10);
+            const char *log_rest = req->path + 10;
+            const char *dl = strstr(log_rest, "/download");
+            if (dl) {
+                char log_name[LOCHS_MAX_NAME];
+                size_t lnlen = (size_t)(dl - log_rest);
+                if (lnlen >= sizeof(log_name)) lnlen = sizeof(log_name) - 1;
+                memcpy(log_name, log_rest, lnlen);
+                log_name[lnlen] = '\0';
+                api_logs_download(client_fd, log_name);
+                return;
+            }
+            api_container_logs(client_fd, log_rest);
             return;
         }
 
-        /* /api/stats/<name> */
+        /* /api/stats/<name>/history or /api/stats/<name> */
         if (strncmp(req->path, "/api/stats/", 11) == 0 && req->path[11]) {
-            api_container_stats(client_fd, req->path + 11);
+            const char *stats_rest = req->path + 11;
+            const char *hist_suffix = strstr(stats_rest, "/history");
+            if (hist_suffix) {
+                char stats_name[LOCHS_MAX_NAME];
+                size_t snlen = (size_t)(hist_suffix - stats_rest);
+                if (snlen >= sizeof(stats_name)) snlen = sizeof(stats_name) - 1;
+                memcpy(stats_name, stats_rest, snlen);
+                stats_name[snlen] = '\0';
+                api_stats_history(client_fd, stats_name);
+                return;
+            }
+            api_container_stats(client_fd, stats_rest);
             return;
         }
     }
 
     if (strcmp(req->method, "POST") == 0) {
-        /* /api/containers/<name>/<action> */
+        /* POST /api/auth — login */
+        if (strcmp(req->path, "/api/auth") == 0) {
+            api_auth_login(client_fd, req);
+            return;
+        }
+        /* POST /api/containers — create new container */
+        if (strcmp(req->path, "/api/containers") == 0) {
+            api_container_create(client_fd, req);
+            return;
+        }
+        /* POST /api/images/pull — pull an image */
+        if (strcmp(req->path, "/api/images/pull") == 0) {
+            api_image_pull(client_fd, req);
+            return;
+        }
+        /* POST /api/networks — create network */
+        if (strcmp(req->path, "/api/networks") == 0) {
+            api_network_create(client_fd, req);
+            return;
+        }
+        /* POST /api/volumes — create volume */
+        if (strcmp(req->path, "/api/volumes") == 0) {
+            api_volume_create(client_fd, req);
+            return;
+        }
+        /* POST /api/build — build from Lochfile */
+        if (strcmp(req->path, "/api/build") == 0) {
+            api_build(client_fd, req);
+            return;
+        }
+        /* /api/containers/<name>/... */
         if (strncmp(req->path, "/api/containers/", 16) == 0) {
             const char *rest = req->path + 16;
             if (rest[0] && strchr(rest, '/')) {
+                /* Check for /exec suffix */
+                const char *slash = strchr(rest, '/');
+                if (slash && strcmp(slash, "/exec") == 0) {
+                    char cname[128];
+                    size_t nlen = (size_t)(slash - rest);
+                    if (nlen >= sizeof(cname)) nlen = sizeof(cname) - 1;
+                    memcpy(cname, rest, nlen);
+                    cname[nlen] = '\0';
+                    api_container_exec(client_fd, cname, req);
+                    return;
+                }
                 api_container_action(client_fd, rest);
                 return;
             }
+        }
+    }
+
+    if (strcmp(req->method, "DELETE") == 0) {
+        /* DELETE /api/images/<spec> */
+        if (strncmp(req->path, "/api/images/", 12) == 0 && req->path[12]) {
+            api_image_delete(client_fd, req->path + 12);
+            return;
+        }
+        /* DELETE /api/networks/<name> */
+        if (strncmp(req->path, "/api/networks/", 14) == 0 && req->path[14]) {
+            api_network_delete(client_fd, req->path + 14);
+            return;
+        }
+        /* DELETE /api/volumes/<name> */
+        if (strncmp(req->path, "/api/volumes/", 13) == 0 && req->path[13]) {
+            api_volume_delete(client_fd, req->path + 13);
+            return;
         }
     }
 
@@ -703,7 +1557,9 @@ static void dashboard_signal(int sig) {
     dashboard_running = 0;
 }
 
-static int dashboard_serve(int port) {
+static int dashboard_serve(int port, const char *ssl_cert, const char *ssl_key) {
+    auth_init();
+
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket");
@@ -735,7 +1591,18 @@ static int dashboard_serve(int port) {
     signal(SIGINT, dashboard_signal);
     signal(SIGPIPE, SIG_IGN);
 
+    /* Start TLS proxy if cert/key provided */
+    if (ssl_cert && ssl_key) {
+        int tls_port = port + 1;
+        if (dashboard_start_tls(port, tls_port, ssl_cert, ssl_key) == 0)
+            fprintf(stderr, "TLS listening on port %d\n", tls_port);
+        else
+            fprintf(stderr, "Warning: TLS proxy failed to start\n");
+    }
+
     fprintf(stderr, "Dashboard listening on port %d\n", port);
+    if (auth_enabled)
+        fprintf(stderr, "Auth token: %s\n", auth_token);
 
     while (dashboard_running) {
         /* Use select with 1 second timeout to check running flag */
@@ -751,7 +1618,7 @@ static int dashboard_serve(int port) {
         if (client_fd < 0) continue;
 
         /* Set read timeout on client */
-        struct timeval client_tv = {5, 0};
+        struct timeval client_tv = {60, 0};
         setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &client_tv, sizeof(client_tv));
 
         /* Read request */
@@ -775,6 +1642,14 @@ static int dashboard_serve(int port) {
     }
 
     close(server_fd);
+
+    /* Kill TLS socat proxy if running */
+    if (tls_socat_pid > 0) {
+        kill(tls_socat_pid, SIGTERM);
+        waitpid(tls_socat_pid, NULL, 0);
+        tls_socat_pid = 0;
+    }
+
     unlink(DASHBOARD_PID_FILE);
     fprintf(stderr, "Dashboard stopped\n");
     return 0;
@@ -784,7 +1659,8 @@ static int dashboard_serve(int port) {
  * Daemon Management
  * ==================================================================== */
 
-static int dashboard_start(int port, int foreground) {
+static int dashboard_start(int port, int foreground,
+                           const char *ssl_cert, const char *ssl_key) {
     /* Check if already running */
     FILE *pf = fopen(DASHBOARD_PID_FILE, "r");
     if (pf) {
@@ -804,8 +1680,10 @@ static int dashboard_start(int port, int foreground) {
     if (foreground) {
         printf("\033[1;31m\xf0\x9f\x8f\x94\xef\xb8\x8f  Lochs Dashboard\033[0m\n\n");
         printf("  Running at: \033[1mhttp://localhost:%d\033[0m\n", port);
+        if (ssl_cert && ssl_key)
+            printf("  TLS at:     \033[1mhttps://localhost:%d\033[0m\n", port + 1);
         printf("  Press Ctrl+C to stop\n\n");
-        return dashboard_serve(port);
+        return dashboard_serve(port, ssl_cert, ssl_key);
     }
 
     /* Fork daemon */
@@ -819,6 +1697,8 @@ static int dashboard_start(int port, int foreground) {
         /* Parent: print info and exit */
         printf("\033[1;31m\xf0\x9f\x8f\x94\xef\xb8\x8f  Lochs Dashboard\033[0m\n\n");
         printf("  Dashboard running at: \033[1mhttp://localhost:%d\033[0m\n", port);
+        if (ssl_cert && ssl_key)
+            printf("  TLS at:              \033[1mhttps://localhost:%d\033[0m\n", port + 1);
         printf("  PID: %d\n", pid);
         printf("\n  Stop with: lochs dashboard stop\n\n");
 
@@ -852,7 +1732,7 @@ static int dashboard_start(int port, int foreground) {
         fclose(f);
     }
 
-    return dashboard_serve(port);
+    return dashboard_serve(port, ssl_cert, ssl_key);
 }
 
 static int dashboard_stop(void) {
@@ -913,8 +1793,11 @@ static int dashboard_status(void) {
  * ==================================================================== */
 
 int lochs_cmd_dashboard(int argc, char **argv) {
+    resolve_self();
     int port = DASHBOARD_DEFAULT_PORT;
     int foreground = 0;
+    const char *ssl_cert = NULL;
+    const char *ssl_key = NULL;
 
     /* Simple argument parsing (no getopt for this subcommand-based interface) */
     int i = 1;
@@ -936,11 +1819,14 @@ int lochs_cmd_dashboard(int argc, char **argv) {
             printf("  -p, --port <n>    Port to listen on (default: %d)\n",
                    DASHBOARD_DEFAULT_PORT);
             printf("  --foreground      Run in foreground (don't daemonize)\n");
+            printf("  --ssl-cert <f>    TLS certificate file (enables HTTPS)\n");
+            printf("  --ssl-key <f>     TLS private key file\n");
             printf("\nExamples:\n");
             printf("  lochs dashboard                    Start on port %d\n",
                    DASHBOARD_DEFAULT_PORT);
             printf("  lochs dashboard --port 9000        Custom port\n");
             printf("  lochs dashboard --foreground        Debug mode\n");
+            printf("  lochs dashboard --ssl-cert c.pem --ssl-key k.pem  HTTPS\n");
             printf("  lochs dashboard stop               Stop dashboard\n");
             printf("  lochs dashboard status             Check status\n");
             return 0;
@@ -959,6 +1845,16 @@ int lochs_cmd_dashboard(int argc, char **argv) {
             i++;
             continue;
         }
+        if (strcmp(argv[i], "--ssl-cert") == 0 && i + 1 < argc) {
+            ssl_cert = argv[i + 1];
+            i += 2;
+            continue;
+        }
+        if (strcmp(argv[i], "--ssl-key") == 0 && i + 1 < argc) {
+            ssl_key = argv[i + 1];
+            i += 2;
+            continue;
+        }
         if (strcmp(argv[i], "start") == 0) {
             i++;
             continue;
@@ -967,5 +1863,11 @@ int lochs_cmd_dashboard(int argc, char **argv) {
         return 1;
     }
 
-    return dashboard_start(port, foreground);
+    /* Validate TLS: need both cert and key */
+    if ((ssl_cert && !ssl_key) || (!ssl_cert && ssl_key)) {
+        fprintf(stderr, "Error: both --ssl-cert and --ssl-key are required\n");
+        return 1;
+    }
+
+    return dashboard_start(port, foreground, ssl_cert, ssl_key);
 }

@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# BSDulator - Setup FreeBSD Root Filesystem
+# Lochs - Setup FreeBSD Root Filesystem
 # Downloads and extracts FreeBSD base system for testing
 #
 
@@ -21,7 +21,7 @@ MIRRORS=(
 FREEBSD_ROOT="${1:-./freebsd-root}"
 
 echo "================================================"
-echo "BSDulator - FreeBSD Root Filesystem Setup"
+echo "Lochs - FreeBSD Root Filesystem Setup"
 echo "================================================"
 echo ""
 echo "FreeBSD Version: ${FREEBSD_VERSION}"

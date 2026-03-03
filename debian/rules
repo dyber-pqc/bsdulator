@@ -1,0 +1,23 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) all
+
+override_dh_auto_install:
+	install -D -m 755 bsdulator $(CURDIR)/debian/lochs/usr/bin/bsdulator
+	install -D -m 755 lochs $(CURDIR)/debian/lochs/usr/bin/lochs
+	install -D -m 644 lochs-dashboard.service $(CURDIR)/debian/lochs/lib/systemd/system/lochs-dashboard.service
+	install -d $(CURDIR)/debian/lochs/usr/share/doc/lochs
+	install -m 644 docs/api.md $(CURDIR)/debian/lochs/usr/share/doc/lochs/
+	install -m 644 docs/quickstart.md $(CURDIR)/debian/lochs/usr/share/doc/lochs/
+	install -m 644 docs/architecture.md $(CURDIR)/debian/lochs/usr/share/doc/lochs/
+	install -d $(CURDIR)/debian/lochs/var/lib/lochs
+
+override_dh_auto_clean:
+	$(MAKE) clean
+
+override_dh_auto_test:
+	# Skip tests during package build

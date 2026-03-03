@@ -225,10 +225,10 @@ static const int freebsd_to_linux_sig[] = {
     [FBSD_SIGVTALRM] = SIGVTALRM,
     [FBSD_SIGPROF] = SIGPROF,
     [FBSD_SIGWINCH] = SIGWINCH,
-    [FBSD_SIGINFO] = 0,         /* No Linux equivalent (use SIGUSR1?) */
+    [FBSD_SIGINFO] = SIGPWR,    /* Map to SIGPWR (Linux 30) */
     [FBSD_SIGUSR1] = SIGUSR1,
     [FBSD_SIGUSR2] = SIGUSR2,
-    [FBSD_SIGTHR] = 0,          /* FreeBSD threading signal */
+    [FBSD_SIGTHR] = 35,  /* SIGRTMIN+1 (Linux SIGRTMIN=34) for threading */
 };
 
 static const int linux_to_freebsd_sig[] = {

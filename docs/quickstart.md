@@ -1,6 +1,6 @@
 # Quick Start Guide
 
-Get BSDulator running in 5 minutes.
+Get Lochs running in 5 minutes.
 
 ## 1. Install Dependencies
 
@@ -106,6 +106,6 @@ ip netns exec bsdjail_1 ping -c 1 10.0.0.20  # web -> db jail
 ## Next Steps
 
 - Read the full [Installation Guide](INSTALL.md) for platform-specific details
-- See [architecture.md](architecture.md) for how BSDulator works under the hood
+- See [architecture.md](architecture.md) for how Lochs works under the hood
 - Check the [roadmap](roadmap.md) for upcoming features
 - See [CONTRIBUTING.md](../CONTRIBUTING.md) to get involved

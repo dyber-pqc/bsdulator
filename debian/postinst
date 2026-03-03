@@ -1,0 +1,30 @@
+#!/bin/sh
+set -e
+
+# Create data directory
+mkdir -p /var/lib/lochs/logs
+mkdir -p /var/lib/lochs/volumes
+mkdir -p /var/lib/lochs/jails
+mkdir -p /var/lib/lochs/images
+
+# Reload systemd if available
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+
+echo ""
+echo "  Lochs installed successfully!"
+echo ""
+echo "  Quick start:"
+echo "    lochs pull freebsd:14       # Download FreeBSD base"
+echo "    lochs create myjail -i freebsd:14"
+echo "    lochs start myjail"
+echo "    lochs exec myjail uname -a"
+echo ""
+echo "  Dashboard:"
+echo "    sudo systemctl start lochs-dashboard"
+echo "    # or: sudo lochs dashboard"
+echo "    # Then open http://localhost:8420"
+echo ""
+
+#DEBHELPER#

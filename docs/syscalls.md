@@ -1,11 +1,11 @@
 # Syscall Support Matrix
 
-BSDulator translates FreeBSD system calls to Linux equivalents. Each syscall falls into one of four categories:
+Lochs translates FreeBSD system calls to Linux equivalents via the bsdulator engine. Each syscall falls into one of four categories:
 
 | Type | Description |
 |------|-------------|
 | **Translated** | FreeBSD syscall number mapped directly to a Linux syscall number. Arguments may be translated (flags, structures) before the Linux kernel executes the call. |
-| **Emulated** | No direct Linux equivalent. BSDulator implements the behavior in userspace via a custom handler function. |
+| **Emulated** | No direct Linux equivalent. The engine implements the behavior in userspace via a custom handler function. |
 | **Stub** | Returns a hardcoded success value without real functionality. Prevents crashes in programs that call it. |
 | **Unsupported** | Returns `ENOSYS`. No translation or emulation exists yet. |
 
@@ -365,7 +365,7 @@ These FreeBSD-specific syscalls have no Linux equivalent and return `ENOSYS`:
 | `fchflags` | 35 | No Linux equivalent |
 | `lchflags` | 391 | No Linux equivalent |
 | `revoke` | 56 | No Linux equivalent |
-| `ktrace` | 45 | FreeBSD-specific tracing (BSDulator uses ptrace) |
+| `ktrace` | 45 | FreeBSD-specific tracing (engine uses ptrace) |
 | `getlogin` | 49 | FreeBSD login session tracking |
 | `setlogin` | 50 | FreeBSD login session tracking |
 | `profil` | 44 | Deprecated profiling interface |

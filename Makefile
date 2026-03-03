@@ -1,4 +1,4 @@
-# BSDulator - FreeBSD Compatibility Layer for Linux
+# Lochs - FreeBSD Jail Management for Linux
 # Makefile
 
 CC = gcc
@@ -38,7 +38,10 @@ LOCHS_SRCS = $(SRCDIR)/lochs/lochs_main.c \
              $(SRCDIR)/lochs/lochs_health.c \
              $(SRCDIR)/lochs/lochs_storage.c \
              $(SRCDIR)/lochs/lochs_zfs.c \
-             $(SRCDIR)/lochs/lochs_dashboard.c
+             $(SRCDIR)/lochs/lochs_dashboard.c \
+             $(SRCDIR)/lochs/lochs_cp.c \
+             $(SRCDIR)/lochs/lochs_export.c \
+             $(SRCDIR)/lochs/lochs_registry.c
 
 # Lochs CLI object files
 LOCHS_OBJS = $(LOCHS_SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
@@ -100,6 +103,9 @@ $(OBJDIR)/lochs/lochs_health.o: $(SRCDIR)/lochs/lochs_health.c $(INCDIR)/bsdulat
 $(OBJDIR)/lochs/lochs_storage.o: $(SRCDIR)/lochs/lochs_storage.c $(INCDIR)/bsdulator/lochs.h
 $(OBJDIR)/lochs/lochs_zfs.o: $(SRCDIR)/lochs/lochs_zfs.c $(INCDIR)/bsdulator/lochs.h
 $(OBJDIR)/lochs/lochs_dashboard.o: $(SRCDIR)/lochs/lochs_dashboard.c $(INCDIR)/bsdulator/lochs.h $(SRCDIR)/lochs/lochs_dashboard_html.h
+$(OBJDIR)/lochs/lochs_cp.o: $(SRCDIR)/lochs/lochs_cp.c $(INCDIR)/bsdulator/lochs.h
+$(OBJDIR)/lochs/lochs_export.o: $(SRCDIR)/lochs/lochs_export.c $(INCDIR)/bsdulator/lochs.h
+$(OBJDIR)/lochs/lochs_registry.o: $(SRCDIR)/lochs/lochs_registry.c $(INCDIR)/bsdulator/lochs.h
 
 # Clean
 clean:
@@ -113,6 +119,12 @@ install: $(TARGET) $(LOCHS_TARGET)
 	@echo "  INSTALL $(LOCHS_TARGET) -> /usr/local/bin/"
 	@install -m 755 $(LOCHS_TARGET) /usr/local/bin/
 
+# Install systemd service
+install-service: lochs-dashboard.service
+	@echo "  INSTALL lochs-dashboard.service -> /etc/systemd/system/"
+	@install -m 644 lochs-dashboard.service /etc/systemd/system/
+	@echo "  Run: sudo systemctl daemon-reload && sudo systemctl enable lochs-dashboard"
+
 # Uninstall
 uninstall:
 	@echo "  UNINSTALL /usr/local/bin/bsdulator"
@@ -125,6 +137,16 @@ test: $(TARGET)
 	@echo "Running tests..."
 	@./tests/run_tests.sh
 
+# Build packages
+package-deb:
+	@./package.sh deb
+
+package-rpm:
+	@./package.sh rpm
+
+package:
+	@./package.sh
+
 # Setup FreeBSD root filesystem
 setup-freebsd:
 	@echo "Setting up FreeBSD root filesystem..."
@@ -132,18 +154,21 @@ setup-freebsd:
 
 # Help
 help:
-	@echo "BSDulator - FreeBSD Compatibility Layer for Linux"
-	@echo "Lochs.dev - FreeBSD jail management CLI"
+	@echo "Lochs - FreeBSD Jail Management for Linux"
 	@echo ""
 	@echo "Targets:"
-	@echo "  all           - Build bsdulator and lochs (default)"
+	@echo "  all           - Build lochs and bsdulator engine (default)"
 	@echo "  debug         - Build with debug symbols and sanitizers"
 	@echo "  verbose       - Build with verbose logging"
 	@echo "  clean         - Remove build artifacts"
-	@echo "  install       - Install to /usr/local/bin"
-	@echo "  uninstall     - Remove from /usr/local/bin"
+	@echo "  install         - Install to /usr/local/bin"
+	@echo "  install-service - Install systemd dashboard service"
+	@echo "  uninstall       - Remove from /usr/local/bin"
+	@echo "  package         - Build .deb or .rpm (auto-detect)"
+	@echo "  package-deb     - Build .deb package"
+	@echo "  package-rpm     - Build .rpm package"
 	@echo "  test          - Run test suite"
 	@echo "  setup-freebsd - Download FreeBSD base system"
 	@echo "  help          - Show this help"
 
-.PHONY: all debug verbose clean install uninstall test setup-freebsd help
+.PHONY: all debug verbose clean install install-service uninstall test setup-freebsd help package package-deb package-rpm

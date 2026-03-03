@@ -1,6 +1,6 @@
 # Examples
 
-This directory contains example files for BSDulator and Lochs.
+This directory contains example files for Lochs.
 
 ## Files
 
@@ -8,7 +8,7 @@ This directory contains example files for BSDulator and Lochs.
 - **`TestLochfile`** — Minimal Lochfile used for testing the build system
 - **`lochs.yml`** — Example compose file for multi-service deployments
 - **`hello.sh`** — Simple test script used by the example Lochfile
-- **`minimal`** — Pre-compiled minimal FreeBSD ELF binary for testing BSDulator
+- **`minimal`** — Pre-compiled minimal FreeBSD ELF binary for testing the bsdulator engine
 
 ## Usage
 

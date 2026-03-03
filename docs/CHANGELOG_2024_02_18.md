@@ -1,4 +1,4 @@
-# BSDulator Changelog - February 18, 2025
+# Lochs Engine Changelog - February 18, 2025
 
 ## File Redirection Fix
 

@@ -26,7 +26,7 @@ static lochs_command_t commands[] = {
     {"inspect", "Show container details (JSON)",        lochs_cmd_inspect},
     {"images",  "List local images",                    lochs_cmd_images},
     {"pull",    "Pull an image from registry",          lochs_cmd_pull},
-    {"push",    "Push an image to registry",            NULL},  /* Future */
+    {"push",    "Push an image to registry",            lochs_cmd_push},
     {"search",  "Search for images",                    lochs_cmd_search},
     {"rmi",     "Remove an image",                      lochs_cmd_rmi},
     {"build",   "Build image from Lochfile",            lochs_cmd_build},
@@ -39,6 +39,9 @@ static lochs_command_t commands[] = {
     {"rollback","Rollback container to a snapshot",      lochs_cmd_rollback},
     {"diff",    "Show changes between snapshots",        lochs_cmd_diff},
     {"clone",   "Clone container from a snapshot",       lochs_cmd_clone},
+    {"cp",      "Copy files between host and container", lochs_cmd_cp},
+    {"export",  "Export container filesystem as tar",   lochs_cmd_export},
+    {"import",  "Import container from tar archive",    lochs_cmd_import},
     {"version", "Show version information",             lochs_cmd_version},
     {"dashboard","Web management dashboard",            lochs_cmd_dashboard},
     {NULL, NULL, NULL}
@@ -62,14 +65,18 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "\n\033[1mImage Commands:\033[0m\n");
     fprintf(stderr, "  %-12s %s\n", "images", "List local images");
     fprintf(stderr, "  %-12s %s\n", "pull", "Pull an image (e.g., lochs pull freebsd:15)");
+    fprintf(stderr, "  %-12s %s\n", "push", "Push an image to registry");
     fprintf(stderr, "  %-12s %s\n", "search", "Search for images in registry");
     fprintf(stderr, "  %-12s %s\n", "rmi", "Remove a local image");
     fprintf(stderr, "  %-12s %s\n", "build", "Build image from Lochfile");
-    
+
     fprintf(stderr, "\n\033[1mOrchestration:\033[0m\n");
     fprintf(stderr, "  %-12s %s\n", "compose", "Manage multi-jail applications (lochs.yml)");
     fprintf(stderr, "  %-12s %s\n", "network", "Manage container networks");
     fprintf(stderr, "  %-12s %s\n", "volume", "Manage named volumes");
+    fprintf(stderr, "  %-12s %s\n", "cp", "Copy files between host and container");
+    fprintf(stderr, "  %-12s %s\n", "export", "Export container filesystem as tar");
+    fprintf(stderr, "  %-12s %s\n", "import", "Import container from tar archive");
 
     fprintf(stderr, "\n\033[1mZFS Snapshots:\033[0m\n");
     fprintf(stderr, "  %-12s %s\n", "snapshot", "Manage container snapshots (create/ls/rm)");

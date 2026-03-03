@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to BSDulator and Lochs will be documented in this file.
+All notable changes to Lochs will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -110,13 +110,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Isolated eth0 interface with assigned IP from subnet pool
   - veth pair connects container netns to host bridge
   - Gateway connectivity with proper routing
-- **BSDulator `--netns` flag** for network namespace entry
+- **Engine `--netns` flag** for network namespace entry
   - Child process enters netns after ptrace setup, before execve
   - Avoids ptrace conflicts that caused segfaults with `ip netns exec`
 - Network namespace cleanup on container stop/remove
 
 ### Fixed
-- Segfault when running BSDulator inside `ip netns exec` wrapper
+- Segfault when running the engine inside `ip netns exec` wrapper
 - veth pair creation order (move to netns before bridge attachment)
 - eth0 interface configuration inside network namespace
 - **Duplicate MAC addresses** causing container-to-container communication failure
@@ -141,7 +141,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - NAT via iptables MASQUERADE for external access
   - Network teardown on container stop
 - **RUN directive** in Lochfile
-  - Execute FreeBSD commands during image build via BSDulator
+  - Execute FreeBSD commands during image build via the engine
   - Direct binary execution for simple commands (no shell overhead)
   - Shell fallback for complex commands (pipes, redirects, etc.)
   - Proper path resolution in build directory
@@ -182,7 +182,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Multiple port mappings per container
 
 ### Fixed
-- JID tracking sync between Lochs and BSDulator state files
+- JID tracking sync between Lochs state files
 - Structure alignment for jail state file reading (simplified vs actual structs)
 - State file persistence in compose (parent process reloads after child saves)
 
@@ -197,7 +197,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `lochs ps` container listing with JID sync
 - State persistence in `/var/lib/lochs/jails.dat`
 
-### BSDulator Features
+### Engine Features
 - 200+ FreeBSD syscall translations
 - FreeBSD TLS (Thread Local Storage) setup
 - Jail syscall emulation (`jail`, `jail_get`, `jail_set`, `jail_attach`, `jail_remove`)
@@ -209,7 +209,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2026-01-01
 
 ### Added
-- Initial BSDulator implementation
+- Initial engine implementation
 - ptrace-based syscall interception
 - Basic syscall translation table
 - FreeBSD ELF binary detection

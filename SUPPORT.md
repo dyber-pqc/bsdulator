@@ -33,7 +33,7 @@ Visit the Dyber community hub for additional resources:
 To help us resolve your issue quickly, please include:
 
 1. **System info**: Linux distro, kernel version, architecture
-2. **BSDulator version**: output of `./bsdulator --version`
+2. **Lochs version**: output of `lochs version`
 3. **Verbose output**: run with `-vvv` flag to capture the syscall trace
 4. **Steps to reproduce**: minimal commands to trigger the issue
 5. **Compatibility check**: output of `./scripts/check_compat.sh`

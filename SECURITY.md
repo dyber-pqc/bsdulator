@@ -2,7 +2,7 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in BSDulator or Lochs, **please do not open a public issue.** Instead, report it responsibly via email:
+If you discover a security vulnerability in Lochs, **please do not open a public issue.** Instead, report it responsibly via email:
 
 **security@dyber.org**
 
@@ -49,7 +49,7 @@ The following components are in scope for security reports:
 
 ## Security Considerations
 
-BSDulator has inherent security characteristics that users should be aware of:
+Lochs has inherent security characteristics that users should be aware of:
 
 ### Privileged Operations
 
@@ -60,14 +60,14 @@ BSDulator has inherent security characteristics that users should be aware of:
 
 ### Architecture
 
-- BSDulator intercepts syscalls via ptrace — the traced process runs with the caller's privileges
+- The bsdulator engine intercepts syscalls via ptrace — the traced process runs with the caller's privileges
 - Jail isolation relies on Linux namespaces (mount, PID, network, UTS) for containment
 - Path translation confines FreeBSD binary file access to the specified root directory
 - No sandboxing is applied beyond Linux namespace isolation for jail features
 
 ### Recommendations
 
-- Run BSDulator with the minimum privileges required for your use case
+- Run Lochs with the minimum privileges required for your use case
 - Use jail features only in trusted environments
 - Keep your Linux kernel updated for namespace security fixes
 - Do not run untrusted FreeBSD binaries without reviewing them first
@@ -80,7 +80,7 @@ BSDulator has inherent security characteristics that users should be aware of:
 | Latest on `main` | Yes |
 | Older commits | Best effort |
 
-As BSDulator is pre-1.0, security fixes are applied to the `main` branch only.
+As Lochs is pre-1.0, security fixes are applied to the `main` branch only.
 
 ## Credit
 
