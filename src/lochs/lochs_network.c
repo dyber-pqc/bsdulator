@@ -15,6 +15,7 @@
 #include <arpa/inet.h>
 #include <getopt.h>
 #include "bsdulator/lochs.h"
+#include "bsdulator/lochs_exec.h"
 
 /* Global network list */
 static lochs_network_t networks[LOCHS_MAX_NETWORKS];
@@ -132,7 +133,31 @@ static int parse_subnet(const char *subnet, char *base, size_t base_size, int *p
 /*
  * Create a new network
  */
+/* Accept only "a.b.c.d/prefix" with a valid IPv4 address and prefix 8..30. */
+static int subnet_valid(const char *subnet) {
+    char addr[32];
+    const char *slash = strchr(subnet, '/');
+    if (!slash || (size_t)(slash - subnet) >= sizeof(addr)) return 0;
+    memcpy(addr, subnet, (size_t)(slash - subnet));
+    addr[slash - subnet] = '\0';
+
+    struct in_addr probe;
+    if (inet_pton(AF_INET, addr, &probe) != 1) return 0;
+
+    char *end = NULL;
+    long prefix = strtol(slash + 1, &end, 10);
+    return end && *end == '\0' && prefix >= 8 && prefix <= 30;
+}
+
 int lochs_network_create(const char *name, const char *subnet) {
+    if (!lochs_valid_name(name)) {
+        lochs_reject_name("network name", name);
+        return -1;
+    }
+    if (subnet && subnet[0] && !subnet_valid(subnet)) {
+        fprintf(stderr, "Error: invalid subnet '%s' (expected e.g. 172.20.0.0/24)\n", subnet);
+        return -1;
+    }
     if (lochs_network_find(name)) {
         fprintf(stderr, "Error: network '%s' already exists\n", name);
         return -1;
@@ -487,10 +512,8 @@ int lochs_network_setup_container(const char *container_name, const char *networ
         char hosts_dst[2048];
         snprintf(hosts_dst, sizeof(hosts_dst), "%s/etc/hosts", jail->path);
 
-        char cp_cmd[2400];
-        snprintf(cp_cmd, sizeof(cp_cmd), "cp '%s' '%s'", hosts_src, hosts_dst);
-        r = system(cp_cmd);
-        (void)r;
+        const char *cp_argv[] = { "cp", hosts_src, hosts_dst, NULL };
+        lochs_run(cp_argv, 0);
         }
 
         /*
@@ -502,9 +525,8 @@ int lochs_network_setup_container(const char *container_name, const char *networ
         snprintf(resolv_dst, sizeof(resolv_dst), "%s/etc/resolv.conf", jail->path);
 
         /* Try to copy host's resolv.conf first */
-        char cp_cmd[2400];
-        snprintf(cp_cmd, sizeof(cp_cmd), "cp /etc/resolv.conf '%s' 2>/dev/null", resolv_dst);
-        if (system(cp_cmd) != 0) {
+        const char *cp_argv[] = { "cp", "/etc/resolv.conf", resolv_dst, NULL };
+        if (lochs_run(cp_argv, LOCHS_RUN_QUIET) != 0) {
             /* Fallback: create with Google DNS */
             FILE *resolv = fopen(resolv_dst, "w");
             if (resolv) {
@@ -562,10 +584,8 @@ int lochs_network_setup_container(const char *container_name, const char *networ
                 snprintf(peer_hosts_dst, sizeof(peer_hosts_dst), 
                          "%s/etc/hosts", lochs_jails[i].path);
                 
-                char cp_cmd[2400];
-                snprintf(cp_cmd, sizeof(cp_cmd), "cp '%s' '%s'", 
-                         peer_hosts_src, peer_hosts_dst);
-                r = system(cp_cmd);
+                const char *cp_argv[] = { "cp", peer_hosts_src, peer_hosts_dst, NULL };
+                lochs_run(cp_argv, 0);
             }
         }
     }

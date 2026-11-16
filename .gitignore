@@ -72,3 +72,4 @@ desktop.ini
 
 # Docker
 .docker/
+tests/test_lochs_exec

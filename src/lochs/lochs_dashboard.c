@@ -31,6 +31,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include "bsdulator/lochs.h"
+#include "bsdulator/lochs_exec.h"
 #include "lochs_dashboard_html.h"
 
 #define DASHBOARD_DEFAULT_PORT  8420
@@ -63,10 +64,14 @@ typedef struct {
 
 static volatile sig_atomic_t dashboard_running = 1;
 
-/* Resolved path to our own binary, used by popen() so the daemon
+/* Resolved path to our own binary, used by lochs_capture() so the daemon
  * works even when /usr/local/bin isn't in PATH.  Filled once at
  * startup by resolve_self(). */
 static char lochs_bin[256] = "lochs";
+
+/* Address the dashboard binds to. Loopback by default: the API can run
+ * commands inside containers, so exposing it is an explicit choice. */
+static char listen_addr[64] = "127.0.0.1";
 
 static void resolve_self(void) {
     ssize_t n = readlink("/proc/self/exe", lochs_bin, sizeof(lochs_bin) - 1);
@@ -81,6 +86,44 @@ static void resolve_self(void) {
 /* ====================================================================
  * Helpers
  * ==================================================================== */
+
+static int json_esc(char *out, int max, const char *s);
+static void send_json(int fd, int status, const char *json, int len);
+static void send_error(int fd, int status, const char *msg);
+
+/* Send {"ok":..,"output":".."} for a command's collected output. */
+static void reply_output(int fd, int ok, const char *output) {
+    size_t esc_sz = strlen(output) * 6 + 1;
+    size_t buf_sz = esc_sz + 64;
+    char *esc = malloc(esc_sz);
+    char *buf = malloc(buf_sz);
+    if (!esc || !buf) {
+        free(esc);
+        free(buf);
+        send_error(fd, 500, "out of memory");
+        return;
+    }
+    json_esc(esc, (int)esc_sz, output);
+    int len = snprintf(buf, buf_sz, "{\"ok\":%s,\"output\":\"%s\"}",
+                       ok ? "true" : "false", esc);
+    send_json(fd, 200, buf, len);
+    free(esc);
+    free(buf);
+}
+
+/* Run argv without a shell, collect up to outsz bytes, reply as JSON. */
+static void run_and_reply(int fd, const char *const argv[], size_t outsz) {
+    char *output = malloc(outsz);
+    if (!output) { send_error(fd, 500, "out of memory"); return; }
+    int ret = lochs_capture(argv, output, outsz);
+    if (ret < 0) {
+        free(output);
+        send_error(fd, 500, "failed to execute command");
+        return;
+    }
+    reply_output(fd, ret == 0, output);
+    free(output);
+}
 
 static void safe_strcpy(char *dst, const char *src, size_t dst_size) {
     if (dst_size == 0) return;
@@ -575,39 +618,28 @@ static void api_container_action(int fd, const char *path_after) {
         return;
     }
 
+    if (!lochs_valid_name(name)) { send_error(fd, 400, "invalid name"); return; }
+
     /* For restart: stop then start */
-    char cmd[2048];
     if (strcmp(action, "restart") == 0) {
-        snprintf(cmd, sizeof(cmd), "%s stop %s 2>&1 && %s start %s 2>&1",
-                 lochs_bin, name, lochs_bin, name);
+        const char *stop_argv[] = { lochs_bin, "stop", name, NULL };
+        const char *start_argv[] = { lochs_bin, "start", name, NULL };
+        char output[4096] = "";
+        size_t used;
+        int ok = (lochs_capture(stop_argv, output, sizeof(output)) == 0);
+        used = strlen(output);
+        if (ok)
+            ok = (lochs_capture(start_argv, output + used, sizeof(output) - used) == 0);
+        reply_output(fd, ok, output);
     } else {
-        snprintf(cmd, sizeof(cmd), "%s %s %s 2>&1", lochs_bin, action, name);
-    }
-
-    char output[4096] = "";
-    int out_pos = 0;
-    FILE *fp = popen(cmd, "r");
-    if (fp) {
-        char line[256];
-        while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256) {
-            out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
-        }
-        int ret = pclose(fp);
-        int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
-
-        char esc[4096];
-        json_esc(esc, sizeof(esc), output);
-        char buf[8192];
-        int len = snprintf(buf, sizeof(buf),
-            "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc);
-        send_json(fd, 200, buf, len);
-    } else {
-        send_error(fd, 500, "failed to execute command");
+        const char *argv[] = { lochs_bin, action, name, NULL };
+        run_and_reply(fd, argv, 4096);
     }
 }
 
 /* GET /api/logs/<name> */
 static void api_container_logs(int fd, const char *name) {
+    if (!lochs_valid_name(name)) { send_error(fd, 400, "invalid name"); return; }
     char path[512];
     snprintf(path, sizeof(path), "%s/%s.log", LOG_DIR, name);
 
@@ -853,55 +885,24 @@ static void api_network_create(int fd, http_request_t *req) {
     json_get_str(req->body, "name", name, sizeof(name));
     json_get_str(req->body, "subnet", subnet, sizeof(subnet));
     if (!name[0]) { send_error(fd, 400, "missing name"); return; }
-    if (!is_safe_name(name)) { send_error(fd, 400, "invalid name"); return; }
+    if (!lochs_valid_name(name)) { send_error(fd, 400, "invalid name"); return; }
+    if (subnet[0] && !is_safe_name(subnet)) { send_error(fd, 400, "invalid subnet"); return; }
 
-    char cmd[1024];
-    if (subnet[0] && is_safe_name(subnet))
-        snprintf(cmd, sizeof(cmd), "%s network create %s --subnet %s 2>&1",
-                 lochs_bin, name, subnet);
-    else
-        snprintf(cmd, sizeof(cmd), "%s network create %s 2>&1", lochs_bin, name);
-
-    char output[4096] = "";
-    int out_pos = 0;
-    FILE *fp = popen(cmd, "r");
-    if (!fp) { send_error(fd, 500, "failed to execute"); return; }
-    char line[256];
-    while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256)
-        out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
-    int ret = pclose(fp);
-    int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
-
-    char esc_out[4096];
-    json_esc(esc_out, sizeof(esc_out), output);
-    char buf[8192];
-    int len = snprintf(buf, sizeof(buf),
-        "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc_out);
-    send_json(fd, 200, buf, len);
+    if (subnet[0]) {
+        const char *argv[] = { lochs_bin, "network", "create", name,
+                               "--subnet", subnet, NULL };
+        run_and_reply(fd, argv, 4096);
+    } else {
+        const char *argv[] = { lochs_bin, "network", "create", name, NULL };
+        run_and_reply(fd, argv, 4096);
+    }
 }
 
 /* DELETE /api/networks/<name> */
 static void api_network_delete(int fd, const char *name) {
-    if (!is_safe_name(name)) { send_error(fd, 400, "invalid name"); return; }
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "%s network rm %s 2>&1", lochs_bin, name);
-
-    char output[4096] = "";
-    int out_pos = 0;
-    FILE *fp = popen(cmd, "r");
-    if (!fp) { send_error(fd, 500, "failed to execute"); return; }
-    char line[256];
-    while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256)
-        out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
-    int ret = pclose(fp);
-    int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
-
-    char esc_out[4096];
-    json_esc(esc_out, sizeof(esc_out), output);
-    char buf[8192];
-    int len = snprintf(buf, sizeof(buf),
-        "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc_out);
-    send_json(fd, 200, buf, len);
+    if (!lochs_valid_name(name)) { send_error(fd, 400, "invalid name"); return; }
+    const char *argv[] = { lochs_bin, "network", "rm", name, NULL };
+    run_and_reply(fd, argv, 4096);
 }
 
 /* POST /api/volumes — create a volume */
@@ -910,51 +911,17 @@ static void api_volume_create(int fd, http_request_t *req) {
     char name[64];
     json_get_str(req->body, "name", name, sizeof(name));
     if (!name[0]) { send_error(fd, 400, "missing name"); return; }
-    if (!is_safe_name(name)) { send_error(fd, 400, "invalid name"); return; }
+    if (!lochs_valid_name(name)) { send_error(fd, 400, "invalid name"); return; }
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "%s volume create %s 2>&1", lochs_bin, name);
-
-    char output[4096] = "";
-    int out_pos = 0;
-    FILE *fp = popen(cmd, "r");
-    if (!fp) { send_error(fd, 500, "failed to execute"); return; }
-    char line[256];
-    while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256)
-        out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
-    int ret = pclose(fp);
-    int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
-
-    char esc_out[4096];
-    json_esc(esc_out, sizeof(esc_out), output);
-    char buf[8192];
-    int len = snprintf(buf, sizeof(buf),
-        "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc_out);
-    send_json(fd, 200, buf, len);
+    const char *argv[] = { lochs_bin, "volume", "create", name, NULL };
+    run_and_reply(fd, argv, 4096);
 }
 
 /* DELETE /api/volumes/<name> */
 static void api_volume_delete(int fd, const char *name) {
-    if (!is_safe_name(name)) { send_error(fd, 400, "invalid name"); return; }
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "%s volume rm %s 2>&1", lochs_bin, name);
-
-    char output[4096] = "";
-    int out_pos = 0;
-    FILE *fp = popen(cmd, "r");
-    if (!fp) { send_error(fd, 500, "failed to execute"); return; }
-    char line[256];
-    while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256)
-        out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
-    int ret = pclose(fp);
-    int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
-
-    char esc_out[4096];
-    json_esc(esc_out, sizeof(esc_out), output);
-    char buf[8192];
-    int len = snprintf(buf, sizeof(buf),
-        "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc_out);
-    send_json(fd, 200, buf, len);
+    if (!lochs_valid_name(name)) { send_error(fd, 400, "invalid name"); return; }
+    const char *argv[] = { lochs_bin, "volume", "rm", name, NULL };
+    run_and_reply(fd, argv, 4096);
 }
 
 /* POST /api/build — Build from Lochfile content */
@@ -964,7 +931,7 @@ static void api_build(int fd, http_request_t *req) {
     json_get_str(req->body, "tag", tag, sizeof(tag));
     json_get_str(req->body, "content", content, sizeof(content));
     if (!content[0]) { send_error(fd, 400, "missing Lochfile content"); return; }
-    if (tag[0] && !is_safe_name(tag)) { send_error(fd, 400, "invalid tag"); return; }
+    if (tag[0] && !lochs_valid_image_ref(tag)) { send_error(fd, 400, "invalid tag"); return; }
 
     /* Write Lochfile to temp file */
     char tmppath[128] = "/tmp/lochs_build_XXXXXX";
@@ -974,68 +941,25 @@ static void api_build(int fd, http_request_t *req) {
     close(tmpfd);
     if (w < 0) { unlink(tmppath); send_error(fd, 500, "failed to write temp file"); return; }
 
-    char cmd[2048];
-    if (tag[0])
-        snprintf(cmd, sizeof(cmd), "%s build -f %s -t %s 2>&1", lochs_bin, tmppath, tag);
-    else
-        snprintf(cmd, sizeof(cmd), "%s build -f %s 2>&1", lochs_bin, tmppath);
-
-    char output[8192] = "";
-    int out_pos = 0;
-    FILE *fp = popen(cmd, "r");
-    if (!fp) { unlink(tmppath); send_error(fd, 500, "failed to execute"); return; }
-    char line[256];
-    while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256)
-        out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
-    int ret = pclose(fp);
-    int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
+    if (tag[0]) {
+        const char *argv[] = { lochs_bin, "build", "-f", tmppath, "-t", tag, NULL };
+        run_and_reply(fd, argv, 8192);
+    } else {
+        const char *argv[] = { lochs_bin, "build", "-f", tmppath, NULL };
+        run_and_reply(fd, argv, 8192);
+    }
     unlink(tmppath);
-
-    char *buf = malloc(32768);
-    if (!buf) { send_error(fd, 500, "out of memory"); return; }
-    char esc_out[16384];
-    json_esc(esc_out, sizeof(esc_out), output);
-    int len = snprintf(buf, 32768,
-        "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc_out);
-    send_json(fd, 200, buf, len);
-    free(buf);
 }
 
 /* DELETE /api/images/<spec> */
 static void api_image_delete(int fd, const char *image_spec) {
-    /* Validate: only allow sane characters */
-    for (const char *p = image_spec; *p; p++) {
-        if (!(*p >= 'a' && *p <= 'z') && !(*p >= 'A' && *p <= 'Z') &&
-            !(*p >= '0' && *p <= '9') && *p != ':' && *p != '-' &&
-            *p != '_' && *p != '.' && *p != '/') {
-            send_error(fd, 400, "invalid image name");
-            return;
-        }
+    if (!lochs_valid_image_ref(image_spec)) {
+        send_error(fd, 400, "invalid image name");
+        return;
     }
 
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "%s rmi %s 2>&1", lochs_bin, image_spec);
-
-    char output[4096] = "";
-    int out_pos = 0;
-    FILE *fp = popen(cmd, "r");
-    if (fp) {
-        char line[256];
-        while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256) {
-            out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
-        }
-        int ret = pclose(fp);
-        int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
-
-        char esc_out[4096];
-        json_esc(esc_out, sizeof(esc_out), output);
-        char buf[8192];
-        int len = snprintf(buf, sizeof(buf),
-            "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc_out);
-        send_json(fd, 200, buf, len);
-    } else {
-        send_error(fd, 500, "failed to execute command");
-    }
+    const char *argv[] = { lochs_bin, "rmi", image_spec, NULL };
+    run_and_reply(fd, argv, 4096);
 }
 
 /* POST /api/containers — Create a new container */
@@ -1055,83 +979,71 @@ static void api_container_create(int fd, http_request_t *req) {
 
     if (!name[0]) { send_error(fd, 400, "missing name"); return; }
     if (!image[0]) { send_error(fd, 400, "missing image"); return; }
-    if (!is_safe_name(name) || !is_safe_name(image)) {
+    if (!lochs_valid_name(name) || !lochs_valid_image_ref(image)) {
         send_error(fd, 400, "invalid characters");
         return;
     }
 
-    /* Build command */
-    char cmd[2048];
-    int cpos = 0;
-    cpos += snprintf(cmd + cpos, sizeof(cmd) - (size_t)cpos,
-        "%s create %s -i %s", lochs_bin, name, image);
+    /* Build the argument vector; every value is a separate argument, so
+     * no value is ever parsed by a shell. */
+    #define CREATE_MAX_ARGS 96
+    const char *argv[CREATE_MAX_ARGS];
+    char ports_copy[256], env_copy[512];
+    int ac = 0;
+    argv[ac++] = lochs_bin;
+    argv[ac++] = "create";
+    argv[ac++] = name;
+    argv[ac++] = "-i";
+    argv[ac++] = image;
 
-    /* Parse ports: comma-separated "8080:80,3000:3000" */
-    if (ports_str[0]) {
-        char *tok = ports_str, *sep;
-        while ((sep = strchr(tok, ',')) != NULL || tok[0]) {
-            char port_one[32];
-            if (sep) { size_t pl2 = (size_t)(sep - tok); if(pl2>=sizeof(port_one))pl2=sizeof(port_one)-1;
-                memcpy(port_one,tok,pl2);port_one[pl2]='\0'; tok=sep+1; }
-            else { safe_strcpy(port_one, tok, sizeof(port_one)); tok += strlen(tok); }
-            if (port_one[0] && is_safe_name(port_one))
-                cpos += snprintf(cmd + cpos, sizeof(cmd) - (size_t)cpos, " -p %s", port_one);
-            if (!sep) break;
-        }
+    /* Ports: comma-separated "8080:80,3000:3000" */
+    safe_strcpy(ports_copy, ports_str, sizeof(ports_copy));
+    for (char *save = NULL, *tok = strtok_r(ports_copy, ",", &save);
+         tok && ac < CREATE_MAX_ARGS - 12; tok = strtok_r(NULL, ",", &save)) {
+        if (!is_safe_name(tok)) { send_error(fd, 400, "invalid port"); return; }
+        argv[ac++] = "-p";
+        argv[ac++] = tok;
     }
-    if (memory[0] && is_safe_name(memory))
-        cpos += snprintf(cmd + cpos, sizeof(cmd) - (size_t)cpos, " --memory %s", memory);
-    if (cpus[0] && is_safe_name(cpus))
-        cpos += snprintf(cmd + cpos, sizeof(cmd) - (size_t)cpos, " --cpus %s", cpus);
-    if (pids_str[0] && is_safe_name(pids_str))
-        cpos += snprintf(cmd + cpos, sizeof(cmd) - (size_t)cpos, " --pids-limit %s", pids_str);
-
-    /* Parse env: comma-separated "KEY=val,KEY2=val2" */
-    if (env_str[0]) {
-        char *tok = env_str, *sep;
-        while ((sep = strchr(tok, ',')) != NULL || tok[0]) {
-            char env_one[128];
-            if (sep) { size_t el = (size_t)(sep - tok); if(el>=sizeof(env_one))el=sizeof(env_one)-1;
-                memcpy(env_one,tok,el);env_one[el]='\0'; tok=sep+1; }
-            else { safe_strcpy(env_one, tok, sizeof(env_one)); tok += strlen(tok); }
-            if (env_one[0])
-                cpos += snprintf(cmd + cpos, sizeof(cmd) - (size_t)cpos, " -e %s", env_one);
-            if (!sep) break;
-        }
+    if (memory[0]) {
+        if (!is_safe_name(memory)) { send_error(fd, 400, "invalid memory"); return; }
+        argv[ac++] = "--memory";
+        argv[ac++] = memory;
+    }
+    if (cpus[0]) {
+        if (!is_safe_name(cpus)) { send_error(fd, 400, "invalid cpus"); return; }
+        argv[ac++] = "--cpus";
+        argv[ac++] = cpus;
+    }
+    if (pids_str[0]) {
+        if (!is_safe_name(pids_str)) { send_error(fd, 400, "invalid pids"); return; }
+        argv[ac++] = "--pids-limit";
+        argv[ac++] = pids_str;
     }
 
-    cpos += snprintf(cmd + cpos, sizeof(cmd) - (size_t)cpos, " 2>&1");
+    /* Env: comma-separated "KEY=val,KEY2=val2"; values may hold any
+     * characters because they are passed as single arguments. */
+    safe_strcpy(env_copy, env_str, sizeof(env_copy));
+    for (char *save = NULL, *tok = strtok_r(env_copy, ",", &save);
+         tok && ac < CREATE_MAX_ARGS - 3; tok = strtok_r(NULL, ",", &save)) {
+        argv[ac++] = "-e";
+        argv[ac++] = tok;
+    }
+    argv[ac] = NULL;
 
-    /* Execute create */
     char output[4096] = "";
-    int out_pos = 0;
-    FILE *fp = popen(cmd, "r");
-    if (!fp) { send_error(fd, 500, "failed to execute"); return; }
-    char line[256];
-    while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256)
-        out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
-    int ret = pclose(fp);
-    int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
+    int ret = lochs_capture(argv, output, sizeof(output));
+    if (ret < 0) { send_error(fd, 500, "failed to execute"); return; }
+    int ok = (ret == 0);
 
     /* Auto-start if requested */
     if (ok && strcmp(start_val, "true") == 0) {
-        char start_cmd[1024];
-        snprintf(start_cmd, sizeof(start_cmd), "%s start %s 2>&1", lochs_bin, name);
-        FILE *sf = popen(start_cmd, "r");
-        if (sf) {
-            while (fgets(line, sizeof(line), sf) && out_pos < (int)sizeof(output) - 256)
-                out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
-            int sr = pclose(sf);
-            if (!WIFEXITED(sr) || WEXITSTATUS(sr) != 0) ok = 0;
-        }
+        const char *start_argv[] = { lochs_bin, "start", name, NULL };
+        size_t used = strlen(output);
+        if (lochs_capture(start_argv, output + used, sizeof(output) - used) != 0)
+            ok = 0;
     }
 
-    char esc_out[4096];
-    json_esc(esc_out, sizeof(esc_out), output);
-    char buf[8192];
-    int len = snprintf(buf, sizeof(buf),
-        "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc_out);
-    send_json(fd, 200, buf, len);
+    reply_output(fd, ok, output);
 }
 
 /* POST /api/containers/<name>/exec — Execute command in container */
@@ -1148,45 +1060,25 @@ static void api_container_exec(int fd, const char *name, http_request_t *req) {
     if (!jail) { send_error(fd, 404, "container not found"); return; }
     if (jail->state != JAIL_STATE_RUNNING) { send_error(fd, 400, "container not running"); return; }
 
-    /* Sanitize: replace single quotes */
-    for (char *p = user_cmd; *p; p++) { if (*p == '\'') *p = ' '; }
+    /* Run: bsdulator [--netns <ns>] <path>/ld-elf.so.1 <path>/jexec <jail>
+     *      /bin/sh -c <cmd>
+     * The user's command is one argument to the jail's /bin/sh; the host
+     * never parses it. */
+    char ld_path[LOCHS_MAX_PATH + 32], jexec_path[LOCHS_MAX_PATH + 32];
+    snprintf(ld_path, sizeof(ld_path), "%s/libexec/ld-elf.so.1", jail->path);
+    snprintf(jexec_path, sizeof(jexec_path), "%s/usr/sbin/jexec", jail->path);
 
-    /* Build bsdulator command directly (same as lochs_cmd_exec):
-     * bsdulator [--netns <ns>] <path>/ld-elf.so.1 <path>/jexec <jail> /bin/sh -c '<cmd>' */
-    char cmd[4096];
-    int pos;
     if (jail->netns[0]) {
-        pos = snprintf(cmd, sizeof(cmd),
-            "/usr/local/bin/bsdulator --netns %s %s/libexec/ld-elf.so.1 %s/usr/sbin/jexec %s /bin/sh -c '%s'",
-            jail->netns, jail->path, jail->path, jail->name, user_cmd);
+        const char *argv[] = { "/usr/local/bin/bsdulator", "--netns", jail->netns,
+                               ld_path, jexec_path, jail->name,
+                               "/bin/sh", "-c", user_cmd, NULL };
+        run_and_reply(fd, argv, 8192);
     } else {
-        pos = snprintf(cmd, sizeof(cmd),
-            "/usr/local/bin/bsdulator %s/libexec/ld-elf.so.1 %s/usr/sbin/jexec %s /bin/sh -c '%s'",
-            jail->path, jail->path, jail->name, user_cmd);
+        const char *argv[] = { "/usr/local/bin/bsdulator",
+                               ld_path, jexec_path, jail->name,
+                               "/bin/sh", "-c", user_cmd, NULL };
+        run_and_reply(fd, argv, 8192);
     }
-    (void)pos;
-    /* Append stderr redirect */
-    strncat(cmd, " 2>&1", sizeof(cmd) - strlen(cmd) - 1);
-
-    char output[8192] = "";
-    int out_pos = 0;
-    FILE *fp = popen(cmd, "r");
-    if (!fp) { send_error(fd, 500, "failed to execute"); return; }
-    char line[256];
-    while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256)
-        out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
-    int ret = pclose(fp);
-    int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
-
-    /* Use larger buffer for exec output */
-    char *buf = malloc(32768);
-    if (!buf) { send_error(fd, 500, "out of memory"); return; }
-    char esc_out[16384];
-    json_esc(esc_out, sizeof(esc_out), output);
-    int len = snprintf(buf, 32768,
-        "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc_out);
-    send_json(fd, 200, buf, len);
-    free(buf);
 }
 
 /* POST /api/images/pull — Pull an image */
@@ -1196,29 +1088,10 @@ static void api_image_pull(int fd, http_request_t *req) {
     char image[128];
     json_get_str(req->body, "image", image, sizeof(image));
     if (!image[0]) { send_error(fd, 400, "missing image name"); return; }
-    if (!is_safe_name(image)) { send_error(fd, 400, "invalid image name"); return; }
+    if (!lochs_valid_image_ref(image)) { send_error(fd, 400, "invalid image name"); return; }
 
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "%s pull %s 2>&1", lochs_bin, image);
-
-    char output[8192] = "";
-    int out_pos = 0;
-    FILE *fp = popen(cmd, "r");
-    if (!fp) { send_error(fd, 500, "failed to execute"); return; }
-    char line[256];
-    while (fgets(line, sizeof(line), fp) && out_pos < (int)sizeof(output) - 256)
-        out_pos += snprintf(output + out_pos, sizeof(output) - (size_t)out_pos, "%s", line);
-    int ret = pclose(fp);
-    int ok = (WIFEXITED(ret) && WEXITSTATUS(ret) == 0);
-
-    char esc_out[8192];
-    json_esc(esc_out, sizeof(esc_out), output);
-    char *buf = malloc(32768);
-    if (!buf) { send_error(fd, 500, "out of memory"); return; }
-    int len = snprintf(buf, 32768,
-        "{\"ok\":%s,\"output\":\"%s\"}", ok ? "true" : "false", esc_out);
-    send_json(fd, 200, buf, len);
-    free(buf);
+    const char *argv[] = { lochs_bin, "pull", image, NULL };
+    run_and_reply(fd, argv, 8192);
 }
 
 /* GET /api/logs/<name>/download — Raw log file download */
@@ -1354,12 +1227,14 @@ static int auth_check(const char *auth_header) {
     if (strncmp(auth_header, "Bearer ", 7) != 0) return 0;
     const char *tok = auth_header + 7;
     size_t tlen = strlen(auth_token);
-    if (strncmp(tok, auth_token, tlen) == 0) {
-        char c = tok[tlen];
-        if (c == '\r' || c == '\n' || c == '\0' || c == ' ')
-            return 1;
-    }
-    return 0;
+    size_t glen = strcspn(tok, " \r\n");
+    if (glen != tlen) return 0;
+
+    /* Constant-time comparison so response timing reveals nothing */
+    unsigned char diff = 0;
+    for (size_t k = 0; k < tlen; k++)
+        diff |= (unsigned char)(tok[k] ^ auth_token[k]);
+    return diff == 0;
 }
 
 /* POST /api/auth — validate token for login */
@@ -1573,7 +1448,15 @@ static int dashboard_serve(int port, const char *ssl_cert, const char *ssl_key) 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
-    addr.sin_addr.s_addr = INADDR_ANY;
+    if (inet_pton(AF_INET, listen_addr, &addr.sin_addr) != 1) {
+        fprintf(stderr, "Error: invalid listen address '%s'\n", listen_addr);
+        close(server_fd);
+        return 1;
+    }
+    if (strcmp(listen_addr, "127.0.0.1") != 0)
+        fprintf(stderr, "Warning: dashboard listening on %s; anyone who can "
+                "reach this address and has the token can run commands in "
+                "containers.\n", listen_addr);
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind");
@@ -1818,6 +1701,8 @@ int lochs_cmd_dashboard(int argc, char **argv) {
             printf("\nOptions:\n");
             printf("  -p, --port <n>    Port to listen on (default: %d)\n",
                    DASHBOARD_DEFAULT_PORT);
+            printf("  --listen <addr>   IPv4 address to bind (default: 127.0.0.1;\n"
+                   "                    use 0.0.0.0 to expose on all interfaces)\n");
             printf("  --foreground      Run in foreground (don't daemonize)\n");
             printf("  --ssl-cert <f>    TLS certificate file (enables HTTPS)\n");
             printf("  --ssl-key <f>     TLS private key file\n");
@@ -1837,6 +1722,16 @@ int lochs_cmd_dashboard(int argc, char **argv) {
                 fprintf(stderr, "Error: invalid port number\n");
                 return 1;
             }
+            i += 2;
+            continue;
+        }
+        if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
+            struct in_addr probe;
+            if (inet_pton(AF_INET, argv[i + 1], &probe) != 1) {
+                fprintf(stderr, "Error: --listen needs an IPv4 address\n");
+                return 1;
+            }
+            safe_strcpy(listen_addr, argv[i + 1], sizeof(listen_addr));
             i += 2;
             continue;
         }

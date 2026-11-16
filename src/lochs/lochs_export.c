@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include "bsdulator/lochs.h"
+#include "bsdulator/lochs_exec.h"
 
 extern lochs_jail_t lochs_jails[];
 extern int lochs_jail_count;
@@ -58,10 +59,8 @@ int lochs_cmd_export(int argc, char **argv) {
     /* Write tar to stdout */
     fprintf(stderr, "Exporting container '%s' from %s...\n", name, jail->path);
 
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "tar -cf - -C '%s' . 2>/dev/null", jail->path);
-
-    int r = system(cmd);
+    const char *tar_argv[] = { "tar", "-cf", "-", "-C", jail->path, ".", NULL };
+    int r = lochs_run(tar_argv, 0);
     if (r != 0) {
         fprintf(stderr, "Error: tar failed\n");
         return 1;
@@ -93,6 +92,15 @@ int lochs_cmd_import(int argc, char **argv) {
         }
     }
 
+    if (!lochs_valid_name(name)) {
+        lochs_reject_name("container name", name);
+        return 1;
+    }
+    if (!lochs_valid_image_ref(image)) {
+        fprintf(stderr, "Error: invalid image reference '%s'\n", image);
+        return 1;
+    }
+
     /* Check tar file exists */
     struct stat st;
     if (strcmp(tarfile, "-") != 0 && stat(tarfile, &st) != 0) {
@@ -116,22 +124,17 @@ int lochs_cmd_import(int argc, char **argv) {
     char path[1024];
     snprintf(path, sizeof(path), "/var/lib/lochs/jails/%s", name);
 
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", path);
-    int r = system(cmd);
+    const char *mk_argv[] = { "mkdir", "-p", path, NULL };
+    int r = lochs_run(mk_argv, 0);
     if (r != 0) {
         fprintf(stderr, "Error: failed to create container directory\n");
         return 1;
     }
 
-    /* Extract tar */
+    /* Extract tar ("-" reads from stdin) */
     fprintf(stderr, "Importing '%s' as container '%s'...\n", tarfile, name);
-    if (strcmp(tarfile, "-") == 0) {
-        snprintf(cmd, sizeof(cmd), "tar -xf - -C '%s' 2>/dev/null", path);
-    } else {
-        snprintf(cmd, sizeof(cmd), "tar -xf '%s' -C '%s' 2>/dev/null", tarfile, path);
-    }
-    r = system(cmd);
+    const char *tar_argv[] = { "tar", "-xf", tarfile, "-C", path, NULL };
+    r = lochs_run(tar_argv, 0);
     if (r != 0) {
         fprintf(stderr, "Error: tar extraction failed\n");
         return 1;

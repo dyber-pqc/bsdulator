@@ -16,7 +16,8 @@ This directory contains example files for Lochs.
 
 ```bash
 lochs build -f examples/Lochfile -t myapp:latest
-lochs run --name myapp myapp:latest
+lochs create myapp -i myapp:latest
+lochs start myapp
 ```
 
 ### Run the compose example

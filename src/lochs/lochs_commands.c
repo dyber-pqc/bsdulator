@@ -27,7 +27,9 @@
 #include <stdint.h>
 #include <signal.h>
 #include <netinet/in.h>  /* For struct in_addr, in6_addr */
+#include <arpa/inet.h>   /* For inet_pton */
 #include "bsdulator/lochs.h"
+#include "bsdulator/lochs_exec.h"
 #include "lochs_compose.h"
 
 /* Global jail list - exposed for network module */
@@ -211,22 +213,34 @@ static int parse_volume_mapping(const char *str, lochs_volume_t *vol) {
  * Parse environment variable "KEY=value"
  * Returns 0 on success, -1 on error
  */
+/* Environment variable names: [A-Za-z_][A-Za-z0-9_]* */
+static int env_key_valid(const char *key) {
+    if (!key[0]) return 0;
+    for (const char *p = key; *p; p++) {
+        int alpha = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || *p == '_';
+        int digit = (*p >= '0' && *p <= '9');
+        if (!alpha && !(digit && p != key)) return 0;
+    }
+    return 1;
+}
+
 static int parse_env_var(const char *str, char *key, size_t key_size, char *value, size_t value_size) {
     const char *eq = strchr(str, '=');
     if (!eq) {
         /* Just a key, value is empty */
+        if (strlen(str) >= key_size) return -1;
         safe_strcpy(key, str, key_size);
         value[0] = '\0';
-        return 0;
+        return env_key_valid(key) ? 0 : -1;
     }
     
     size_t klen = (size_t)(eq - str);
-    if (klen >= key_size) klen = key_size - 1;
+    if (klen == 0 || klen >= key_size) return -1;
     memcpy(key, str, klen);
     key[klen] = '\0';
-    
+
     safe_strcpy(value, eq + 1, value_size);
-    return 0;
+    return env_key_valid(key) ? 0 : -1;
 }
 
 /*
@@ -407,6 +421,10 @@ int lochs_cmd_create(int argc, char **argv) {
                     if (parse_env_var(optarg, env_keys[env_count], sizeof(env_keys[0]),
                                      env_values[env_count], sizeof(env_values[0])) == 0) {
                         env_count++;
+                    } else {
+                        fprintf(stderr, "Error: invalid environment variable '%s' "
+                                "(name must match [A-Za-z_][A-Za-z0-9_]*)\n", optarg);
+                        return 1;
                     }
                 }
                 break;
@@ -498,12 +516,32 @@ int lochs_cmd_create(int argc, char **argv) {
     }
     
     name = argv[optind];
-    
+
+    if (!lochs_valid_name(name)) {
+        lochs_reject_name("container name", name);
+        return 1;
+    }
+    if (!lochs_valid_image_ref(image)) {
+        fprintf(stderr, "Error: invalid image reference '%s'\n", image);
+        return 1;
+    }
+    if (network && !lochs_valid_name(network)) {
+        lochs_reject_name("network name", network);
+        return 1;
+    }
+    if (ip) {
+        struct in_addr probe;
+        if (inet_pton(AF_INET, ip, &probe) != 1) {
+            fprintf(stderr, "Error: invalid IPv4 address '%s'\n", ip);
+            return 1;
+        }
+    }
+
     if (lochs_jail_find(name) != NULL) {
         fprintf(stderr, "Error: container '%s' already exists\n", name);
         return 1;
     }
-    
+
     /* Determine root path */
     char root_path[LOCHS_MAX_PATH];
     if (path) {
@@ -693,34 +731,26 @@ int lochs_cmd_create(int argc, char **argv) {
  * Returns PID of forwarder process, or -1 on error
  */
 static pid_t start_port_forward(int host_port, int container_port, const char *protocol) {
-    char cmd[512];
-    
-    /* Use socat for port forwarding */
     /* TCP: socat TCP-LISTEN:host,fork,reuseaddr TCP:127.0.0.1:container */
     /* UDP: socat UDP-LISTEN:host,fork,reuseaddr UDP:127.0.0.1:container */
-    
-    if (strcmp(protocol, "udp") == 0) {
-        snprintf(cmd, sizeof(cmd),
-            "socat UDP-LISTEN:%d,fork,reuseaddr UDP:127.0.0.1:%d &"
-            " echo $!",
-            host_port, container_port);
-    } else {
-        snprintf(cmd, sizeof(cmd),
-            "socat TCP-LISTEN:%d,fork,reuseaddr TCP:127.0.0.1:%d &"
-            " echo $!",
-            host_port, container_port);
-    }
-    
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return -1;
-    
-    pid_t pid = 0;
-    if (fscanf(fp, "%d", &pid) != 1) {
-        pid = -1;
-    }
-    pclose(fp);
-    
-    return pid;
+    char listen_spec[64], connect_spec[64];
+    int udp = (strcmp(protocol, "udp") == 0);
+
+    snprintf(listen_spec, sizeof(listen_spec), "%s-LISTEN:%d,fork,reuseaddr",
+             udp ? "UDP" : "TCP", host_port);
+    snprintf(connect_spec, sizeof(connect_spec), "%s:127.0.0.1:%d",
+             udp ? "UDP" : "TCP", container_port);
+
+    const char *argv[] = { "socat", listen_spec, connect_spec, NULL };
+    int pid = lochs_run(argv, LOCHS_RUN_NOWAIT);
+    return pid > 0 ? (pid_t)pid : -1;
+}
+
+/* Build "<jail path><suffix>" into buf. */
+static const char *jail_subpath(char *buf, size_t size,
+                                const lochs_jail_t *jail, const char *suffix) {
+    snprintf(buf, size, "%s%s", jail->path, suffix);
+    return buf;
 }
 
 /*
@@ -738,70 +768,70 @@ static void stop_port_forward(pid_t pid) {
  * Called from lochs_cmd_start() after overlay mount.
  */
 static int lochs_devfs_setup(lochs_jail_t *jail) {
-    char cmd[2048];
-    int r;
+    char p1[LOCHS_MAX_PATH + 32], p2[LOCHS_MAX_PATH + 32], p3[LOCHS_MAX_PATH + 32];
 
     /* Create /dev directory tree */
-    snprintf(cmd, sizeof(cmd), "mkdir -p '%s/dev/pts'", jail->path);
-    r = system(cmd);
-    if (r != 0) {
-        fprintf(stderr, "Warning: failed to create /dev directories\n");
-        return -1;
+    {
+        const char *argv[] = { "mkdir", "-p",
+            jail_subpath(p1, sizeof(p1), jail, "/dev/pts"),
+            jail_subpath(p2, sizeof(p2), jail, "/dev/fd"),
+            jail_subpath(p3, sizeof(p3), jail, "/dev/shm"), NULL };
+        if (lochs_run(argv, 0) != 0) {
+            fprintf(stderr, "Warning: failed to create /dev directories\n");
+            return -1;
+        }
     }
-    snprintf(cmd, sizeof(cmd), "mkdir -p '%s/dev/fd'", jail->path);
-    r = system(cmd); (void)r;
-    snprintf(cmd, sizeof(cmd), "mkdir -p '%s/dev/shm'", jail->path);
-    r = system(cmd); (void)r;
 
     /* Bind-mount standard devices from host */
     static const char *devices[] = {
         "null", "zero", "random", "urandom", "tty", NULL
     };
     for (int i = 0; devices[i]; i++) {
+        char host_dev[64], suffix[64];
+        snprintf(host_dev, sizeof(host_dev), "/dev/%s", devices[i]);
+        snprintf(suffix, sizeof(suffix), "/dev/%s", devices[i]);
+        jail_subpath(p1, sizeof(p1), jail, suffix);
+
         /* Create target file for bind mount */
-        snprintf(cmd, sizeof(cmd), "touch '%s/dev/%s' 2>/dev/null",
-            jail->path, devices[i]);
-        r = system(cmd); (void)r;
+        const char *touch_argv[] = { "touch", p1, NULL };
+        lochs_run(touch_argv, LOCHS_RUN_QUIET);
         /* Bind mount from host */
-        snprintf(cmd, sizeof(cmd), "mount --bind /dev/%s '%s/dev/%s' 2>/dev/null",
-            devices[i], jail->path, devices[i]);
-        r = system(cmd);
-        if (r != 0) {
+        const char *mount_argv[] = { "mount", "--bind", host_dev, p1, NULL };
+        if (lochs_run(mount_argv, LOCHS_RUN_QUIET) != 0) {
             fprintf(stderr, "  Warning: failed to mount /dev/%s\n", devices[i]);
         }
     }
 
     /* Mount devpts for PTY support */
-    snprintf(cmd, sizeof(cmd),
-        "mount -t devpts devpts '%s/dev/pts' -o newinstance,ptmxmode=0666 2>/dev/null",
-        jail->path);
-    r = system(cmd); (void)r;
+    {
+        const char *argv[] = { "mount", "-t", "devpts", "devpts",
+            jail_subpath(p1, sizeof(p1), jail, "/dev/pts"),
+            "-o", "newinstance,ptmxmode=0666", NULL };
+        lochs_run(argv, LOCHS_RUN_QUIET);
+    }
 
-    /* Create /dev/ptmx symlink */
-    snprintf(cmd, sizeof(cmd), "ln -sf pts/ptmx '%s/dev/ptmx' 2>/dev/null", jail->path);
-    r = system(cmd); (void)r;
-
-    /* Create convenience symlinks (one at a time to avoid buffer overflow) */
-    snprintf(cmd, sizeof(cmd),
-        "ln -sf /proc/self/fd '%s/dev/fd' 2>/dev/null", jail->path);
-    r = system(cmd); (void)r;
-    snprintf(cmd, sizeof(cmd),
-        "ln -sf /proc/self/fd/0 '%s/dev/stdin' 2>/dev/null", jail->path);
-    r = system(cmd); (void)r;
-    snprintf(cmd, sizeof(cmd),
-        "ln -sf /proc/self/fd/1 '%s/dev/stdout' 2>/dev/null", jail->path);
-    r = system(cmd); (void)r;
-    snprintf(cmd, sizeof(cmd),
-        "ln -sf /proc/self/fd/2 '%s/dev/stderr' 2>/dev/null", jail->path);
-    r = system(cmd); (void)r;
+    /* /dev/ptmx and convenience symlinks */
+    static const char *links[][2] = {
+        { "pts/ptmx",         "/dev/ptmx" },
+        { "/proc/self/fd",    "/dev/fd" },
+        { "/proc/self/fd/0",  "/dev/stdin" },
+        { "/proc/self/fd/1",  "/dev/stdout" },
+        { "/proc/self/fd/2",  "/dev/stderr" },
+    };
+    for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); i++) {
+        const char *argv[] = { "ln", "-sf", links[i][0],
+            jail_subpath(p1, sizeof(p1), jail, links[i][1]), NULL };
+        lochs_run(argv, LOCHS_RUN_QUIET);
+    }
 
     /* Mount /proc if not already present */
-    snprintf(cmd, sizeof(cmd),
-        "mkdir -p '%s/proc'", jail->path);
-    r = system(cmd); (void)r;
-    snprintf(cmd, sizeof(cmd),
-        "mount -t proc proc '%s/proc' 2>/dev/null", jail->path);
-    r = system(cmd); (void)r;
+    {
+        const char *mk_argv[] = { "mkdir", "-p",
+            jail_subpath(p1, sizeof(p1), jail, "/proc"), NULL };
+        lochs_run(mk_argv, 0);
+        const char *mnt_argv[] = { "mount", "-t", "proc", "proc", p1, NULL };
+        lochs_run(mnt_argv, LOCHS_RUN_QUIET);
+    }
 
     printf("  Devices: /dev mounted\n");
     return 0;
@@ -812,25 +842,17 @@ static int lochs_devfs_setup(lochs_jail_t *jail) {
  * Called from lochs_cmd_stop() before unmounting volumes/overlay.
  */
 static void lochs_devfs_teardown(lochs_jail_t *jail) {
-    char cmd[2048];
-    int r;
+    char p[LOCHS_MAX_PATH + 32];
 
-    /* Unmount /proc */
-    snprintf(cmd, sizeof(cmd), "umount '%s/proc' 2>/dev/null", jail->path);
-    r = system(cmd); (void)r;
-
-    /* Unmount devpts */
-    snprintf(cmd, sizeof(cmd), "umount '%s/dev/pts' 2>/dev/null", jail->path);
-    r = system(cmd); (void)r;
-
-    /* Unmount individual devices */
-    static const char *devices[] = {
-        "null", "zero", "random", "urandom", "tty", NULL
+    /* Unmount /proc, devpts, then the individual devices */
+    static const char *targets[] = {
+        "/proc", "/dev/pts", "/dev/null", "/dev/zero", "/dev/random",
+        "/dev/urandom", "/dev/tty", NULL
     };
-    for (int i = 0; devices[i]; i++) {
-        snprintf(cmd, sizeof(cmd), "umount '%s/dev/%s' 2>/dev/null",
-            jail->path, devices[i]);
-        r = system(cmd); (void)r;
+    for (int i = 0; targets[i]; i++) {
+        const char *argv[] = { "umount",
+            jail_subpath(p, sizeof(p), jail, targets[i]), NULL };
+        lochs_run(argv, LOCHS_RUN_QUIET);
     }
 
     printf("  Devices: /dev unmounted\n");
@@ -917,7 +939,6 @@ int lochs_cmd_start(int argc, char **argv) {
         for (int i = 0; i < jail->volume_count; i++) {
             lochs_volume_t *v = &jail->volumes[i];
             char mount_point[2048];
-            char mount_cmd[4096];
 
             /* Skip volumes that couldn't be resolved */
             if (v->host_path[0] == '\0') {
@@ -928,14 +949,12 @@ int lochs_cmd_start(int argc, char **argv) {
 
             /* Create mount point in container */
             snprintf(mount_point, sizeof(mount_point), "%s%s", jail->path, v->container_path);
-            snprintf(mount_cmd, sizeof(mount_cmd), "mkdir -p '%s'", mount_point);
-            int r = system(mount_cmd);
-            (void)r;
+            const char *mkdir_argv[] = { "mkdir", "-p", mount_point, NULL };
+            lochs_run(mkdir_argv, 0);
 
             /* Bind mount the host path */
-            snprintf(mount_cmd, sizeof(mount_cmd),
-                "mount --bind '%s' '%s'", v->host_path, mount_point);
-            if (system(mount_cmd) == 0) {
+            const char *bind_argv[] = { "mount", "--bind", v->host_path, mount_point, NULL };
+            if (lochs_run(bind_argv, 0) == 0) {
                 if (v->volume_name[0]) {
                     printf("  %s (%s) -> %s%s\n", v->volume_name, v->host_path,
                            v->container_path, v->readonly ? " (ro)" : "");
@@ -946,10 +965,9 @@ int lochs_cmd_start(int argc, char **argv) {
 
                 /* Make read-only if requested */
                 if (v->readonly) {
-                    snprintf(mount_cmd, sizeof(mount_cmd),
-                        "mount -o remount,ro,bind '%s'", mount_point);
-                    r = system(mount_cmd);
-                    (void)r;
+                    const char *ro_argv[] = { "mount", "-o", "remount,ro,bind",
+                                              mount_point, NULL };
+                    lochs_run(ro_argv, 0);
                 }
             } else {
                 fprintf(stderr, "  Warning: Failed to mount %s\n", v->host_path);
@@ -970,7 +988,10 @@ int lochs_cmd_start(int argc, char **argv) {
         FILE *ef = fopen(env_file, "w");
         if (ef) {
             for (int i = 0; i < jail->env_count; i++) {
-                fprintf(ef, "export %s='%s'\n", jail->env_keys[i], jail->env_values[i]);
+                /* Quote the value so the jail's shell reads it literally */
+                fprintf(ef, "export %s=", jail->env_keys[i]);
+                lochs_fprint_shell_quoted(ef, jail->env_values[i]);
+                fputc('\n', ef);
             }
             fclose(ef);
             printf("Environment: %d variable(s) set\n", jail->env_count);
@@ -993,52 +1014,47 @@ int lochs_cmd_start(int argc, char **argv) {
      * BEFORE launching bsdulator, so the jail and all its processes
      * inherit the resource limits.
      *
-     * Format: ./bsdulator [--netns <ns>] <ld-elf.so.1> <jail> -c name=X path=Y persist
+     * Format: bsdulator [--netns <ns>] <ld-elf.so.1> <jail> -c name=X path=Y persist
+     *
+     * Each value is its own argument (no shell), and the child joins the
+     * cgroup itself before exec when limits are active.
      */
-    char cmd[4096];
-    int pos = 0;
+    char ld_path[LOCHS_MAX_PATH + 32], jail_bin[LOCHS_MAX_PATH + 32];
+    char name_arg[LOCHS_MAX_NAME + 8], path_arg[LOCHS_MAX_PATH + 8];
+    char ip_arg[128], cgroup_procs[LOCHS_MAX_NAME + 64];
+    const char *jargv[16];
+    int ja = 0;
 
-    /* Prefix with cgroup migration if resource limits are active */
-    if (jail->cgroup_applied) {
-        pos = snprintf(cmd, sizeof(cmd),
-            "echo $$ > /sys/fs/cgroup/lochs/%s/cgroup.procs && ",
-            jail->name);
-    }
+    jail_subpath(ld_path, sizeof(ld_path), jail, "/libexec/ld-elf.so.1");
+    jail_subpath(jail_bin, sizeof(jail_bin), jail, "/usr/sbin/jail");
+    snprintf(name_arg, sizeof(name_arg), "name=%s", jail->name);
+    snprintf(path_arg, sizeof(path_arg), "path=%s", jail->path);
 
-    /* Start with bsdulator and optional netns */
+    jargv[ja++] = lochs_bsdulator_path();
     if (jail->netns[0]) {
-        pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos,
-            "./bsdulator --netns %s %s/libexec/ld-elf.so.1 %s/usr/sbin/jail -c name=%s path=%s",
-            jail->netns,
-            jail->path,
-            jail->path,
-            jail->name,
-            jail->path);
-    } else {
-        pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos,
-            "./bsdulator %s/libexec/ld-elf.so.1 %s/usr/sbin/jail -c name=%s path=%s",
-            jail->path,
-            jail->path,
-            jail->name,
-            jail->path);
+        jargv[ja++] = "--netns";
+        jargv[ja++] = jail->netns;
     }
-    
+    jargv[ja++] = ld_path;
+    jargv[ja++] = jail_bin;
+    jargv[ja++] = "-c";
+    jargv[ja++] = name_arg;
+    jargv[ja++] = path_arg;
     if (jail->ip4_addr[0]) {
-        pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos, 
-            " ip4.addr=%s", jail->ip4_addr);
+        snprintf(ip_arg, sizeof(ip_arg), "ip4.addr=%s", jail->ip4_addr);
+        jargv[ja++] = ip_arg;
     }
-    
-    if (jail->vnet) {
-        pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos, " vnet");
-    }
-    
-    snprintf(cmd + pos, sizeof(cmd) - (size_t)pos, " persist");
-    
-    int ret = system(cmd);
-    
-    /* system() returns wait status; check if command exited normally */
-    if (ret == -1) {
-        fprintf(stderr, "Failed to start container '%s': system() error\n", name);
+    if (jail->vnet) jargv[ja++] = "vnet";
+    jargv[ja++] = "persist";
+    jargv[ja] = NULL;
+
+    snprintf(cgroup_procs, sizeof(cgroup_procs),
+             "/sys/fs/cgroup/lochs/%s/cgroup.procs", jail->name);
+
+    int ret = lochs_run_in_cgroup(jargv,
+                                  jail->cgroup_applied ? cgroup_procs : NULL, 0);
+    if (ret < 0) {
+        fprintf(stderr, "Failed to start container '%s': could not run bsdulator\n", name);
         return 1;
     }
     
@@ -1076,28 +1092,29 @@ int lochs_cmd_start(int argc, char **argv) {
     if (jail->cmd[0]) {
         printf("Running CMD: %s\n", jail->cmd);
 
-        /* Build the exec command with cgroup migration if active */
-        char exec_cmd[4096];
-        int epos = 0;
+        /* Run CMD in the background through the jail's own /bin/sh, so
+         * the host never parses it; join the cgroup first if active. */
+        char jexec_bin[LOCHS_MAX_PATH + 32];
+        const char *cargv[12];
+        int ca = 0;
 
-        if (jail->cgroup_applied) {
-            epos = snprintf(exec_cmd, sizeof(exec_cmd),
-                "echo $$ > /sys/fs/cgroup/lochs/%s/cgroup.procs && ",
-                jail->name);
-        }
-
+        jail_subpath(jexec_bin, sizeof(jexec_bin), jail, "/usr/sbin/jexec");
+        cargv[ca++] = lochs_bsdulator_path();
         if (jail->netns[0]) {
-            snprintf(exec_cmd + epos, sizeof(exec_cmd) - (size_t)epos,
-                "./bsdulator --netns %s %s/libexec/ld-elf.so.1 %s/usr/sbin/jexec %s %s &",
-                jail->netns, jail->path, jail->path, jail->name, jail->cmd);
-        } else {
-            snprintf(exec_cmd + epos, sizeof(exec_cmd) - (size_t)epos,
-                "./bsdulator %s/libexec/ld-elf.so.1 %s/usr/sbin/jexec %s %s &",
-                jail->path, jail->path, jail->name, jail->cmd);
+            cargv[ca++] = "--netns";
+            cargv[ca++] = jail->netns;
         }
+        cargv[ca++] = ld_path;
+        cargv[ca++] = jexec_bin;
+        cargv[ca++] = jail->name;
+        cargv[ca++] = "/bin/sh";
+        cargv[ca++] = "-c";
+        cargv[ca++] = jail->cmd;
+        cargv[ca] = NULL;
 
-        int cmd_ret = system(exec_cmd);
-        (void)cmd_ret;
+        if (lochs_run_in_cgroup(cargv, jail->cgroup_applied ? cgroup_procs : NULL,
+                                LOCHS_RUN_NOWAIT) < 0)
+            fprintf(stderr, "  Warning: failed to launch CMD\n");
     }
 
     /* Start health check monitor if configured */
@@ -1169,12 +1186,10 @@ int lochs_cmd_stop(int argc, char **argv) {
         for (int i = jail->volume_count - 1; i >= 0; i--) {
             lochs_volume_t *v = &jail->volumes[i];
             char mount_point[2048];
-            char umount_cmd[4096];
 
             snprintf(mount_point, sizeof(mount_point), "%s%s", jail->path, v->container_path);
-            snprintf(umount_cmd, sizeof(umount_cmd), "umount '%s' 2>/dev/null", mount_point);
-            int r = system(umount_cmd);
-            (void)r;
+            const char *umount_argv[] = { "umount", mount_point, NULL };
+            lochs_run(umount_argv, LOCHS_RUN_QUIET);
         }
     }
     
@@ -1184,14 +1199,13 @@ int lochs_cmd_stop(int argc, char **argv) {
     }
 
     /* Use jail -r from the container image */
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd),
-        "./bsdulator %s/libexec/ld-elf.so.1 %s/usr/sbin/jail -r %s",
-        jail->path,
-        jail->path,
-        jail->name);
+    char ld_path[LOCHS_MAX_PATH + 32], jail_bin[LOCHS_MAX_PATH + 32];
+    jail_subpath(ld_path, sizeof(ld_path), jail, "/libexec/ld-elf.so.1");
+    jail_subpath(jail_bin, sizeof(jail_bin), jail, "/usr/sbin/jail");
+    const char *rargv[] = { lochs_bsdulator_path(), ld_path, jail_bin,
+                            "-r", jail->name, NULL };
 
-    int ret = system(cmd);
+    int ret = lochs_run(rargv, 0);
 
     if (ret == 0) {
         jail->state = JAIL_STATE_STOPPED;
@@ -1297,41 +1311,45 @@ int lochs_cmd_exec(int argc, char **argv) {
     }
     
     /*
-     * Build jexec command using binaries FROM THE CONTAINER IMAGE.
-     * 
-     * If container has network namespace, pass --netns to bsdulator.
-     * Format: ./bsdulator [--netns <ns>] <ld-elf.so.1> <jexec> <jail-name> <command...>
+     * Run jexec using binaries FROM THE CONTAINER IMAGE, passing the
+     * user's command and arguments through unchanged (no host shell).
+     * Format: bsdulator [--netns <ns>] <ld-elf.so.1> <jexec> <jail-name> <command...>
      */
-    char cmd[4096];
-    int pos;
-    
+    char ld_path[LOCHS_MAX_PATH + 32], jexec_bin[LOCHS_MAX_PATH + 32];
+    jail_subpath(ld_path, sizeof(ld_path), jail, "/libexec/ld-elf.so.1");
+    jail_subpath(jexec_bin, sizeof(jexec_bin), jail, "/usr/sbin/jexec");
+
+    const char **eargv = calloc((size_t)argc + 8, sizeof(*eargv));
+    if (!eargv) {
+        fprintf(stderr, "Error: out of memory\n");
+        return 1;
+    }
+    int ea = 0;
+    eargv[ea++] = lochs_bsdulator_path();
     if (jail->netns[0]) {
-        pos = snprintf(cmd, sizeof(cmd),
-            "./bsdulator --netns %s %s/libexec/ld-elf.so.1 %s/usr/sbin/jexec %s",
-            jail->netns,
-            jail->path,
-            jail->path,
-            jail->name);
-    } else {
-        pos = snprintf(cmd, sizeof(cmd),
-            "./bsdulator %s/libexec/ld-elf.so.1 %s/usr/sbin/jexec %s",
-            jail->path,
-            jail->path,
-            jail->name);
+        eargv[ea++] = "--netns";
+        eargv[ea++] = jail->netns;
     }
-    
-    /* Add the command and arguments */
-    for (int i = 2; i < argc && pos < (int)sizeof(cmd) - 1; i++) {
-        pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos, " %s", argv[i]);
+    eargv[ea++] = ld_path;
+    eargv[ea++] = jexec_bin;
+    eargv[ea++] = jail->name;
+    for (int i = 2; i < argc; i++)
+        eargv[ea++] = argv[i];
+    eargv[ea] = NULL;
+
+    /* Show output and append it to the container's log */
+    char log_path[LOCHS_MAX_NAME + 64];
+    mkdir("/var/lib/lochs", 0755);
+    mkdir("/var/lib/lochs/logs", 0755);
+    snprintf(log_path, sizeof(log_path), "/var/lib/lochs/logs/%s.log", jail->name);
+
+    int ret = lochs_run_tee(eargv, log_path);
+    free(eargv);
+    if (ret < 0) {
+        fprintf(stderr, "Error: could not run bsdulator\n");
+        return 1;
     }
-    
-    /* Capture output to log file as well as displaying it */
-    char log_cmd[4200];
-    snprintf(log_cmd, sizeof(log_cmd), 
-        "mkdir -p /var/lib/lochs/logs && %s 2>&1 | tee -a /var/lib/lochs/logs/%s.log",
-        cmd, name);
-    
-    return system(log_cmd);
+    return ret;
 }
 
 /*
@@ -1622,7 +1640,12 @@ int lochs_cmd_build(int argc, char **argv) {
     if (optind < argc) {
         context = argv[optind];
     }
-    
+
+    if (tag && !lochs_valid_image_ref(tag)) {
+        fprintf(stderr, "Error: invalid tag '%s'\n", tag);
+        return 1;
+    }
+
     return lochs_build_from_lochfile(lochfile, context, tag);
 }
 
@@ -1780,14 +1803,14 @@ int lochs_cmd_logs(int argc, char **argv) {
     
     if (follow) {
         /* Use tail -f for following */
-        char cmd[1200];
-        snprintf(cmd, sizeof(cmd), "tail -f '%s'", log_path);
-        return system(cmd);
+        const char *targv[] = { "tail", "-f", log_path, NULL };
+        return lochs_run(targv, 0);
     } else {
         /* Show last N lines */
-        char cmd[1200];
-        snprintf(cmd, sizeof(cmd), "tail -n %d '%s'", lines, log_path);
-        return system(cmd);
+        char nbuf[32];
+        snprintf(nbuf, sizeof(nbuf), "%d", lines);
+        const char *targv[] = { "tail", "-n", nbuf, log_path, NULL };
+        return lochs_run(targv, 0);
     }
 }
 

@@ -29,9 +29,10 @@ This installs Lochs, the bsdulator engine, and fetches the FreeBSD 15.0-RELEASE 
 ## Quick Start
 
 ```bash
-# Create and run a jail
-$ lochs run --name webserver --vnet -p 8080:80 freebsd:15
-  Jail "webserver" created (JID 1) - 10.0.0.10
+# Pull the base image, then create and start a jail
+$ lochs pull freebsd:15
+$ lochs create webserver -i freebsd:15 --vnet -p 8080:80
+$ lochs start webserver
 
 # Execute into the jail
 $ lochs exec webserver /bin/sh
@@ -49,14 +50,16 @@ $ lochs rm webserver
 
 ## What Is This?
 
-**Lochs** (pronounced "locks", like the Scottish lakes) is a Docker-like container management CLI for FreeBSD jails on Linux. It provides familiar commands (`run`, `exec`, `ps`, `stop`) and brings FreeBSD's jail isolation system — the original container technology (2000, 13 years before Docker) — to any Linux host.
+**Lochs** (pronounced "locks", like the Scottish lakes) is a Docker-like container management CLI for FreeBSD jails on Linux. It provides familiar commands (`create`, `start`, `exec`, `ps`, `stop`) and brings FreeBSD's jail isolation system — the original container technology (2000, 13 years before Docker) — to any Linux host.
 
-Under the hood, Lochs uses the **bsdulator** engine, a FreeBSD binary compatibility layer that intercepts system calls via ptrace and translates them to Linux equivalents in real time — no VMs, no emulation overhead. Think Wine for FreeBSD, or the inverse of FreeBSD's Linuxulator.
+Under the hood, Lochs uses the **bsdulator** engine, a FreeBSD binary compatibility layer that intercepts system calls via ptrace and translates them to Linux equivalents in real time, with no VM. Think Wine for FreeBSD, or the inverse of FreeBSD's Linuxulator. ptrace stops on every system call, so expect noticeably slower syscall-heavy workloads than native FreeBSD.
+
+> **Status: alpha.** FreeBSD base utilities and `/bin/sh` work. Multi-threaded programs and software that relies on `kqueue` (including nginx's default configuration) do not work reliably yet; see [Known limitations](#known-limitations).
 
 ## Features
 
 ### Engine (bsdulator)
-- **222 syscalls** translated or emulated ([full matrix](docs/syscalls.md))
+- **224 FreeBSD syscalls mapped**: 175 translated directly, 49 emulated, several of them partially ([full matrix](docs/syscalls.md))
 - **Static and dynamic** FreeBSD binary support
 - **FreeBSD jail syscalls** — `jail`, `jail_get`, `jail_set`, `jail_attach`, `jail_remove`
 - **VNET** — full network stack isolation via Linux network namespaces
@@ -66,7 +69,7 @@ Under the hood, Lochs uses the **bsdulator** engine, a FreeBSD binary compatibil
 - **Path translation** — FreeBSD system paths redirected to local root
 
 ### Lochs CLI
-- **Docker-like commands** — `pull`, `run`, `exec`, `stop`, `rm`, `ps`
+- **Docker-like commands** — `pull`, `create`, `start`, `exec`, `stop`, `rm`, `ps`
 - **Lochfile** — Dockerfile equivalent for building custom jail images
 - **lochs.yml** — Compose files for multi-service deployments
 - **Image registry** — Pull from FreeBSD mirrors or custom registries
@@ -168,13 +171,23 @@ Environment:
 | Signals | sigaction, sigprocmask, sigfastblock | Full |
 | IPC | semget, msgget, shmget | Full |
 | *at syscalls | openat, fstatat, unlinkat | Full |
-| Threading | thr_self, thr_exit, thr_kill, _umtx_op | Emulated |
+| Threading | thr_self, thr_exit, thr_kill, _umtx_op | Partial: `thr_new` missing, `_umtx_op` returns without waiting or locking |
 | sysctl | __sysctl, __sysctlbyname | Emulated |
 | Jail | jail, jail_get, jail_set, jail_attach, jail_remove | Full |
-| kqueue | kqueue, kevent | Basic |
+| kqueue | kqueue, kevent | Not working: the backing epoll fd is created in the tracer, not the jailed process |
 | Capsicum | cap_enter, cap_getmode | Stub |
 
-222 total syscalls. See [docs/syscalls.md](docs/syscalls.md) for the complete matrix.
+224 syscalls mapped (175 translated, 49 emulated, 12 more explicitly unsupported). See [docs/syscalls.md](docs/syscalls.md) for the complete matrix.
+
+## Known Limitations
+
+- **Not a security boundary yet.** A jail is a Linux network namespace plus `chroot`; there are no PID, mount or user namespaces and no seccomp filter, so root inside a jail is root on the host. Only run software you trust.
+- **No real threads.** `thr_new` is not implemented and `_umtx_op` does not block or lock, so multi-threaded FreeBSD programs (Redis, Node.js, Go, Rust) fail or misbehave.
+- **kqueue does not work.** Software that uses it, including nginx's default event method, will not run correctly. For nginx, `use poll;` is a workaround.
+- **Speed.** ptrace adds two context switches per system call.
+- **Dashboard.** `lochs dashboard` listens on 127.0.0.1 by default and requires a bearer token; `--listen 0.0.0.0` exposes it, and anyone with the token can run commands in containers.
+
+These are the first items on the engine roadmap.
 
 ## System Requirements
 
@@ -210,12 +223,13 @@ bsdulator/
 ## Roadmap
 
 ### Completed
-- [x] 222 FreeBSD syscall translations
+- [x] 224 FreeBSD syscalls mapped (see Known Limitations for partial ones)
 - [x] Static and dynamic binary support
 - [x] FreeBSD shell with pipes and redirects
 - [x] Full jail lifecycle (create, list, exec, remove)
 - [x] VNET with bridge networking
 - [x] Lochs CLI with Lochfile and compose support
+- [x] Web dashboard (`lochs dashboard`)
 
 ### In Progress
 - [ ] NAT/masquerade for external jail connectivity
@@ -224,7 +238,8 @@ bsdulator/
 - [ ] `lochs.dev/install.sh` one-line installer
 
 ### Planned
-- [ ] Web dashboard
+- [ ] Threads (`thr_new`, real `_umtx_op`) and working kqueue
+- [ ] PID, mount and user namespaces plus seccomp for real isolation
 - [ ] macOS support via Hypervisor.framework VM
 - [ ] Windows native support via Hyper-V
 - [ ] GPU passthrough for ML workloads

@@ -17,6 +17,7 @@
 #include <time.h>
 #include <errno.h>
 #include "bsdulator/lochs.h"
+#include "bsdulator/lochs_exec.h"
 
 /* Global named volume list */
 static lochs_named_volume_t volumes[LOCHS_MAX_NAMED_VOLUMES];
@@ -136,6 +137,16 @@ int lochs_volume_is_in_use(const char *name) {
     return 0;
 }
 
+/* Human-readable size of path ("du -sh"), or "N/A". */
+static void volume_size(const char *path, char *out, size_t out_size) {
+    char buf[256];
+    const char *argv[] = { "du", "-sh", path, NULL };
+    safe_strcpy(out, "N/A", out_size);
+    if (lochs_capture_stdout(argv, buf, sizeof(buf)) != 0) return;
+    buf[strcspn(buf, "\t \n")] = '\0';
+    if (buf[0]) safe_strcpy(out, buf, out_size);
+}
+
 /*
  * Create a new named volume
  */
@@ -183,9 +194,8 @@ int lochs_volume_create(const char *name) {
 
     /* Create directory if not ZFS-backed */
     if (!vol->zfs_dataset[0]) {
-        char cmd[2048];
-        snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", vol->path);
-        if (system(cmd) != 0) {
+        const char *argv[] = { "mkdir", "-p", vol->path, NULL };
+        if (lochs_run(argv, 0) != 0) {
             fprintf(stderr, "Error: failed to create volume directory '%s'\n", vol->path);
             return -1;
         }
@@ -238,10 +248,8 @@ int lochs_volume_remove(const char *name) {
         lochs_zfs_volume_destroy(name);
     } else {
         /* Remove directory */
-        char cmd[2048];
-        snprintf(cmd, sizeof(cmd), "rm -rf '%s'", vol->path);
-        int r = system(cmd);
-        (void)r;
+        const char *argv[] = { "rm", "-rf", "--", vol->path, NULL };
+        lochs_run(argv, 0);
     }
 
     /* Mark as inactive */
@@ -273,18 +281,8 @@ int lochs_volume_list(void) {
     for (int i = 0; i < volume_count; i++) {
         if (volumes[i].active) {
             /* Get volume size using du */
-            char size_str[32] = "N/A";
-            char cmd[2048];
-            snprintf(cmd, sizeof(cmd), "du -sh '%s' 2>/dev/null | cut -f1", volumes[i].path);
-            FILE *p = popen(cmd, "r");
-            if (p) {
-                if (fgets(size_str, sizeof(size_str), p)) {
-                    /* Strip newline */
-                    char *nl = strchr(size_str, '\n');
-                    if (nl) *nl = '\0';
-                }
-                pclose(p);
-            }
+            char size_str[32];
+            volume_size(volumes[i].path, size_str, sizeof(size_str));
 
             /* Format creation time */
             char time_str[64];
@@ -332,17 +330,8 @@ static int lochs_volume_inspect(const char *name) {
     }
 
     /* Get volume size */
-    char size_str[32] = "N/A";
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "du -sh '%s' 2>/dev/null | cut -f1", vol->path);
-    FILE *p = popen(cmd, "r");
-    if (p) {
-        if (fgets(size_str, sizeof(size_str), p)) {
-            char *nl = strchr(size_str, '\n');
-            if (nl) *nl = '\0';
-        }
-        pclose(p);
-    }
+    char size_str[32];
+    volume_size(vol->path, size_str, sizeof(size_str));
 
     printf("Name:       %s\n", vol->name);
     printf("Driver:     %s\n", vol->zfs_dataset[0] ? "zfs" : "local");

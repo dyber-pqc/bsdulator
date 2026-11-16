@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include "bsdulator/lochs.h"
+#include "bsdulator/lochs_exec.h"
 
 #define HEALTH_DIR "/var/lib/lochs/health"
 #define MAX_HEALTH_RESTARTS 5   /* Cap auto-restarts to prevent infinite loops */
@@ -158,104 +159,68 @@ static void health_cleanup_files(const char *container_name) {
 
 /* ─── Health check execution ─── */
 
-/* SIGALRM handler for timeout */
-static volatile sig_atomic_t check_timed_out = 0;
-
-static void alarm_handler(int sig) {
-    (void)sig;
-    check_timed_out = 1;
-}
-
 /*
  * Execute a health check command inside the jail.
- * Uses popen() to capture output. Enforces timeout via alarm().
+ * The command is one argument to the jail's /bin/sh (never parsed by the
+ * host). The process is killed if it exceeds the configured timeout.
  * Returns exit code: 0 = healthy, non-zero = unhealthy.
  */
 static int health_exec_check(const lochs_jail_t *jail,
                              char *output, size_t output_size) {
-    char cmd[4096];
+    char ld_path[LOCHS_MAX_PATH + 32], jexec_path[LOCHS_MAX_PATH + 32];
+    snprintf(ld_path, sizeof(ld_path), "%s/libexec/ld-elf.so.1", jail->path);
+    snprintf(jexec_path, sizeof(jexec_path), "%s/usr/sbin/jexec", jail->path);
 
-    /* Build jexec command through bsdulator */
+    const char *argv[12];
+    int ac = 0;
+    argv[ac++] = lochs_bsdulator_path();
     if (jail->netns[0]) {
-        snprintf(cmd, sizeof(cmd),
-            "./bsdulator --netns %s %s/libexec/ld-elf.so.1 %s/usr/sbin/jexec %s /bin/sh -c '%s' 2>&1",
-            jail->netns, jail->path, jail->path, jail->name, jail->healthcheck.cmd);
-    } else {
-        snprintf(cmd, sizeof(cmd),
-            "./bsdulator %s/libexec/ld-elf.so.1 %s/usr/sbin/jexec %s /bin/sh -c '%s' 2>&1",
-            jail->path, jail->path, jail->name, jail->healthcheck.cmd);
+        argv[ac++] = "--netns";
+        argv[ac++] = jail->netns;
     }
+    argv[ac++] = ld_path;
+    argv[ac++] = jexec_path;
+    argv[ac++] = jail->name;
+    argv[ac++] = "/bin/sh";
+    argv[ac++] = "-c";
+    argv[ac++] = jail->healthcheck.cmd;
+    argv[ac] = NULL;
 
-    /* Set up timeout */
-    check_timed_out = 0;
-    struct sigaction sa, old_sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = alarm_handler;
-    sa.sa_flags = 0;
-    sigaction(SIGALRM, &sa, &old_sa);
-    alarm((unsigned)jail->healthcheck.timeout);
+    char scratch[256];
+    char *out = (output && output_size > 0) ? output : scratch;
+    size_t out_size = (output && output_size > 0) ? output_size : sizeof(scratch);
 
-    /* Execute and capture output */
-    FILE *p = popen(cmd, "r");
-    if (!p) {
-        alarm(0);
-        sigaction(SIGALRM, &old_sa, NULL);
-        if (output && output_size > 0)
-            safe_strcpy(output, "popen failed", output_size);
+    int timed_out = 0;
+    int ret = lochs_capture_timeout(argv, out, out_size,
+                                    jail->healthcheck.timeout, &timed_out);
+    if (ret < 0) {
+        safe_strcpy(out, "failed to run health check", out_size);
+        return 1;
+    }
+    if (timed_out) {
+        safe_strcpy(out, "health check timed out", out_size);
         return 1;
     }
 
-    /* Read output */
-    if (output && output_size > 0) {
-        output[0] = '\0';
-        size_t total = 0;
-        char buf[256];
-        while (fgets(buf, sizeof(buf), p) && !check_timed_out) {
-            size_t blen = strlen(buf);
-            if (total + blen < output_size - 1) {
-                memcpy(output + total, buf, blen);
-                total += blen;
-                output[total] = '\0';
-            }
-        }
-        /* Trim trailing newline */
-        if (total > 0 && output[total - 1] == '\n') {
-            output[total - 1] = '\0';
-        }
-    } else {
-        /* Drain pipe */
-        char buf[256];
-        while (fgets(buf, sizeof(buf), p) && !check_timed_out) {}
-    }
+    /* Trim trailing newline */
+    size_t total = strlen(out);
+    if (total > 0 && out[total - 1] == '\n') out[total - 1] = '\0';
 
-    int status = pclose(p);
-    alarm(0);
-    sigaction(SIGALRM, &old_sa, NULL);
-
-    if (check_timed_out) {
-        if (output && output_size > 0)
-            safe_strcpy(output, "health check timed out", output_size);
-        return 1;
-    }
-
-    if (WIFEXITED(status)) {
-        return WEXITSTATUS(status);
-    }
-    return 1;
+    return ret;
 }
 
 /* ─── Auto-restart ─── */
 
 /*
- * Restart a container by invoking lochs stop + lochs start.
- * Uses system() so each invocation loads fresh state.
+ * Restart a container by invoking lochs stop + lochs start as separate
+ * processes so each invocation loads fresh state.
  */
 static int health_restart_container(const char *container_name) {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "lochs stop %s && lochs start %s",
-             container_name, container_name);
-    int ret = system(cmd);
-    return WIFEXITED(ret) ? WEXITSTATUS(ret) : -1;
+    const char *stop_argv[] = { lochs_self_path(), "stop", container_name, NULL };
+    int ret = lochs_run(stop_argv, 0);
+    if (ret != 0) return ret;
+    const char *start_argv[] = { lochs_self_path(), "start", container_name, NULL };
+    return lochs_run(start_argv, 0);
 }
 
 /* ─── Monitor loop (runs in forked child) ─── */

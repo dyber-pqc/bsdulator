@@ -8,6 +8,7 @@
  * Default registry: http://localhost:5000 (local development)
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include "bsdulator/lochs.h"
+#include "bsdulator/lochs_exec.h"
 
 static void safe_strcpy(char *dst, const char *src, size_t dst_size) {
     if (dst_size == 0) return;
@@ -130,6 +132,10 @@ int lochs_cmd_push(int argc, char **argv) {
     }
 
     const char *image_spec = argv[1];
+    if (!lochs_valid_image_ref(image_spec)) {
+        fprintf(stderr, "Error: invalid image reference '%s'\n", image_spec);
+        return 1;
+    }
     const char *registry_host = "localhost";
     int registry_port = 5000;
 
@@ -176,16 +182,22 @@ int lochs_cmd_push(int argc, char **argv) {
         return 1;
     }
 
-    /* Create tarball */
-    char tarpath[512];
-    snprintf(tarpath, sizeof(tarpath), "/tmp/lochs_push_%s_%s.tar.gz", repo, tag);
+    /* Create tarball in a private temp file (a predictable /tmp name could
+     * be pre-created as a symlink by another user) */
+    char tarpath[64] = "/tmp/lochs_push_XXXXXX";
+    int tfd = mkstemp(tarpath);
+    if (tfd < 0) {
+        fprintf(stderr, "Error: failed to create temp file\n");
+        return 1;
+    }
+    close(tfd);
 
     printf("Compressing image '%s:%s'...\n", repo, tag);
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "tar -czf '%s' -C '%s' . 2>/dev/null", tarpath, image_path);
-    int r = system(cmd);
+    const char *tar_argv[] = { "tar", "-czf", tarpath, "-C", image_path, ".", NULL };
+    int r = lochs_run(tar_argv, 0);
     if (r != 0) {
         fprintf(stderr, "Error: failed to create tarball\n");
+        unlink(tarpath);
         return 1;
     }
 

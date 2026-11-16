@@ -41,7 +41,8 @@ LOCHS_SRCS = $(SRCDIR)/lochs/lochs_main.c \
              $(SRCDIR)/lochs/lochs_dashboard.c \
              $(SRCDIR)/lochs/lochs_cp.c \
              $(SRCDIR)/lochs/lochs_export.c \
-             $(SRCDIR)/lochs/lochs_registry.c
+             $(SRCDIR)/lochs/lochs_registry.c \
+             $(SRCDIR)/lochs/lochs_exec.c
 
 # Lochs CLI object files
 LOCHS_OBJS = $(LOCHS_SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
@@ -106,11 +107,22 @@ $(OBJDIR)/lochs/lochs_dashboard.o: $(SRCDIR)/lochs/lochs_dashboard.c $(INCDIR)/b
 $(OBJDIR)/lochs/lochs_cp.o: $(SRCDIR)/lochs/lochs_cp.c $(INCDIR)/bsdulator/lochs.h
 $(OBJDIR)/lochs/lochs_export.o: $(SRCDIR)/lochs/lochs_export.c $(INCDIR)/bsdulator/lochs.h
 $(OBJDIR)/lochs/lochs_registry.o: $(SRCDIR)/lochs/lochs_registry.c $(INCDIR)/bsdulator/lochs.h
+$(OBJDIR)/lochs/lochs_exec.o: $(SRCDIR)/lochs/lochs_exec.c $(INCDIR)/bsdulator/lochs_exec.h
+$(LOCHS_OBJS): $(INCDIR)/bsdulator/lochs_exec.h
+
+# Unit tests for the no-shell exec helpers
+TEST_EXEC = $(BINDIR)/tests/test_lochs_exec
+$(TEST_EXEC): tests/test_lochs_exec.c $(OBJDIR)/lochs/lochs_exec.o
+	@echo "  LINK    $@"
+	@$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+test-exec: $(TEST_EXEC)
+	@./$(TEST_EXEC)
 
 # Clean
 clean:
 	@echo "  CLEAN"
-	@rm -rf $(OBJDIR) $(TARGET) $(LOCHS_TARGET)
+	@rm -rf $(OBJDIR) $(TARGET) $(LOCHS_TARGET) $(TEST_EXEC)
 
 # Install
 install: $(TARGET) $(LOCHS_TARGET)
@@ -168,7 +180,8 @@ help:
 	@echo "  package-deb     - Build .deb package"
 	@echo "  package-rpm     - Build .rpm package"
 	@echo "  test          - Run test suite"
+	@echo "  test-exec     - Run unit tests for the no-shell exec helpers"
 	@echo "  setup-freebsd - Download FreeBSD base system"
 	@echo "  help          - Show this help"
 
-.PHONY: all debug verbose clean install install-service uninstall test setup-freebsd help package package-deb package-rpm
+.PHONY: all debug verbose clean install install-service uninstall test test-exec setup-freebsd help package package-deb package-rpm

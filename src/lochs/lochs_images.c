@@ -17,6 +17,7 @@
 #include <time.h>
 
 #include "bsdulator/lochs.h"
+#include "bsdulator/lochs_exec.h"
 
 /* Registry and storage paths */
 #define LOCHS_IMAGES_DIR    "/var/lib/lochs/images"
@@ -389,21 +390,18 @@ static lochs_official_image_t *find_official_image(const char *repo, const char 
  * Download file with progress
  */
 static int download_file(const char *url, const char *dest) {
-    char cmd[4096];
-    
-    int n = snprintf(cmd, sizeof(cmd),
-        "curl -L --progress-bar -o '%s' '%s' 2>&1 || "
-        "wget --progress=bar:force -O '%s' '%s' 2>&1",
-        dest, url, dest, url);
-    
-    if (n >= (int)sizeof(cmd)) {
-        fprintf(stderr, "Error: URL too long\n");
-        return -1;
-    }
-    
     printf("Downloading from %s\n", url);
-    int ret = system(cmd);
-    
+
+    /* curl first, wget as the fallback; URL and path are plain arguments */
+    const char *curl_argv[] = { "curl", "-fL", "--progress-bar",
+                                "--proto", "=https,http", "-o", dest, url, NULL };
+    int ret = lochs_run(curl_argv, 0);
+    if (ret == 127 || ret < 0) {
+        const char *wget_argv[] = { "wget", "--progress=bar:force",
+                                    "-O", dest, url, NULL };
+        ret = lochs_run(wget_argv, 0);
+    }
+
     if (ret != 0) {
         fprintf(stderr, "Download failed\n");
         unlink(dest);
@@ -433,32 +431,30 @@ static int download_file(const char *url, const char *dest) {
  * Extract tarball to directory
  */
 static int extract_tarball(const char *tarball, const char *dest) {
-    char cmd[4096];
-    int n;
-    
+    const char *mode;
+
     mkdir(dest, 0755);
-    
-    /* --warning=no-unknown-keyword suppresses FreeBSD SCHILY.fflags noise */
-    if (strstr(tarball, ".txz") || strstr(tarball, ".tar.xz")) {
-        n = snprintf(cmd, sizeof(cmd),
-            "tar --warning=no-unknown-keyword -xJf '%s' -C '%s'", tarball, dest);
-    } else if (strstr(tarball, ".tgz") || strstr(tarball, ".tar.gz")) {
-        n = snprintf(cmd, sizeof(cmd),
-            "tar --warning=no-unknown-keyword -xzf '%s' -C '%s'", tarball, dest);
-    } else {
-        n = snprintf(cmd, sizeof(cmd),
-            "tar --warning=no-unknown-keyword -xf '%s' -C '%s'", tarball, dest);
-    }
-    
-    if (n >= (int)sizeof(cmd)) {
-        fprintf(stderr, "Error: Path too long\n");
-        return -1;
-    }
-    
+
+    if (strstr(tarball, ".txz") || strstr(tarball, ".tar.xz"))
+        mode = "-xJf";
+    else if (strstr(tarball, ".tgz") || strstr(tarball, ".tar.gz"))
+        mode = "-xzf";
+    else
+        mode = "-xf";
+
     printf("Extracting to %s...\n", dest);
-    int ret = system(cmd);
+    /* --warning=no-unknown-keyword suppresses FreeBSD SCHILY.fflags noise */
+    const char *argv[] = { "tar", "--warning=no-unknown-keyword", mode,
+                           tarball, "-C", dest, NULL };
+    int ret = lochs_run(argv, 0);
 
     return (ret == 0) ? 0 : -1;
+}
+
+/* Delete everything inside dir (not dir itself), without a shell glob. */
+static void empty_dir(const char *dir) {
+    const char *argv[] = { "find", dir, "-mindepth", "1", "-delete", NULL };
+    lochs_run(argv, LOCHS_RUN_QUIET);
 }
 
 /*
@@ -466,8 +462,7 @@ static int extract_tarball(const char *tarball, const char *dest) {
  * Removes docs, debug symbols, includes, games, etc.
  */
 static void strip_image(const char *path) {
-    char cmd[2048];
-    int r;
+    char sub[2048];
 
     printf("Stripping image (removing docs, debug symbols, etc.)...\n");
 
@@ -481,43 +476,36 @@ static void strip_image(const char *path) {
     };
 
     for (int i = 0; strip_dirs[i]; i++) {
-        snprintf(cmd, sizeof(cmd), "rm -rf '%s'/%s 2>/dev/null", path, strip_dirs[i]);
-        r = system(cmd);
-        (void)r;
+        snprintf(sub, sizeof(sub), "%s/%s", path, strip_dirs[i]);
+        const char *argv[] = { "rm", "-rf", "--", sub, NULL };
+        lochs_run(argv, LOCHS_RUN_QUIET);
     }
 
     /* Clean caches */
-    snprintf(cmd, sizeof(cmd),
-        "rm -rf '%s'/var/db/pkg/* '%s'/var/cache/* '%s'/tmp/* 2>/dev/null",
-        path, path, path);
-    r = system(cmd);
-    (void)r;
+    static const char *cache_dirs[] = { "var/db/pkg", "var/cache", "tmp", NULL };
+    for (int i = 0; cache_dirs[i]; i++) {
+        snprintf(sub, sizeof(sub), "%s/%s", path, cache_dirs[i]);
+        empty_dir(sub);
+    }
 
     /* Remove non-English locales */
-    snprintf(cmd, sizeof(cmd),
-        "find '%s'/usr/share/locale -mindepth 1 -maxdepth 1 -type d "
-        "! -name 'C' ! -name 'en_US*' -exec rm -rf {} + 2>/dev/null; true",
-        path);
-    r = system(cmd);
-    (void)r;
+    snprintf(sub, sizeof(sub), "%s/usr/share/locale", path);
+    const char *argv[] = { "find", sub, "-mindepth", "1", "-maxdepth", "1",
+                           "-type", "d", "!", "-name", "C", "!", "-name", "en_US*",
+                           "-exec", "rm", "-rf", "{}", "+", NULL };
+    lochs_run(argv, LOCHS_RUN_QUIET);
 }
 
 /*
  * Get directory size in bytes
  */
 static size_t get_dir_size(const char *path) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "du -sb '%s' 2>/dev/null | cut -f1", path);
-    
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return 0;
-    
+    char out[128];
+    const char *argv[] = { "du", "-sb", path, NULL };
+    if (lochs_capture_stdout(argv, out, sizeof(out)) < 0) return 0;
+
     size_t size = 0;
-    if (fscanf(fp, "%zu", &size) != 1) {
-        size = 0;
-    }
-    pclose(fp);
-    
+    if (sscanf(out, "%zu", &size) != 1) size = 0;
     return size;
 }
 
@@ -525,6 +513,10 @@ static size_t get_dir_size(const char *path) {
  * Pull an image from registry
  */
 int lochs_image_pull(const char *image_name) {
+    if (!lochs_valid_image_ref(image_name)) {
+        fprintf(stderr, "Error: invalid image reference '%s'\n", image_name);
+        return -1;
+    }
     char repo[64], tag[32];
     parse_image_name(image_name, repo, sizeof(repo), tag, sizeof(tag));
     
@@ -696,10 +688,9 @@ int lochs_image_remove(const char *image_name) {
     
     printf("Removing %s:%s...\n", repo, tag);
     
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", img->path);
-    int ret = system(cmd);
-    
+    const char *rm_argv[] = { "rm", "-rf", "--", img->path, NULL };
+    int ret = lochs_run(rm_argv, 0);
+
     if (ret != 0) {
         fprintf(stderr, "Warning: Failed to remove image directory\n");
     }

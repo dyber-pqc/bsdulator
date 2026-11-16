@@ -27,6 +27,7 @@
 #include <sys/mount.h>
 #include <errno.h>
 #include "bsdulator/lochs.h"
+#include "bsdulator/lochs_exec.h"
 
 #define CONTAINERS_DIR "/var/lib/lochs/containers"
 
@@ -43,9 +44,9 @@ static void safe_strcpy(char *dst, const char *src, size_t dst_size) {
  * Check if ZFS is available on this system
  */
 int lochs_storage_is_zfs_available(void) {
-    /* Check if zfs command exists and works */
-    int ret = system("which zfs >/dev/null 2>&1 && zfs list >/dev/null 2>&1");
-    return (ret == 0);
+    /* Check if the zfs command exists and works */
+    const char *argv[] = { "zfs", "list", NULL };
+    return lochs_run(argv, LOCHS_RUN_QUIET) == 0;
 }
 
 /*
@@ -131,8 +132,6 @@ int lochs_storage_create_container(lochs_jail_t *jail, const char *image_path) {
 
     /* OverlayFS backend */
     char container_dir[512];
-    char cmd[4096];
-    int r;
 
     /* Container storage directory - keep name short */
     snprintf(container_dir, sizeof(container_dir), "%s/%.60s", CONTAINERS_DIR, jail->name);
@@ -153,10 +152,9 @@ int lochs_storage_create_container(lochs_jail_t *jail, const char *image_path) {
     jail->overlay_mounted = 0;
 
     /* Create directory structure */
-    snprintf(cmd, sizeof(cmd), "mkdir -p '%s' '%s' '%s'",
-             jail->diff_path, jail->work_path, jail->merged_path);
-    r = system(cmd);
-    if (r != 0) {
+    const char *mk_argv[] = { "mkdir", "-p", jail->diff_path, jail->work_path,
+                              jail->merged_path, NULL };
+    if (lochs_run(mk_argv, 0) != 0) {
         fprintf(stderr, "Error: Failed to create container directories\n");
         return -1;
     }
@@ -178,8 +176,7 @@ int lochs_storage_mount_container(lochs_jail_t *jail) {
     }
 
     /* OverlayFS backend */
-    char cmd[8192];
-    int r;
+    char opts[4096];
 
     if (jail->overlay_mounted) {
         return 0;
@@ -196,14 +193,21 @@ int lochs_storage_mount_container(lochs_jail_t *jail) {
         return -1;
     }
 
-    snprintf(cmd, sizeof(cmd),
-             "mount -t overlay overlay -o 'lowerdir=%.900s,upperdir=%.900s,workdir=%.900s' '%.900s'",
-             jail->image_path, jail->diff_path, jail->work_path, jail->merged_path);
+    /* Overlay options are comma-separated, so a path containing ',' would
+     * change their meaning */
+    if (strchr(jail->image_path, ',') || strchr(jail->diff_path, ',') ||
+        strchr(jail->work_path, ',')) {
+        fprintf(stderr, "Error: storage paths may not contain ','\n");
+        return -1;
+    }
+    snprintf(opts, sizeof(opts), "lowerdir=%.900s,upperdir=%.900s,workdir=%.900s",
+             jail->image_path, jail->diff_path, jail->work_path);
 
-    r = system(cmd);
-    if (r != 0) {
+    const char *argv[] = { "mount", "-t", "overlay", "overlay", "-o", opts,
+                           jail->merged_path, NULL };
+    if (lochs_run(argv, 0) != 0) {
         fprintf(stderr, "Error: Failed to mount overlay filesystem\n");
-        fprintf(stderr, "Command: %s\n", cmd);
+        fprintf(stderr, "Options: %s\n", opts);
         fprintf(stderr, "Make sure you're running as root and overlay is supported.\n");
         return -1;
     }
@@ -222,19 +226,14 @@ int lochs_storage_unmount_container(lochs_jail_t *jail) {
     }
 
     /* OverlayFS backend */
-    char cmd[2048];
-    int r;
-
     if (!jail->overlay_mounted) {
         return 0;
     }
 
-    snprintf(cmd, sizeof(cmd), "umount '%s' 2>/dev/null", jail->merged_path);
-    r = system(cmd);
+    const char *argv[] = { "umount", jail->merged_path, NULL };
+    lochs_run(argv, LOCHS_RUN_QUIET);
 
     jail->overlay_mounted = 0;
-
-    (void)r;
     return 0;
 }
 
@@ -249,16 +248,20 @@ int lochs_storage_destroy_container(lochs_jail_t *jail) {
     }
 
     /* OverlayFS backend */
-    char cmd[2048];
     char container_dir[LOCHS_MAX_PATH];
-    int r;
 
     lochs_storage_unmount_container(jail);
 
+    /* Never let an empty or odd name turn this into "rm -rf" of the parent */
+    if (!lochs_valid_name(jail->name)) {
+        fprintf(stderr, "Error: refusing to remove storage for invalid name '%s'\n",
+                jail->name);
+        return -1;
+    }
     snprintf(container_dir, sizeof(container_dir), "%s/%s", CONTAINERS_DIR, jail->name);
 
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", container_dir);
-    r = system(cmd);
+    const char *argv[] = { "rm", "-rf", "--", container_dir, NULL };
+    lochs_run(argv, 0);
 
     jail->image_path[0] = '\0';
     jail->diff_path[0] = '\0';
@@ -266,6 +269,5 @@ int lochs_storage_destroy_container(lochs_jail_t *jail) {
     jail->merged_path[0] = '\0';
     jail->overlay_mounted = 0;
 
-    (void)r;
     return 0;
 }

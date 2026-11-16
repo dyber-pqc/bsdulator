@@ -17,6 +17,7 @@
 
 #include "lochs_compose.h"
 #include "bsdulator/lochs.h"
+#include "bsdulator/lochs_exec.h"
 
 /* Safe string copy that always null-terminates */
 static void safe_copy(char *dst, const char *src, size_t dst_size) {
@@ -405,43 +406,41 @@ int compose_up(compose_file_t *compose, int detach) {
             
             printf("  Starting %s...\n", svc->name);
             
-            /* Build create command */
-            char cmd[4096];
-            int pos = snprintf(cmd, sizeof(cmd), 
-                "./lochs create %s --image %s",
-                container_name, svc->image);
-            
+            /* Create container: values from the compose file are passed as
+             * separate arguments to our own binary, never through a shell,
+             * and "lochs create" validates them. */
+            const char *cargv[12];
+            int ca = 0;
+            cargv[ca++] = lochs_self_path();
+            cargv[ca++] = "create";
+            cargv[ca++] = container_name;
+            cargv[ca++] = "--image";
+            cargv[ca++] = svc->image;
             if (svc->ip4_addr[0]) {
-                pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos,
-                    " --ip %s", svc->ip4_addr);
+                cargv[ca++] = "--ip";
+                cargv[ca++] = svc->ip4_addr;
             }
-            
-            if (svc->vnet) {
-                pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos, " --vnet");
-            }
-            
-            /* Create container */
-            int ret = system(cmd);
+            if (svc->vnet) cargv[ca++] = "--vnet";
+            cargv[ca] = NULL;
+
+            int ret = lochs_run(cargv, 0);
             if (ret != 0) {
                 /* Container might already exist, try to continue */
                 fprintf(stderr, "  Warning: create returned %d (container may exist)\n", ret);
             }
-            
+
             /* Start container */
-            snprintf(cmd, sizeof(cmd), "./lochs start %s", container_name);
-            ret = system(cmd);
+            const char *sargv[] = { lochs_self_path(), "start", container_name, NULL };
+            ret = lochs_run(sargv, 0);
             if (ret != 0) {
                 fprintf(stderr, "  Error: Failed to start %s\n", svc->name);
                 continue;
             }
-            
+
             /* Run command if specified */
             if (svc->command[0]) {
-                snprintf(cmd, sizeof(cmd), "./lochs exec %s %s %s",
-                    container_name, 
-                    detach ? "&" : "",
-                    svc->command);
-                /* For now, just note the command - actual background execution needs more work */
+                (void)detach;
+                /* Background execution of service commands is not implemented yet */
                 printf("  Command: %s\n", svc->command);
             }
             
@@ -482,16 +481,12 @@ int compose_down(compose_file_t *compose) {
         
         printf("  Stopping %s...\n", svc->name);
         
-        char cmd[512];
-        int ret;
-        
-        snprintf(cmd, sizeof(cmd), "./lochs stop %s 2>/dev/null", container_name);
-        ret = system(cmd);
-        (void)ret;  /* Intentionally ignore - container may not be running */
-        
-        snprintf(cmd, sizeof(cmd), "./lochs rm %s 2>/dev/null", container_name);
-        ret = system(cmd);
-        (void)ret;  /* Intentionally ignore - container may not exist */
+        /* Ignore failures: the container may not be running or may not exist */
+        const char *stop_argv[] = { lochs_self_path(), "stop", container_name, NULL };
+        lochs_run(stop_argv, LOCHS_RUN_QUIET);
+
+        const char *rm_argv[] = { lochs_self_path(), "rm", container_name, NULL };
+        lochs_run(rm_argv, LOCHS_RUN_QUIET);
         
         svc->started = 0;
     }
@@ -551,15 +546,20 @@ int compose_exec(compose_file_t *compose, const char *service, int argc, char **
     make_container_name(container_name, sizeof(container_name),
                        compose->project_name, svc->name);
     
-    /* Build exec command */
-    char cmd[4096];
-    int pos = snprintf(cmd, sizeof(cmd), "./lochs exec %s", container_name);
-    
-    for (int i = 0; i < argc && pos < (int)sizeof(cmd) - 1; i++) {
-        pos += snprintf(cmd + pos, sizeof(cmd) - (size_t)pos, " %s", argv[i]);
-    }
-    
-    return system(cmd);
+    /* Pass the user's command through unchanged: lochs exec <name> <args...> */
+    const char **eargv = calloc((size_t)argc + 4, sizeof(*eargv));
+    if (!eargv) return -1;
+    int ea = 0;
+    eargv[ea++] = lochs_self_path();
+    eargv[ea++] = "exec";
+    eargv[ea++] = container_name;
+    for (int i = 0; i < argc; i++)
+        eargv[ea++] = argv[i];
+    eargv[ea] = NULL;
+
+    int ret = lochs_run(eargv, 0);
+    free(eargv);
+    return ret;
 }
 
 /*

@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include "bsdulator/lochs.h"
+#include "bsdulator/lochs_exec.h"
 
 extern lochs_jail_t lochs_jails[];
 extern int lochs_jail_count;
@@ -91,23 +92,28 @@ int lochs_cmd_cp(int argc, char **argv) {
         return 1;
     }
 
-    /* Copy using cp (preserves attributes, handles directories) */
-    char cmd[4096];
+    /* Copy using cp (preserves attributes, handles directories); paths are
+     * passed as arguments, never through a shell. */
     int r;
 
     if (S_ISDIR(st.st_mode)) {
-        snprintf(cmd, sizeof(cmd), "cp -rp '%s' '%s'", resolved_src, resolved_dst);
-        r = system(cmd);
+        const char *cp_argv[] = { "cp", "-rp", "--", resolved_src, resolved_dst, NULL };
+        r = lochs_run(cp_argv, 0);
     } else {
         /* Ensure parent directory exists for destination */
-        snprintf(cmd, sizeof(cmd), "mkdir -p \"$(dirname '%s')\"", resolved_dst);
-        r = system(cmd);
-        if (r != 0) {
-            fprintf(stderr, "Error: failed to create parent directory\n");
-            return 1;
+        char parent[sizeof(resolved_dst)];
+        snprintf(parent, sizeof(parent), "%s", resolved_dst);
+        char *slash = strrchr(parent, '/');
+        if (slash && slash != parent) {
+            *slash = '\0';
+            const char *mk_argv[] = { "mkdir", "-p", "--", parent, NULL };
+            if (lochs_run(mk_argv, 0) != 0) {
+                fprintf(stderr, "Error: failed to create parent directory\n");
+                return 1;
+            }
         }
-        snprintf(cmd, sizeof(cmd), "cp -p '%s' '%s'", resolved_src, resolved_dst);
-        r = system(cmd);
+        const char *cp_argv[] = { "cp", "-p", "--", resolved_src, resolved_dst, NULL };
+        r = lochs_run(cp_argv, 0);
     }
     if (r == 0) {
         printf("Copied %s -> %s\n",

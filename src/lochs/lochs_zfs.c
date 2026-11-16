@@ -13,6 +13,10 @@
  *   1. LOCHS_ZFS_POOL environment variable
  *   2. /var/lib/lochs/zfs.conf
  *   3. Auto-detect first available pool
+ *
+ * Every zfs/cp command runs through lochs_run()/lochs_capture() with an
+ * argument vector, and every name that becomes part of a dataset is checked
+ * by zfs_name_ok() first.
  */
 
 #define _GNU_SOURCE
@@ -26,6 +30,7 @@
 #include <errno.h>
 #include <time.h>
 #include "bsdulator/lochs.h"
+#include "bsdulator/lochs_exec.h"
 
 #define ZFS_CONF_PATH "/var/lib/lochs/zfs.conf"
 #define ZFS_BASE_DS   "lochs"
@@ -35,28 +40,52 @@
 
 static char zfs_pool[256] = {0};
 
-/* Run a command and return exit code */
-static int zfs_run(const char *cmd) {
-    int ret = system(cmd);
-    if (ret == -1) return -1;
-    return WEXITSTATUS(ret);
+/*
+ * A single dataset or snapshot name component: letters, digits, '_', '-',
+ * '.', ':' (the characters ZFS allows), not starting with '-' or '.', and
+ * never "..". Rejects '/', '@', quotes and whitespace.
+ */
+static int zfs_name_ok(const char *s) {
+    if (!s || !s[0] || s[0] == '-' || s[0] == '.') return 0;
+    if (strlen(s) > 200 || strstr(s, "..")) return 0;
+    for (const char *p = s; *p; p++) {
+        int ok = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                 (*p >= '0' && *p <= '9') || *p == '_' || *p == '-' ||
+                 *p == '.' || *p == ':';
+        if (!ok) return 0;
+    }
+    return 1;
 }
 
-/* Run a command and capture stdout into buf */
-static int zfs_run_capture(const char *cmd, char *buf, size_t bufsz) {
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return -1;
+static int zfs_reject(const char *what, const char *value) {
+    fprintf(stderr, "Error: invalid %s '%s' for ZFS\n", what, value ? value : "");
+    return -1;
+}
 
-    size_t total = 0;
-    while (total < bufsz - 1) {
-        size_t n = fread(buf + total, 1, bufsz - 1 - total, fp);
-        if (n == 0) break;
-        total += n;
+/* 0 if the dataset or snapshot exists */
+static int zfs_exists(const char *name) {
+    const char *argv[] = { "zfs", "list", "-Ho", "name", name, NULL };
+    return lochs_run(argv, LOCHS_RUN_QUIET) == 0 ? 0 : -1;
+}
+
+/* zfs create [-o mountpoint=<mp>] <dataset> */
+static int zfs_create(const char *dataset, const char *mountpoint) {
+    if (mountpoint) {
+        char opt[600];
+        snprintf(opt, sizeof(opt), "mountpoint=%s", mountpoint);
+        const char *argv[] = { "zfs", "create", "-o", opt, dataset, NULL };
+        return lochs_run(argv, 0);
     }
-    buf[total] = '\0';
+    const char *argv[] = { "zfs", "create", dataset, NULL };
+    return lochs_run(argv, 0);
+}
 
-    int status = pclose(fp);
-    return WEXITSTATUS(status);
+/* zfs clone -o mountpoint=<mp> <origin> <dataset> */
+static int zfs_clone(const char *origin, const char *dataset, const char *mountpoint) {
+    char opt[600];
+    snprintf(opt, sizeof(opt), "mountpoint=%s", mountpoint);
+    const char *argv[] = { "zfs", "clone", "-o", opt, origin, dataset, NULL };
+    return lochs_run(argv, 0);
 }
 
 /*
@@ -67,45 +96,53 @@ const char *lochs_zfs_get_pool(void) {
     if (zfs_pool[0])
         return zfs_pool;
 
+    char candidate[256] = "";
+
     /* 1. Environment variable */
     const char *env = getenv("LOCHS_ZFS_POOL");
     if (env && env[0]) {
-        snprintf(zfs_pool, sizeof(zfs_pool), "%s", env);
-        return zfs_pool;
+        snprintf(candidate, sizeof(candidate), "%s", env);
     }
 
     /* 2. Config file */
-    FILE *f = fopen(ZFS_CONF_PATH, "r");
-    if (f) {
-        char line[256];
-        while (fgets(line, sizeof(line), f)) {
-            /* Strip newline */
-            char *nl = strchr(line, '\n');
-            if (nl) *nl = '\0';
-            /* Skip comments and empty lines */
-            if (line[0] == '#' || line[0] == '\0') continue;
-            /* Look for pool= */
-            if (strncmp(line, "pool=", 5) == 0 && line[5]) {
-                snprintf(zfs_pool, sizeof(zfs_pool), "%s", line + 5);
-                fclose(f);
-                return zfs_pool;
+    if (!candidate[0]) {
+        FILE *f = fopen(ZFS_CONF_PATH, "r");
+        if (f) {
+            char line[256];
+            while (fgets(line, sizeof(line), f)) {
+                /* Strip newline */
+                char *nl = strchr(line, '\n');
+                if (nl) *nl = '\0';
+                /* Skip comments and empty lines */
+                if (line[0] == '#' || line[0] == '\0') continue;
+                /* Look for pool= */
+                if (strncmp(line, "pool=", 5) == 0 && line[5]) {
+                    snprintf(candidate, sizeof(candidate), "%s", line + 5);
+                    break;
+                }
             }
+            fclose(f);
         }
-        fclose(f);
     }
 
     /* 3. Auto-detect: use first pool from zpool list */
-    char buf[256];
-    if (zfs_run_capture("zpool list -Ho name 2>/dev/null | head -1", buf, sizeof(buf)) == 0) {
-        char *nl = strchr(buf, '\n');
-        if (nl) *nl = '\0';
-        if (buf[0]) {
-            snprintf(zfs_pool, sizeof(zfs_pool), "%s", buf);
-            return zfs_pool;
+    if (!candidate[0]) {
+        char buf[1024];
+        const char *argv[] = { "zpool", "list", "-Ho", "name", NULL };
+        if (lochs_capture_stdout(argv, buf, sizeof(buf)) == 0) {
+            buf[strcspn(buf, "\n")] = '\0';
+            buf[sizeof(candidate) - 1] = '\0';
+            memcpy(candidate, buf, sizeof(candidate));
         }
     }
 
-    return NULL;
+    if (!candidate[0]) return NULL;
+    if (!zfs_name_ok(candidate)) {
+        zfs_reject("pool name", candidate);
+        return NULL;
+    }
+    snprintf(zfs_pool, sizeof(zfs_pool), "%s", candidate);
+    return zfs_pool;
 }
 
 /*
@@ -120,17 +157,14 @@ int lochs_zfs_init(void) {
         return -1;
     }
 
-    char cmd[512];
+    char ds[512];
     const char *datasets[] = { ZFS_BASE_DS, ZFS_IMAGES_DS, ZFS_CONTAINERS_DS, ZFS_VOLUMES_DS };
 
     for (int i = 0; i < 4; i++) {
-        /* Check if dataset exists */
-        snprintf(cmd, sizeof(cmd), "zfs list -Ho name '%s/%s' >/dev/null 2>&1", pool, datasets[i]);
-        if (zfs_run(cmd) != 0) {
-            /* Create it */
-            snprintf(cmd, sizeof(cmd), "zfs create '%s/%s'", pool, datasets[i]);
-            if (zfs_run(cmd) != 0) {
-                fprintf(stderr, "Error: Failed to create ZFS dataset %s/%s\n", pool, datasets[i]);
+        snprintf(ds, sizeof(ds), "%s/%s", pool, datasets[i]);
+        if (zfs_exists(ds) != 0) {
+            if (zfs_create(ds, NULL) != 0) {
+                fprintf(stderr, "Error: Failed to create ZFS dataset %s\n", ds);
                 return -1;
             }
         }
@@ -146,40 +180,40 @@ int lochs_zfs_init(void) {
 int lochs_zfs_import_image(const char *image_path, const char *image_name) {
     const char *pool = lochs_zfs_get_pool();
     if (!pool) return -1;
+    if (!zfs_name_ok(image_name)) return zfs_reject("image name", image_name);
 
     char dataset[512];
     char mountpoint[512];
-    char cmd[2048];
+    char snapshot[600];
 
     snprintf(dataset, sizeof(dataset), "%s/%s/%s", pool, ZFS_IMAGES_DS, image_name);
     snprintf(mountpoint, sizeof(mountpoint), "/var/lib/lochs/zfs/images/%s", image_name);
 
     /* Check if image dataset already exists */
-    snprintf(cmd, sizeof(cmd), "zfs list -Ho name '%s' >/dev/null 2>&1", dataset);
-    if (zfs_run(cmd) == 0) {
+    if (zfs_exists(dataset) == 0) {
         /* Already imported */
         return 0;
     }
 
     /* Create dataset with explicit mountpoint */
-    snprintf(cmd, sizeof(cmd),
-             "zfs create -o mountpoint='%s' '%s'",
-             mountpoint, dataset);
-    if (zfs_run(cmd) != 0) {
+    if (zfs_create(dataset, mountpoint) != 0) {
         fprintf(stderr, "Error: Failed to create image dataset %s\n", dataset);
         return -1;
     }
 
     /* Copy image contents into the dataset */
-    snprintf(cmd, sizeof(cmd), "cp -a '%s'/. '%s'/ 2>/dev/null", image_path, mountpoint);
-    if (zfs_run(cmd) != 0) {
+    char src_dot[LOCHS_MAX_PATH + 4];
+    snprintf(src_dot, sizeof(src_dot), "%s/.", image_path);
+    const char *cp_argv[] = { "cp", "-a", src_dot, mountpoint, NULL };
+    if (lochs_run(cp_argv, LOCHS_RUN_QUIET) != 0) {
         fprintf(stderr, "Error: Failed to copy image data to %s\n", mountpoint);
         return -1;
     }
 
     /* Create @base snapshot */
-    snprintf(cmd, sizeof(cmd), "zfs snapshot '%s@base'", dataset);
-    if (zfs_run(cmd) != 0) {
+    snprintf(snapshot, sizeof(snapshot), "%s@base", dataset);
+    const char *snap_argv[] = { "zfs", "snapshot", snapshot, NULL };
+    if (lochs_run(snap_argv, 0) != 0) {
         fprintf(stderr, "Error: Failed to create base snapshot for %s\n", dataset);
         return -1;
     }
@@ -193,6 +227,7 @@ int lochs_zfs_import_image(const char *image_path, const char *image_name) {
 int lochs_zfs_create_container(lochs_jail_t *jail, const char *image_path) {
     const char *pool = lochs_zfs_get_pool();
     if (!pool) return -1;
+    if (!zfs_name_ok(jail->name)) return zfs_reject("container name", jail->name);
 
     /* Derive image name from image_path (last component) */
     const char *image_name = strrchr(image_path, '/');
@@ -207,24 +242,19 @@ int lochs_zfs_create_container(lochs_jail_t *jail, const char *image_path) {
     char origin[512];
     char container_ds[512];
     char mountpoint[512];
-    char cmd[2048];
 
     snprintf(origin, sizeof(origin), "%s/%s/%s@base", pool, ZFS_IMAGES_DS, image_name);
     snprintf(container_ds, sizeof(container_ds), "%s/%s/%s", pool, ZFS_CONTAINERS_DS, jail->name);
     snprintf(mountpoint, sizeof(mountpoint), "/var/lib/lochs/zfs/containers/%s", jail->name);
 
     /* Check if container dataset already exists */
-    snprintf(cmd, sizeof(cmd), "zfs list -Ho name '%s' >/dev/null 2>&1", container_ds);
-    if (zfs_run(cmd) == 0) {
+    if (zfs_exists(container_ds) == 0) {
         fprintf(stderr, "Error: ZFS dataset already exists for container '%s'\n", jail->name);
         return -1;
     }
 
     /* Clone from image@base */
-    snprintf(cmd, sizeof(cmd),
-             "zfs clone -o mountpoint='%s' '%s' '%s'",
-             mountpoint, origin, container_ds);
-    if (zfs_run(cmd) != 0) {
+    if (zfs_clone(origin, container_ds, mountpoint) != 0) {
         fprintf(stderr, "Error: Failed to clone %s -> %s\n", origin, container_ds);
         return -1;
     }
@@ -253,9 +283,8 @@ int lochs_zfs_mount_container(lochs_jail_t *jail) {
         return -1;
     }
 
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "zfs mount '%s' 2>/dev/null", jail->zfs_dataset);
-    zfs_run(cmd);  /* May already be mounted, that's OK */
+    const char *argv[] = { "zfs", "mount", jail->zfs_dataset, NULL };
+    lochs_run(argv, LOCHS_RUN_QUIET);  /* May already be mounted, that's OK */
 
     return 0;
 }
@@ -266,9 +295,8 @@ int lochs_zfs_mount_container(lochs_jail_t *jail) {
 int lochs_zfs_unmount_container(lochs_jail_t *jail) {
     if (!jail->zfs_dataset[0]) return 0;
 
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "zfs unmount '%s' 2>/dev/null", jail->zfs_dataset);
-    zfs_run(cmd);
+    const char *argv[] = { "zfs", "unmount", jail->zfs_dataset, NULL };
+    lochs_run(argv, LOCHS_RUN_QUIET);
 
     return 0;
 }
@@ -279,14 +307,12 @@ int lochs_zfs_unmount_container(lochs_jail_t *jail) {
 int lochs_zfs_destroy_container(lochs_jail_t *jail) {
     if (!jail->zfs_dataset[0]) return 0;
 
-    char cmd[2048];
-
     /* Unmount first */
     lochs_zfs_unmount_container(jail);
 
     /* Destroy recursively (includes all snapshots) */
-    snprintf(cmd, sizeof(cmd), "zfs destroy -r '%s'", jail->zfs_dataset);
-    if (zfs_run(cmd) != 0) {
+    const char *argv[] = { "zfs", "destroy", "-r", jail->zfs_dataset, NULL };
+    if (lochs_run(argv, 0) != 0) {
         fprintf(stderr, "Warning: Failed to destroy ZFS dataset %s\n", jail->zfs_dataset);
     }
 
@@ -305,16 +331,18 @@ int lochs_zfs_destroy_container(lochs_jail_t *jail) {
 int lochs_zfs_snapshot_create(const char *container, const char *snap_name) {
     const char *pool = lochs_zfs_get_pool();
     if (!pool) return -1;
+    if (!zfs_name_ok(container)) return zfs_reject("container name", container);
+    if (snap_name && snap_name[0] && !zfs_name_ok(snap_name))
+        return zfs_reject("snapshot name", snap_name);
 
     char dataset[512];
-    char cmd[1024];
+    char snapshot[700];
     char name_buf[128];
 
     snprintf(dataset, sizeof(dataset), "%s/%s/%s", pool, ZFS_CONTAINERS_DS, container);
 
     /* Verify dataset exists */
-    snprintf(cmd, sizeof(cmd), "zfs list -Ho name '%s' >/dev/null 2>&1", dataset);
-    if (zfs_run(cmd) != 0) {
+    if (zfs_exists(dataset) != 0) {
         fprintf(stderr, "Error: No ZFS dataset found for container '%s'\n", container);
         fprintf(stderr, "Is this container using the ZFS storage backend?\n");
         return -1;
@@ -328,9 +356,10 @@ int lochs_zfs_snapshot_create(const char *container, const char *snap_name) {
         snap_name = name_buf;
     }
 
-    snprintf(cmd, sizeof(cmd), "zfs snapshot '%s@%s'", dataset, snap_name);
-    if (zfs_run(cmd) != 0) {
-        fprintf(stderr, "Error: Failed to create snapshot %s@%s\n", dataset, snap_name);
+    snprintf(snapshot, sizeof(snapshot), "%s@%s", dataset, snap_name);
+    const char *argv[] = { "zfs", "snapshot", snapshot, NULL };
+    if (lochs_run(argv, 0) != 0) {
+        fprintf(stderr, "Error: Failed to create snapshot %s\n", snapshot);
         return -1;
     }
 
@@ -344,15 +373,14 @@ int lochs_zfs_snapshot_create(const char *container, const char *snap_name) {
 int lochs_zfs_snapshot_list(const char *container) {
     const char *pool = lochs_zfs_get_pool();
     if (!pool) return -1;
+    if (!zfs_name_ok(container)) return zfs_reject("container name", container);
 
     char dataset[512];
-    char cmd[1024];
 
     snprintf(dataset, sizeof(dataset), "%s/%s/%s", pool, ZFS_CONTAINERS_DS, container);
 
     /* Verify dataset exists */
-    snprintf(cmd, sizeof(cmd), "zfs list -Ho name '%s' >/dev/null 2>&1", dataset);
-    if (zfs_run(cmd) != 0) {
+    if (zfs_exists(dataset) != 0) {
         fprintf(stderr, "Error: No ZFS dataset found for container '%s'\n", container);
         return -1;
     }
@@ -362,19 +390,20 @@ int lochs_zfs_snapshot_list(const char *container) {
     printf("%-30s %-22s %-10s %-10s\n", "----", "-------", "----", "-----");
 
     /* List snapshots with relevant properties */
-    snprintf(cmd, sizeof(cmd),
-             "zfs list -t snapshot -r -Ho name,creation,used,refer '%s' 2>/dev/null",
-             dataset);
+    size_t bufsz = 256 * 1024;
+    char *buf = malloc(bufsz);
+    if (!buf) return -1;
+    const char *argv[] = { "zfs", "list", "-t", "snapshot", "-r", "-Ho",
+                           "name,creation,used,refer", dataset, NULL };
+    if (lochs_capture_stdout(argv, buf, bufsz) < 0) {
+        free(buf);
+        return -1;
+    }
 
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return -1;
-
-    char line[1024];
     int count = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = '\0';
-
+    char *save = NULL;
+    for (char *line = strtok_r(buf, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
         /* Parse tab-separated fields: name, creation, used, refer */
         char *name = line;
         char *creation = NULL, *used = NULL, *refer = NULL;
@@ -395,7 +424,7 @@ int lochs_zfs_snapshot_list(const char *container) {
                refer ? refer : "-");
         count++;
     }
-    pclose(fp);
+    free(buf);
 
     if (count == 0) {
         printf("  (no snapshots)\n");
@@ -411,12 +440,15 @@ int lochs_zfs_snapshot_list(const char *container) {
 int lochs_zfs_snapshot_delete(const char *container, const char *snap_name) {
     const char *pool = lochs_zfs_get_pool();
     if (!pool) return -1;
+    if (!zfs_name_ok(container)) return zfs_reject("container name", container);
+    if (!zfs_name_ok(snap_name)) return zfs_reject("snapshot name", snap_name);
 
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "zfs destroy '%s/%s/%s@%s'",
+    char snapshot[700];
+    snprintf(snapshot, sizeof(snapshot), "%s/%s/%s@%s",
              pool, ZFS_CONTAINERS_DS, container, snap_name);
 
-    if (zfs_run(cmd) != 0) {
+    const char *argv[] = { "zfs", "destroy", snapshot, NULL };
+    if (lochs_run(argv, 0) != 0) {
         fprintf(stderr, "Error: Failed to delete snapshot %s@%s\n", container, snap_name);
         return -1;
     }
@@ -433,23 +465,22 @@ int lochs_zfs_snapshot_delete(const char *container, const char *snap_name) {
 int lochs_zfs_rollback(const char *container, const char *snap_name) {
     const char *pool = lochs_zfs_get_pool();
     if (!pool) return -1;
+    if (!zfs_name_ok(container)) return zfs_reject("container name", container);
+    if (!zfs_name_ok(snap_name)) return zfs_reject("snapshot name", snap_name);
 
-    char dataset[512];
-    char cmd[1024];
-
-    snprintf(dataset, sizeof(dataset), "%s/%s/%s", pool, ZFS_CONTAINERS_DS, container);
+    char snapshot[700];
+    snprintf(snapshot, sizeof(snapshot), "%s/%s/%s@%s",
+             pool, ZFS_CONTAINERS_DS, container, snap_name);
 
     /* Verify snapshot exists */
-    snprintf(cmd, sizeof(cmd), "zfs list -Ho name '%s@%s' >/dev/null 2>&1",
-             dataset, snap_name);
-    if (zfs_run(cmd) != 0) {
+    if (zfs_exists(snapshot) != 0) {
         fprintf(stderr, "Error: Snapshot '%s@%s' does not exist\n", container, snap_name);
         return -1;
     }
 
     /* Rollback (use -r to destroy newer snapshots) */
-    snprintf(cmd, sizeof(cmd), "zfs rollback -r '%s@%s'", dataset, snap_name);
-    if (zfs_run(cmd) != 0) {
+    const char *argv[] = { "zfs", "rollback", "-r", snapshot, NULL };
+    if (lochs_run(argv, 0) != 0) {
         fprintf(stderr, "Error: Failed to rollback to %s@%s\n", container, snap_name);
         return -1;
     }
@@ -466,28 +497,38 @@ int lochs_zfs_rollback(const char *container, const char *snap_name) {
 int lochs_zfs_diff(const char *container, const char *snap1, const char *snap2) {
     const char *pool = lochs_zfs_get_pool();
     if (!pool) return -1;
+    if (!zfs_name_ok(container)) return zfs_reject("container name", container);
+    if (!zfs_name_ok(snap1)) return zfs_reject("snapshot name", snap1);
+    if (snap2 && snap2[0] && !zfs_name_ok(snap2))
+        return zfs_reject("snapshot name", snap2);
 
-    char dataset[512];
-    char cmd[2048];
+    char from[700], to[700];
+    snprintf(from, sizeof(from), "%s/%s/%s@%s", pool, ZFS_CONTAINERS_DS, container, snap1);
 
-    snprintf(dataset, sizeof(dataset), "%s/%s/%s", pool, ZFS_CONTAINERS_DS, container);
+    size_t bufsz = 4 * 1024 * 1024;
+    char *buf = malloc(bufsz);
+    if (!buf) return -1;
+    int ret;
 
     if (snap2 && snap2[0]) {
         printf("Changes between %s@%s and %s@%s:\n\n", container, snap1, container, snap2);
-        snprintf(cmd, sizeof(cmd), "zfs diff '%s@%s' '%s@%s' 2>&1",
-                 dataset, snap1, dataset, snap2);
+        snprintf(to, sizeof(to), "%s/%s/%s@%s", pool, ZFS_CONTAINERS_DS, container, snap2);
+        const char *argv[] = { "zfs", "diff", from, to, NULL };
+        ret = lochs_capture(argv, buf, bufsz);
     } else {
         printf("Changes since %s@%s:\n\n", container, snap1);
-        snprintf(cmd, sizeof(cmd), "zfs diff '%s@%s' 2>&1", dataset, snap1);
+        const char *argv[] = { "zfs", "diff", from, NULL };
+        ret = lochs_capture(argv, buf, bufsz);
+    }
+    if (ret < 0) {
+        free(buf);
+        return -1;
     }
 
-    /* Stream output directly */
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return -1;
-
-    char line[2048];
     int count = 0;
-    while (fgets(line, sizeof(line), fp)) {
+    char *save = NULL;
+    for (char *line = strtok_r(buf, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
         /* zfs diff output format: M\t/path or +\t/path or -\t/path */
         char type = line[0];
         const char *symbol;
@@ -499,14 +540,14 @@ int lochs_zfs_diff(const char *container, const char *snap1, const char *snap2) 
             default:  symbol = " "; break;
         }
         /* Print with color-coded type */
-        if (line[1] == '\t') {
-            printf("  %s %s", symbol, line + 2);
+        if (line[0] && line[1] == '\t') {
+            printf("  %s %s\n", symbol, line + 2);
         } else {
-            printf("  %s", line);
+            printf("  %s\n", line);
         }
         count++;
     }
-    pclose(fp);
+    free(buf);
 
     if (count == 0) {
         printf("  (no changes)\n");
@@ -522,11 +563,13 @@ int lochs_zfs_diff(const char *container, const char *snap1, const char *snap2) 
 int lochs_zfs_clone(const char *src_container, const char *snap_name, const char *new_name) {
     const char *pool = lochs_zfs_get_pool();
     if (!pool) return -1;
+    if (!zfs_name_ok(src_container)) return zfs_reject("container name", src_container);
+    if (!zfs_name_ok(snap_name)) return zfs_reject("snapshot name", snap_name);
+    if (!lochs_valid_name(new_name)) return zfs_reject("container name", new_name);
 
-    char src_snap[512];
+    char src_snap[700];
     char new_ds[512];
     char new_mount[512];
-    char cmd[2048];
 
     snprintf(src_snap, sizeof(src_snap), "%s/%s/%s@%s",
              pool, ZFS_CONTAINERS_DS, src_container, snap_name);
@@ -535,24 +578,19 @@ int lochs_zfs_clone(const char *src_container, const char *snap_name, const char
     snprintf(new_mount, sizeof(new_mount), "/var/lib/lochs/zfs/containers/%s", new_name);
 
     /* Verify snapshot exists */
-    snprintf(cmd, sizeof(cmd), "zfs list -Ho name '%s' >/dev/null 2>&1", src_snap);
-    if (zfs_run(cmd) != 0) {
+    if (zfs_exists(src_snap) != 0) {
         fprintf(stderr, "Error: Snapshot '%s@%s' does not exist\n", src_container, snap_name);
         return -1;
     }
 
     /* Check new name doesn't conflict */
-    snprintf(cmd, sizeof(cmd), "zfs list -Ho name '%s' >/dev/null 2>&1", new_ds);
-    if (zfs_run(cmd) == 0) {
+    if (zfs_exists(new_ds) == 0) {
         fprintf(stderr, "Error: Container '%s' already exists\n", new_name);
         return -1;
     }
 
     /* Clone */
-    snprintf(cmd, sizeof(cmd),
-             "zfs clone -o mountpoint='%s' '%s' '%s'",
-             new_mount, src_snap, new_ds);
-    if (zfs_run(cmd) != 0) {
+    if (zfs_clone(src_snap, new_ds, new_mount) != 0) {
         fprintf(stderr, "Error: Failed to clone %s -> %s\n", src_snap, new_ds);
         return -1;
     }
@@ -567,27 +605,23 @@ int lochs_zfs_clone(const char *src_container, const char *snap_name, const char
 int lochs_zfs_volume_create(const char *name) {
     const char *pool = lochs_zfs_get_pool();
     if (!pool) return -1;
+    if (!zfs_name_ok(name)) return zfs_reject("volume name", name);
 
     char dataset[512];
     char mountpoint[512];
-    char cmd[2048];
 
     snprintf(dataset, sizeof(dataset), "%s/%s/%s", pool, ZFS_VOLUMES_DS, name);
     snprintf(mountpoint, sizeof(mountpoint), "/var/lib/lochs/zfs/volumes/%s", name);
 
     /* Check if already exists */
-    snprintf(cmd, sizeof(cmd), "zfs list -Ho name '%s' >/dev/null 2>&1", dataset);
-    if (zfs_run(cmd) == 0) {
+    if (zfs_exists(dataset) == 0) {
         return 0;  /* Already exists */
     }
 
     /* Ensure parent dataset exists */
     lochs_zfs_init();
 
-    snprintf(cmd, sizeof(cmd),
-             "zfs create -o mountpoint='%s' '%s'",
-             mountpoint, dataset);
-    if (zfs_run(cmd) != 0) {
+    if (zfs_create(dataset, mountpoint) != 0) {
         fprintf(stderr, "Error: Failed to create ZFS volume dataset %s\n", dataset);
         return -1;
     }
@@ -601,11 +635,13 @@ int lochs_zfs_volume_create(const char *name) {
 int lochs_zfs_volume_destroy(const char *name) {
     const char *pool = lochs_zfs_get_pool();
     if (!pool) return -1;
+    if (!zfs_name_ok(name)) return zfs_reject("volume name", name);
 
-    char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "zfs destroy '%s/%s/%s'",
-             pool, ZFS_VOLUMES_DS, name);
-    if (zfs_run(cmd) != 0) {
+    char dataset[512];
+    snprintf(dataset, sizeof(dataset), "%s/%s/%s", pool, ZFS_VOLUMES_DS, name);
+
+    const char *argv[] = { "zfs", "destroy", dataset, NULL };
+    if (lochs_run(argv, 0) != 0) {
         fprintf(stderr, "Warning: Failed to destroy ZFS volume dataset\n");
         return -1;
     }

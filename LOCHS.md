@@ -778,8 +778,10 @@ lochs create db --image freebsd:15 -v postgres-data:/var/db/postgres
 lochs volume inspect postgres-data
 
 # Backup volume
-lochs run --rm -v postgres-data:/data -v $(pwd):/backup freebsd:15 \
-  tar czf /backup/postgres-backup.tar.gz /data
+lochs create backup -i freebsd:15 -v postgres-data:/data -v "$(pwd)":/backup
+lochs start backup
+lochs exec backup tar czf /backup/postgres-backup.tar.gz /data
+lochs stop backup && lochs rm backup
 ```
 
 ### ZFS Integration (FreeBSD Host)
@@ -802,9 +804,11 @@ lochs volume send mydata@backup1 | ssh backup-server lochs volume receive
 
 ## Security
 
-### Default Security Model
+> **Current status (v0.3.x on Linux):** a jail is a Linux network namespace plus `chroot`. There are no PID, mount or user namespaces and no seccomp filter yet, so root inside a jail is root on the host, and the jail parameters below are not enforced by the Linux kernel. Options such as `--user`, `--userns=remap` and `--read-only` describe the planned design and are not implemented. Only run software you trust.
 
-Lochs jails are secure by default:
+### Default Security Model (planned)
+
+The intended defaults, as enforced on a real FreeBSD kernel:
 
 | Restriction | Default | Description |
 |-------------|---------|-------------|

@@ -28,8 +28,10 @@
 #include <errno.h>
 #include <time.h>
 #include <dirent.h>
+#include <limits.h>
 
 #include "bsdulator/lochs.h"
+#include "bsdulator/lochs_exec.h"
 
 /* Safe string copy */
 static void safe_strcpy(char *dst, const char *src, size_t dst_size) {
@@ -399,112 +401,47 @@ static void lochfile_free(lochfile_context_t *ctx) {
 }
 
 /*
- * Execute a command in the build jail using BSDulator
- * 
- * For simple commands, runs the binary directly.
- * For complex commands (pipes, redirects), uses sh -c.
+ * Execute a RUN command in the build root using BSDulator.
+ *
+ * Like Docker's shell form, the command is handed to the image's own
+ * /bin/sh as a single "-c" argument. The host never parses it.
  */
 static int run_in_jail(const char *build_dir, const char *command) {
-    char cmd[16384];
-    char bsdulator_path[2048];
+    char ld_path[1100], sh_path[1100];
+    snprintf(ld_path, sizeof(ld_path), "%s/libexec/ld-elf.so.1", build_dir);
+    snprintf(sh_path, sizeof(sh_path), "%s/bin/sh", build_dir);
 
-    /* Get absolute path to bsdulator */
-    char cwd[1024];
-    if (getcwd(cwd, sizeof(cwd)) == NULL) {
-        strcpy(cwd, ".");
+    const char *argv[] = { lochs_bsdulator_path(), ld_path, sh_path,
+                           "-c", command, NULL };
+    return lochs_run(argv, 0);
+}
+
+/*
+ * Resolve a COPY source against the build context and refuse anything
+ * that ends up outside it (absolute paths, "..", or symlinks leading out),
+ * so a Lochfile cannot read arbitrary host files into an image.
+ * Returns 0 and fills out on success.
+ */
+static int resolve_copy_source(const char *context_dir, const char *src,
+                               char *out, size_t out_size) {
+    char ctx_real[PATH_MAX], joined[PATH_MAX * 2], src_real[PATH_MAX];
+
+    if (!realpath(context_dir, ctx_real)) return -1;
+    if (src[0] == '/') {
+        fprintf(stderr, "  ✗ COPY source must be relative to the build context: %s\n", src);
+        return -1;
     }
-    snprintf(bsdulator_path, sizeof(bsdulator_path), "%s/bsdulator", cwd);
-    
-    /* Check if bsdulator exists at that path, fall back to PATH */
-    struct stat st;
-    if (stat(bsdulator_path, &st) != 0) {
-        strcpy(bsdulator_path, "/usr/local/bin/bsdulator");
-        if (stat(bsdulator_path, &st) != 0) {
-            strcpy(bsdulator_path, "bsdulator");
-        }
+    snprintf(joined, sizeof(joined), "%s/%s", ctx_real, src);
+    if (!realpath(joined, src_real)) return -1;
+
+    size_t clen = strlen(ctx_real);
+    if (strncmp(src_real, ctx_real, clen) != 0 ||
+        (src_real[clen] != '/' && src_real[clen] != '\0')) {
+        fprintf(stderr, "  ✗ COPY source is outside the build context: %s\n", src);
+        return -1;
     }
-    
-    /* Check if command needs shell (has shell metacharacters) */
-    int needs_shell = (strchr(command, '|') != NULL ||
-                       strchr(command, '>') != NULL ||
-                       strchr(command, '<') != NULL ||
-                       strchr(command, '&') != NULL ||
-                       strchr(command, ';') != NULL ||
-                       strchr(command, '$') != NULL ||
-                       strchr(command, '`') != NULL ||
-                       strchr(command, '*') != NULL ||
-                       strchr(command, '?') != NULL);
-    
-    if (!needs_shell) {
-        /* Try to run command directly without shell */
-        char binary[512];
-        char args[4096] = "";
-        char cmd_copy[4096];
-        
-        safe_strcpy(cmd_copy, command, sizeof(cmd_copy));
-        
-        /* Get first token (the binary) */
-        char *space = strchr(cmd_copy, ' ');
-        if (space) {
-            *space = '\0';
-            safe_strcpy(binary, cmd_copy, sizeof(binary));
-            safe_strcpy(args, space + 1, sizeof(args));
-        } else {
-            safe_strcpy(binary, cmd_copy, sizeof(binary));
-        }
-        
-        /* Build full path to binary in build_dir */
-        char full_binary[2048];
-        if (binary[0] == '/') {
-            snprintf(full_binary, sizeof(full_binary), "%s%.500s", build_dir, binary);
-        } else {
-            snprintf(full_binary, sizeof(full_binary), "%s/bin/%.500s", build_dir, binary);
-        }
-        
-        /* Check if binary exists */
-        if (stat(full_binary, &st) == 0) {
-            if (args[0]) {
-                snprintf(cmd, sizeof(cmd),
-                    "%s %s/libexec/ld-elf.so.1 %s %s 2>&1",
-                    bsdulator_path, build_dir, full_binary, args);
-            } else {
-                snprintf(cmd, sizeof(cmd),
-                    "%s %s/libexec/ld-elf.so.1 %s 2>&1",
-                    bsdulator_path, build_dir, full_binary);
-            }
-            
-            int ret = system(cmd);
-            return WIFEXITED(ret) ? WEXITSTATUS(ret) : ret;
-        }
-    }
-    
-    /* Fall back to sh -c for complex commands or if direct exec failed */
-    /* Escape the command for shell */
-    char escaped[4096];
-    const char *src = command;
-    char *dst = escaped;
-    char *end = escaped + sizeof(escaped) - 5;
-    
-    while (*src && dst < end) {
-        if (*src == '\'') {
-            /* Replace ' with '\'' */
-            *dst++ = '\'';
-            *dst++ = '\\';
-            *dst++ = '\'';
-            *dst++ = '\'';
-            src++;
-        } else {
-            *dst++ = *src++;
-        }
-    }
-    *dst = '\0';
-    
-    snprintf(cmd, sizeof(cmd),
-        "%s %s/libexec/ld-elf.so.1 %s/bin/sh -c '%s' 2>&1",
-        bsdulator_path, build_dir, build_dir, escaped);
-    
-    int ret = system(cmd);
-    return WIFEXITED(ret) ? WEXITSTATUS(ret) : ret;
+    safe_strcpy(out, src_real, out_size);
+    return 0;
 }
 
 /*
@@ -562,20 +499,22 @@ int lochs_build_from_lochfile(const char *lochfile_path, const char *context_dir
     generate_hash(image_id, sizeof(image_id));
     snprintf(ctx.build_dir, sizeof(ctx.build_dir), "/var/lib/lochs/images/%s", image_id);
     
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", ctx.build_dir);
-    if (system(cmd) != 0) {
+    const char *mkdir_argv[] = { "mkdir", "-p", ctx.build_dir, NULL };
+    if (lochs_run(mkdir_argv, 0) != 0) {
         fprintf(stderr, "Error: Failed to create build directory\n");
         free(base_path);
         lochfile_free(&ctx);
         return -1;
     }
-    
+
     /* Copy base image */
     printf("  Copying base image...\n");
-    snprintf(cmd, sizeof(cmd), "cp -a '%s'/. '%s'/ 2>/dev/null", base_path, ctx.build_dir);
-    ret = system(cmd);
-    (void)ret;
+    {
+        char base_dot[LOCHS_MAX_PATH + 4];
+        snprintf(base_dot, sizeof(base_dot), "%s/.", base_path);
+        const char *cp_argv[] = { "cp", "-a", base_dot, ctx.build_dir, NULL };
+        lochs_run(cp_argv, LOCHS_RUN_QUIET);
+    }
     free(base_path);
     printf("  ✓ Build directory: %s\n\n", ctx.build_dir);
     
@@ -588,13 +527,16 @@ int lochs_build_from_lochfile(const char *lochfile_path, const char *context_dir
         char src_path[1024];
         char dst_path[1024];
         
-        /* Resolve source relative to context */
-        if (ctx.copies[i].src[0] == '/') {
-            safe_strcpy(src_path, ctx.copies[i].src, sizeof(src_path));
-        } else {
-            snprintf(src_path, sizeof(src_path), "%s/%s", context_dir, ctx.copies[i].src);
+        printf("  COPY %s -> %s\n", ctx.copies[i].src, ctx.copies[i].dst);
+
+        /* Resolve source inside the build context */
+        if (resolve_copy_source(context_dir, ctx.copies[i].src,
+                                src_path, sizeof(src_path)) != 0) {
+            fprintf(stderr, "  ✗ Source not found in build context: %s\n",
+                    ctx.copies[i].src);
+            continue;
         }
-        
+
         /* Resolve destination in build dir */
         if (ctx.copies[i].dst[0] == '/') {
             snprintf(dst_path, sizeof(dst_path), "%s%s", ctx.build_dir, ctx.copies[i].dst);
@@ -602,33 +544,44 @@ int lochs_build_from_lochfile(const char *lochfile_path, const char *context_dir
             snprintf(dst_path, sizeof(dst_path), "%s/%s", ctx.build_dir, ctx.copies[i].dst);
         }
         
-        printf("  COPY %s -> %s\n", ctx.copies[i].src, ctx.copies[i].dst);
-        
+        /* Destinations may not climb out of the image root */
+        if (strstr(ctx.copies[i].dst, "..")) {
+            fprintf(stderr, "  ✗ COPY destination may not contain '..': %s\n",
+                    ctx.copies[i].dst);
+            continue;
+        }
+
         /* Create parent directory */
         char *last_slash = strrchr(dst_path, '/');
         if (last_slash && last_slash != dst_path) {
             *last_slash = '\0';
-            snprintf(cmd, sizeof(cmd), "mkdir -p '%s'", dst_path);
-            ret = system(cmd);
-            (void)ret;
+            const char *mk_argv[] = { "mkdir", "-p", dst_path, NULL };
+            lochs_run(mk_argv, 0);
             *last_slash = '/';
         }
-        
+
         /* Check if source exists */
         struct stat st;
         if (stat(src_path, &st) != 0) {
             fprintf(stderr, "  ✗ Source not found: %s\n", src_path);
             continue;
         }
-        
+
         /* Copy file or directory */
+        int copy_ret;
         if (S_ISDIR(st.st_mode)) {
-            snprintf(cmd, sizeof(cmd), "cp -a '%s'/. '%s'/ 2>/dev/null", src_path, dst_path);
+            char src_dot[sizeof(src_path) + 4];
+            snprintf(src_dot, sizeof(src_dot), "%s/.", src_path);
+            const char *mk_argv[] = { "mkdir", "-p", dst_path, NULL };
+            lochs_run(mk_argv, 0);
+            const char *cp_argv[] = { "cp", "-a", src_dot, dst_path, NULL };
+            copy_ret = lochs_run(cp_argv, LOCHS_RUN_QUIET);
         } else {
-            snprintf(cmd, sizeof(cmd), "cp -a '%s' '%s'", src_path, dst_path);
+            const char *cp_argv[] = { "cp", "-a", src_path, dst_path, NULL };
+            copy_ret = lochs_run(cp_argv, 0);
         }
-        
-        if (system(cmd) == 0) {
+
+        if (copy_ret == 0) {
             printf("  ✓ Copied\n");
         } else {
             fprintf(stderr, "  ✗ Failed to copy\n");
