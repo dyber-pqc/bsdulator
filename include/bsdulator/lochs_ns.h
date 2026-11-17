@@ -47,6 +47,8 @@ int lochs_idshift_tree(const char *dir, uid_t from, uid_t to);
  * range. Remembers the image's state; lochs_image_ids_forget drops it. */
 int lochs_image_ids(const char *image_path, uid_t want);
 void lochs_image_ids_forget(const char *image_path);
+/* Record an image's current form without shifting it (a fresh copy) */
+int lochs_image_ids_set(const char *image_path, uid_t state);
 
 /* The same for any shared tree, under a state key ("volume.<name>") */
 int lochs_tree_ids(const char *key, const char *path, uid_t want);

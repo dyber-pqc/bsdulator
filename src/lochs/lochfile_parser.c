@@ -30,8 +30,12 @@
 #include <dirent.h>
 #include <limits.h>
 
+#include <fcntl.h>
+#include <sys/mount.h>
+
 #include "bsdulator/lochs.h"
 #include "bsdulator/lochs_exec.h"
+#include "bsdulator/lochs_ns.h"
 
 /* Safe string copy */
 static void safe_strcpy(char *dst, const char *src, size_t dst_size) {
@@ -401,18 +405,146 @@ static void lochfile_free(lochfile_context_t *ctx) {
 }
 
 /*
- * Execute a RUN command in the build root using BSDulator.
+ * RUN steps run in a container of their own, like `lochs run`: the build
+ * root gets an id range and is mounted idmapped (container ids on disk), a
+ * minimal /dev, a network namespace with NAT, and a holder (user, PID,
+ * mount, UTS and IPC namespaces, pivoted into the root). Each step runs
+ * with "bsdulator -N", so its tracer moves into the container too and
+ * nothing from the image ever runs as host root.
+ */
+typedef struct {
+    char name[64];          /* "build-<image id>": ids, holder, network */
+    char root[600];         /* where the build root is mounted for the box */
+    char netns[64];
+    uid_t ids;
+    int mounted;
+    int dev_made[8];        /* /dev files this box created (removed after) */
+    int dev_bound[8];
+    int holder;
+} build_box_t;
+
+static const char *box_devices[] = { "null", "zero", "random", "urandom", NULL };
+
+static void box_down(build_box_t *b) {
+    if (b->holder) lochs_ns_stop(b->name);
+    if (b->netns[0]) lochs_ns_net_down(b->name);
+    for (int i = 0; box_devices[i]; i++) {
+        char p[700];
+        snprintf(p, sizeof(p), "%s/dev/%s", b->root, box_devices[i]);
+        if (b->dev_bound[i]) umount2(p, MNT_DETACH);
+        if (b->dev_made[i]) {
+            lochs_croot_enter();
+            unlink(p);
+            lochs_croot_leave();
+        }
+    }
+    if (b->mounted) umount2(b->root, MNT_DETACH);
+    rmdir(b->root);
+    char dir[600];
+    snprintf(dir, sizeof(dir), "/var/lib/lochs/idmnt/%s", b->name);
+    rmdir(dir);
+    lochs_ids_free(b->name);
+    memset(b, 0, sizeof(*b));
+}
+
+static int box_up(build_box_t *b, const char *image_id, const char *build_dir, int idmapped) {
+    memset(b, 0, sizeof(*b));
+    snprintf(b->name, sizeof(b->name), "build-%s", image_id);
+    lochs_storage_lockdown();
+
+    /* The build root, at a mount point of its own */
+    char dir[128];
+    snprintf(dir, sizeof(dir), "/var/lib/lochs/idmnt/%s", b->name);
+    mkdir(dir, 0700);
+    snprintf(b->root, sizeof(b->root), "/var/lib/lochs/idmnt/%s/root", b->name);
+    mkdir(b->root, 0700);
+    if (idmapped) {
+        b->ids = lochs_ids_alloc(b->name);
+        if (lochs_idmap_bind(build_dir, b->root, 0, 0, b->ids, LOCHS_ID_COUNT, 0, 0) != 0) {
+            fprintf(stderr, "Error: cannot mount the build root: %s\n", strerror(errno));
+            box_down(b);
+            return -1;
+        }
+    } else {
+        b->ids = LOCHS_ID_BASE;
+        if (mount(build_dir, b->root, NULL, MS_BIND, NULL) != 0) {
+            fprintf(stderr, "Error: cannot mount the build root: %s\n", strerror(errno));
+            box_down(b);
+            return -1;
+        }
+    }
+    b->mounted = 1;
+    lochs_ns_set_base(b->name, b->ids);
+    lochs_croot_set(b->ids);
+
+    /* Minimal /dev: the host's null, zero, random and urandom */
+    {
+        char p[700];
+        snprintf(p, sizeof(p), "%s/dev", b->root);
+        lochs_croot_enter();
+        mkdir(p, 0755);
+        lochs_croot_leave();
+        for (int i = 0; box_devices[i]; i++) {
+            char host[64];
+            snprintf(p, sizeof(p), "%s/dev/%s", b->root, box_devices[i]);
+            snprintf(host, sizeof(host), "/dev/%s", box_devices[i]);
+            if (access(p, F_OK) != 0) {
+                lochs_croot_enter();
+                int fd = open(p, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+                lochs_croot_leave();
+                if (fd >= 0) {
+                    close(fd);
+                    b->dev_made[i] = 1;
+                }
+            }
+            if (mount(host, p, NULL, MS_BIND, NULL) == 0) b->dev_bound[i] = 1;
+        }
+    }
+
+    /* Network: package installs need it */
+    if (lochs_ns_net_up(b->name, b->netns, sizeof(b->netns)) != 0) {
+        fprintf(stderr, "Warning: no network for the build\n");
+        b->netns[0] = '\0';
+    }
+
+    if (lochs_ns_start(b->name, b->root) < 0) {
+        fprintf(stderr, "Error: cannot create the build's namespaces\n");
+        box_down(b);
+        return -1;
+    }
+    b->holder = 1;
+    return 0;
+}
+
+/*
+ * Execute a RUN command in the build container.
  *
  * Like Docker's shell form, the command is handed to the image's own
  * /bin/sh as a single "-c" argument. The host never parses it.
  */
-static int run_in_jail(const char *build_dir, const char *command) {
-    char ld_path[1100], sh_path[1100];
-    snprintf(ld_path, sizeof(ld_path), "%s/libexec/ld-elf.so.1", build_dir);
-    snprintf(sh_path, sizeof(sh_path), "%s/bin/sh", build_dir);
+static int run_in_jail(const build_box_t *b, const char *command) {
+    char ld_path[700], sh_path[700], ns_arg[16];
+    snprintf(ld_path, sizeof(ld_path), "%s/libexec/ld-elf.so.1", b->root);
+    snprintf(sh_path, sizeof(sh_path), "%s/bin/sh", b->root);
 
-    const char *argv[] = { lochs_bsdulator_path(), "-r", build_dir, ld_path, sh_path,
-                           "-c", command, NULL };
+    const char *argv[16];
+    int n = 0;
+    argv[n++] = lochs_bsdulator_path();
+    argv[n++] = "-r";
+    argv[n++] = b->root;
+    if (!lochs_ns_add_args(b->name, argv, &n, ns_arg, sizeof(ns_arg))) {
+        fprintf(stderr, "Error: the build container is gone\n");
+        return -1;
+    }
+    if (b->netns[0]) {
+        argv[n++] = "--netns";
+        argv[n++] = b->netns;
+    }
+    argv[n++] = ld_path;
+    argv[n++] = sh_path;
+    argv[n++] = "-c";
+    argv[n++] = command;
+    argv[n] = NULL;
     return lochs_run(argv, 0);
 }
 
@@ -507,6 +639,13 @@ int lochs_build_from_lochfile(const char *lochfile_path, const char *context_dir
         return -1;
     }
 
+    /* Layers keep container ids on disk where idmapped mounts work, else
+     * the shared range (see lochs_ns.c): the base is brought to that form
+     * and the copy is recorded in it */
+    int idmapped = lochs_idmap_supported();
+    uid_t form = idmapped ? 0 : (uid_t)LOCHS_ID_BASE;
+    lochs_image_ids(base_path, form);
+
     /* Copy base image */
     printf("  Copying base image...\n");
     {
@@ -516,7 +655,18 @@ int lochs_build_from_lochfile(const char *lochfile_path, const char *context_dir
         lochs_run(cp_argv, LOCHS_RUN_QUIET);
     }
     free(base_path);
+    lochs_image_ids_set(ctx.build_dir, form);
     printf("  ✓ Build directory: %s\n\n", ctx.build_dir);
+
+    /* The build container: COPY writes through it as container root, and
+     * RUN steps run in it */
+    build_box_t box;
+    if (box_up(&box, image_id, ctx.build_dir, idmapped) != 0) {
+        lochfile_free(&ctx);
+        return -1;
+    }
+    printf("  ✓ Build container: ids %u-%u\n\n", (unsigned)box.ids,
+           (unsigned)(box.ids + LOCHS_ID_COUNT - 1));
     
     /* Step 3: Process COPY directives */
     printf("\033[1mStep 3/6: Copying files\033[0m\n");
@@ -539,9 +689,9 @@ int lochs_build_from_lochfile(const char *lochfile_path, const char *context_dir
 
         /* Resolve destination in build dir */
         if (ctx.copies[i].dst[0] == '/') {
-            snprintf(dst_path, sizeof(dst_path), "%s%s", ctx.build_dir, ctx.copies[i].dst);
+            snprintf(dst_path, sizeof(dst_path), "%s%s", box.root, ctx.copies[i].dst);
         } else {
-            snprintf(dst_path, sizeof(dst_path), "%s/%s", ctx.build_dir, ctx.copies[i].dst);
+            snprintf(dst_path, sizeof(dst_path), "%s/%s", box.root, ctx.copies[i].dst);
         }
         
         /* Destinations may not climb out of the image root */
@@ -556,7 +706,7 @@ int lochs_build_from_lochfile(const char *lochfile_path, const char *context_dir
         if (last_slash && last_slash != dst_path) {
             *last_slash = '\0';
             const char *mk_argv[] = { "mkdir", "-p", dst_path, NULL };
-            lochs_run(mk_argv, 0);
+            lochs_run(mk_argv, LOCHS_RUN_AS_CROOT);
             *last_slash = '/';
         }
 
@@ -573,12 +723,14 @@ int lochs_build_from_lochfile(const char *lochfile_path, const char *context_dir
             char src_dot[sizeof(src_path) + 4];
             snprintf(src_dot, sizeof(src_dot), "%s/.", src_path);
             const char *mk_argv[] = { "mkdir", "-p", dst_path, NULL };
-            lochs_run(mk_argv, 0);
-            const char *cp_argv[] = { "cp", "-a", src_dot, dst_path, NULL };
-            copy_ret = lochs_run(cp_argv, LOCHS_RUN_QUIET);
+            lochs_run(mk_argv, LOCHS_RUN_AS_CROOT);
+            const char *cp_argv[] = { "cp", "-R", "-P", "--preserve=mode,timestamps,links",
+                                      src_dot, dst_path, NULL };
+            copy_ret = lochs_run(cp_argv, LOCHS_RUN_QUIET | LOCHS_RUN_AS_CROOT);
         } else {
-            const char *cp_argv[] = { "cp", "-a", src_path, dst_path, NULL };
-            copy_ret = lochs_run(cp_argv, 0);
+            const char *cp_argv[] = { "cp", "-P", "--preserve=mode,timestamps",
+                                      src_path, dst_path, NULL };
+            copy_ret = lochs_run(cp_argv, LOCHS_RUN_AS_CROOT);
         }
 
         if (copy_ret == 0) {
@@ -598,7 +750,7 @@ int lochs_build_from_lochfile(const char *lochfile_path, const char *context_dir
         printf("  RUN %s\n", ctx.run_commands[i]);
         
         /* Run command using BSDulator */
-        ret = run_in_jail(ctx.build_dir, ctx.run_commands[i]);
+        ret = run_in_jail(&box, ctx.run_commands[i]);
         if (ret == 0) {
             printf("  ✓ Success\n");
         } else {
@@ -607,6 +759,8 @@ int lochs_build_from_lochfile(const char *lochfile_path, const char *context_dir
     }
     printf("\n");
     
+    box_down(&box);
+
     /* Step 5: Create image metadata */
     printf("\033[1mStep 5/6: Creating image metadata\033[0m\n");
     

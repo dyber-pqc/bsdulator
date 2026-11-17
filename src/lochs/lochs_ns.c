@@ -444,6 +444,15 @@ int lochs_image_ids(const char *image_path, uid_t want) {
     return lochs_tree_ids(key, image_path, want);
 }
 
+int lochs_image_ids_set(const char *image_path, uid_t state) {
+    char key[300], path[600];
+    image_key(image_path, key, sizeof(key));
+    mkdir("/var/lib/lochs", 0755);
+    mkdir(IDS_DIR, 0700);
+    snprintf(path, sizeof(path), IDS_DIR "/%s", key);
+    return write_long(path, (long)state);
+}
+
 void lochs_image_ids_forget(const char *image_path) {
     char key[300];
     image_key(image_path, key, sizeof(key));
