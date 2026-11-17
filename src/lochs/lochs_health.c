@@ -23,6 +23,7 @@
 #include <getopt.h>
 #include "bsdulator/lochs.h"
 #include "bsdulator/lochs_exec.h"
+#include "bsdulator/lochs_ns.h"
 
 #define HEALTH_DIR "/var/lib/lochs/health"
 #define MAX_HEALTH_RESTARTS 5   /* Cap auto-restarts to prevent infinite loops */
@@ -171,11 +172,13 @@ static int health_exec_check(const lochs_jail_t *jail,
     snprintf(ld_path, sizeof(ld_path), "%s/libexec/ld-elf.so.1", jail->path);
     snprintf(jexec_path, sizeof(jexec_path), "%s/usr/sbin/jexec", jail->path);
 
-    const char *argv[16];
+    const char *argv[20];
     int ac = 0;
     argv[ac++] = lochs_bsdulator_path();
     argv[ac++] = "-r";
     argv[ac++] = jail->path;
+    char ns_arg[16];
+    lochs_ns_add_args(jail->name, argv, &ac, ns_arg, sizeof(ns_arg));
     if (jail->netns[0]) {
         argv[ac++] = "--netns";
         argv[ac++] = jail->netns;

@@ -25,7 +25,8 @@ SRCS = $(SRCDIR)/main.c \
        $(SRCDIR)/kqueue/kqueue_emul.c \
        $(SRCDIR)/net/msg_emul.c \
        $(SRCDIR)/thread/chain.c \
-       $(SRCDIR)/thread/thread_emul.c
+       $(SRCDIR)/thread/thread_emul.c \
+       $(SRCDIR)/jail/pidmap.c
 
 # BSDulator object files
 OBJS = $(SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
@@ -47,7 +48,8 @@ LOCHS_SRCS = $(SRCDIR)/lochs/lochs_main.c \
              $(SRCDIR)/lochs/lochs_cp.c \
              $(SRCDIR)/lochs/lochs_export.c \
              $(SRCDIR)/lochs/lochs_registry.c \
-             $(SRCDIR)/lochs/lochs_exec.c
+             $(SRCDIR)/lochs/lochs_exec.c \
+             $(SRCDIR)/lochs/lochs_ns.c
 
 # Lochs CLI object files
 LOCHS_OBJS = $(LOCHS_SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
@@ -115,7 +117,7 @@ $(OBJDIR)/lochs/lochs_cp.o: $(SRCDIR)/lochs/lochs_cp.c $(INCDIR)/bsdulator/lochs
 $(OBJDIR)/lochs/lochs_export.o: $(SRCDIR)/lochs/lochs_export.c $(INCDIR)/bsdulator/lochs.h
 $(OBJDIR)/lochs/lochs_registry.o: $(SRCDIR)/lochs/lochs_registry.c $(INCDIR)/bsdulator/lochs.h
 $(OBJDIR)/lochs/lochs_exec.o: $(SRCDIR)/lochs/lochs_exec.c $(INCDIR)/bsdulator/lochs_exec.h
-$(LOCHS_OBJS): $(INCDIR)/bsdulator/lochs_exec.h
+$(LOCHS_OBJS): $(INCDIR)/bsdulator/lochs_exec.h $(INCDIR)/bsdulator/lochs_ns.h
 
 # Unit tests for the no-shell exec helpers
 TEST_EXEC = $(BINDIR)/tests/test_lochs_exec
@@ -128,7 +130,7 @@ test-exec: $(TEST_EXEC)
 
 # Unit tests for signal, errno, wait4 and MSG_* translation
 TEST_SIGNAL = $(BINDIR)/tests/test_signal_map
-$(TEST_SIGNAL): tests/test_signal_map.c $(OBJDIR)/signal/signal_emul.o $(OBJDIR)/kqueue/kqueue_emul.o $(OBJDIR)/net/msg_emul.o $(OBJDIR)/abi/abi_translate.o $(OBJDIR)/thread/chain.o $(OBJDIR)/thread/thread_emul.o
+$(TEST_SIGNAL): tests/test_signal_map.c $(OBJDIR)/signal/signal_emul.o $(OBJDIR)/kqueue/kqueue_emul.o $(OBJDIR)/net/msg_emul.o $(OBJDIR)/abi/abi_translate.o $(OBJDIR)/thread/chain.o $(OBJDIR)/thread/thread_emul.o $(OBJDIR)/jail/pidmap.o
 	@echo "  LINK    $@"
 	@$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 

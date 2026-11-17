@@ -43,6 +43,7 @@
 #include "bsdulator/kqueue_emul.h"
 #include "bsdulator/msg_emul.h"
 #include "bsdulator/thread_emul.h"
+#include "bsdulator/pidmap.h"
 #include "bsdulator/jail.h"
 #include "../runtime/freebsd_runtime.h"
 
@@ -753,8 +754,9 @@ static long emul_thr_self(pid_t pid, uint64_t args[6]) {
      */
     uint64_t id_addr = args[0];  /* Pointer in CHILD's memory */
     
-    /* For single-threaded process, TID == PID */
-    long tid = (long)pid;
+    /* The calling thread's id as the program sees it (its PID namespace):
+     * libthr uses it as the owner word of PI futexes */
+    long tid = (long)pid_to_ns(pid);
     
     BSD_TRACE("thr_self: writing tid=%ld (child pid) to addr=0x%lx", tid, id_addr);
     

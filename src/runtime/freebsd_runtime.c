@@ -23,6 +23,10 @@
 #include "freebsd_runtime.h"
 #include "bsdulator.h"
 #include "bsdulator/jail.h"
+#include "bsdulator/pidmap.h"
+#include <fcntl.h>
+#include <sched.h>
+#include <sys/wait.h>
 
 /* Global runtime state */
 freebsd_runtime_t g_freebsd_runtime = {0};
@@ -180,6 +184,40 @@ static void set_exe_path(pid_t pid, const char *path) {
 }
 
 /*
+ * Hostname as seen in pid's UTS namespace: a short-lived helper joins it.
+ * Returns 0, or -1 if pid shares the tracer's namespace or it fails.
+ */
+static int uts_hostname(pid_t pid, char *out, size_t sz) {
+    char a[64], b[64], la[64] = "", lb[64] = "";
+    snprintf(a, sizeof(a), "/proc/%d/ns/uts", (int)pid);
+    snprintf(b, sizeof(b), "/proc/self/ns/uts");
+    ssize_t na = readlink(a, la, sizeof(la) - 1), nb = readlink(b, lb, sizeof(lb) - 1);
+    if (na <= 0 || nb <= 0) return -1;
+    la[na] = lb[nb] = '\0';
+    if (strcmp(la, lb) == 0) return -1;
+    int fd = open(a, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    int pfd[2];
+    if (pipe(pfd) < 0) { close(fd); return -1; }
+    pid_t h = fork();
+    if (h == 0) {
+        char name[256] = "";
+        if (setns(fd, CLONE_NEWUTS) == 0) gethostname(name, sizeof(name));
+        ssize_t w = write(pfd[1], name, strlen(name) + 1);
+        (void)w;
+        _exit(0);
+    }
+    close(fd);
+    close(pfd[1]);
+    ssize_t n = h > 0 ? read(pfd[0], out, sz - 1) : -1;
+    close(pfd[0]);
+    if (h > 0) waitpid(h, NULL, 0);
+    if (n <= 1) return -1;
+    out[n] = '\0';
+    return 0;
+}
+
+/*
  * Handle kern.* sysctl queries
  */
 static long handle_kern_sysctl(int mib1, pid_t pid, uint64_t oldp_addr, uint64_t oldlenp_addr) {
@@ -267,8 +305,10 @@ static long handle_kern_sysctl(int mib1, pid_t pid, uint64_t oldp_addr, uint64_t
         }
         
         case KERN_HOSTNAME: {
+            /* The hostname of the process's UTS namespace (its container) */
             char hostname[256];
-            if (gethostname(hostname, sizeof(hostname)) < 0) {
+            if (uts_hostname(pid, hostname, sizeof(hostname)) < 0 &&
+                gethostname(hostname, sizeof(hostname)) < 0) {
                 strcpy(hostname, "bsdulator");
             }
             size_t len = strlen(hostname) + 1;
@@ -627,7 +667,7 @@ long freebsd_handle_sysctl(pid_t pid, uint64_t args[6]) {
             
         case CTL_KERN:
             if (mib[1] == 14 /* KERN_PROC */ && namelen >= 4 && mib[2] == 12 /* KERN_PROC_PATHNAME */) {
-                pid_t who = mib[3] == -1 ? pid : (pid_t)mib[3];
+                pid_t who = mib[3] == -1 ? pid : pid_from_ns((pid_t)mib[3], pid);
                 const char *pth = freebsd_exe_path(who);
                 if (!pth) return -ENOENT;
                 size_t len = strlen(pth) + 1, have = 0;

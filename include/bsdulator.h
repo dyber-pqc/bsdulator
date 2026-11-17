@@ -61,5 +61,7 @@ void bsdulator_set_freebsd_root(const char *path);
 const char *bsdulator_get_freebsd_root(void);
 void bsdulator_set_netns(const char *netns_name);
 const char *bsdulator_get_netns(void);
+void bsdulator_set_ns_pid(int pid);
+int bsdulator_get_ns_pid(void);
 
 #endif /* BSDULATOR_H */

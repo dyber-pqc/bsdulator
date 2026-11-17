@@ -27,6 +27,7 @@
 int bsd_debug_level = BSD_DEBUG_ERROR;
 static char *freebsd_root = NULL;
 static char *netns_name = NULL;
+static int ns_holder_pid = 0;
 static interceptor_state_t *global_state = NULL;
 
 /* Signal handler for clean shutdown */
@@ -56,6 +57,7 @@ static void print_usage(const char *prog) {
     printf("  -q, --quiet          Quiet mode (errors only)\n");
     printf("  -r, --root <path>    FreeBSD root filesystem path\n");
     printf("  -n, --netns <name>   Run in network namespace\n");
+    printf("  -N, --ns <pid>       Join the PID, mount, UTS and IPC namespaces of <pid>\n");
     printf("  -s, --stats          Print syscall statistics on exit\n");
     printf("  -t, --trace          Trace all syscalls (very verbose)\n");
     printf("\nExamples:\n");
@@ -74,6 +76,7 @@ static struct option long_options[] = {
     {"quiet",   no_argument,       0, 'q'},
     {"root",    required_argument, 0, 'r'},
     {"netns",   required_argument, 0, 'n'},
+    {"ns",      required_argument, 0, 'N'},
     {"stats",   no_argument,       0, 's'},
     {"trace",   no_argument,       0, 't'},
     {0, 0, 0, 0}
@@ -171,6 +174,15 @@ const char *bsdulator_get_netns(void) {
     return netns_name;
 }
 
+/* Container namespaces to join: those of this host process (0 = none) */
+void bsdulator_set_ns_pid(int pid) {
+    ns_holder_pid = pid;
+}
+
+int bsdulator_get_ns_pid(void) {
+    return ns_holder_pid;
+}
+
 /* Run a FreeBSD binary */
 int bsdulator_run(const char *binary, char *const argv[], char *const envp[]) {
     binary_info_t info;
@@ -257,7 +269,7 @@ int main(int argc, char *argv[], char *envp[]) {
     }
     
     /* Parse options */
-    while ((opt = getopt_long(argc, argv, "+hVvqr:n:st", long_options, &opt_idx)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+hVvqr:n:N:st", long_options, &opt_idx)) != -1) {
         switch (opt) {
             case 'h':
                 print_usage(argv[0]);
@@ -283,6 +295,10 @@ int main(int argc, char *argv[], char *envp[]) {
                 
             case 'n':
                 bsdulator_set_netns(optarg);
+                break;
+
+            case 'N':
+                bsdulator_set_ns_pid(atoi(optarg));
                 break;
                 
             case 's':

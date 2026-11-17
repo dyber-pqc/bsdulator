@@ -32,6 +32,7 @@
 #include <stdint.h>
 #include "bsdulator/lochs.h"
 #include "bsdulator/lochs_exec.h"
+#include "bsdulator/lochs_ns.h"
 #include "lochs_dashboard_html.h"
 
 #define DASHBOARD_DEFAULT_PORT  8420
@@ -1068,18 +1069,25 @@ static void api_container_exec(int fd, const char *name, http_request_t *req) {
     snprintf(ld_path, sizeof(ld_path), "%s/libexec/ld-elf.so.1", jail->path);
     snprintf(jexec_path, sizeof(jexec_path), "%s/usr/sbin/jexec", jail->path);
 
+    const char *argv[20];
+    int ac = 0;
+    char ns_arg[16];
+    argv[ac++] = lochs_bsdulator_path();
+    argv[ac++] = "-r";
+    argv[ac++] = jail->path;
+    lochs_ns_add_args(jail->name, argv, &ac, ns_arg, sizeof(ns_arg));
     if (jail->netns[0]) {
-        const char *argv[] = { lochs_bsdulator_path(), "-r", jail->path,
-                               "--netns", jail->netns,
-                               ld_path, jexec_path, jail->name,
-                               "/bin/sh", "-c", user_cmd, NULL };
-        run_and_reply(fd, argv, 8192);
-    } else {
-        const char *argv[] = { lochs_bsdulator_path(), "-r", jail->path,
-                               ld_path, jexec_path, jail->name,
-                               "/bin/sh", "-c", user_cmd, NULL };
-        run_and_reply(fd, argv, 8192);
+        argv[ac++] = "--netns";
+        argv[ac++] = jail->netns;
     }
+    argv[ac++] = ld_path;
+    argv[ac++] = jexec_path;
+    argv[ac++] = jail->name;
+    argv[ac++] = "/bin/sh";
+    argv[ac++] = "-c";
+    argv[ac++] = user_cmd;
+    argv[ac] = NULL;
+    run_and_reply(fd, argv, 8192);
 }
 
 /* POST /api/images/pull — Pull an image */

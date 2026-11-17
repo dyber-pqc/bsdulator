@@ -30,6 +30,7 @@
 #include <arpa/inet.h>   /* For inet_pton */
 #include "bsdulator/lochs.h"
 #include "bsdulator/lochs_exec.h"
+#include "bsdulator/lochs_ns.h"
 #include "lochs_compose.h"
 
 /* Global jail list - exposed for network module */
@@ -1001,6 +1002,12 @@ int lochs_cmd_start(int argc, char **argv) {
     /* Set up /dev devices inside the container */
     lochs_devfs_setup(jail);
 
+    /* The container's own PID, mount, UTS and IPC namespaces: every
+     * bsdulator run below joins them */
+    if (lochs_ns_start(jail->name) < 0)
+        fprintf(stderr, "Warning: could not create namespaces for '%s'; running without them\n", name);
+    char ns_arg[16];
+
     /*
      * Build the jail command using binaries FROM THE CONTAINER IMAGE.
      *
@@ -1022,7 +1029,7 @@ int lochs_cmd_start(int argc, char **argv) {
     char ld_path[LOCHS_MAX_PATH + 32], jail_bin[LOCHS_MAX_PATH + 32];
     char name_arg[LOCHS_MAX_NAME + 8], path_arg[LOCHS_MAX_PATH + 8];
     char ip_arg[128], cgroup_procs[LOCHS_MAX_NAME + 64];
-    const char *jargv[16];
+    const char *jargv[20];
     int ja = 0;
 
     jail_subpath(ld_path, sizeof(ld_path), jail, "/libexec/ld-elf.so.1");
@@ -1034,6 +1041,7 @@ int lochs_cmd_start(int argc, char **argv) {
     /* Resolve FreeBSD paths (libraries, ld-elf) against this container */
     jargv[ja++] = "-r";
     jargv[ja++] = jail->path;
+    lochs_ns_add_args(jail->name, jargv, &ja, ns_arg, sizeof(ns_arg));
     if (jail->netns[0]) {
         jargv[ja++] = "--netns";
         jargv[ja++] = jail->netns;
@@ -1098,13 +1106,14 @@ int lochs_cmd_start(int argc, char **argv) {
         /* Run CMD in the background through the jail's own /bin/sh, so
          * the host never parses it; join the cgroup first if active. */
         char jexec_bin[LOCHS_MAX_PATH + 32];
-        const char *cargv[16];
+        const char *cargv[20];
         int ca = 0;
 
         jail_subpath(jexec_bin, sizeof(jexec_bin), jail, "/usr/sbin/jexec");
         cargv[ca++] = lochs_bsdulator_path();
         cargv[ca++] = "-r";
         cargv[ca++] = jail->path;
+        lochs_ns_add_args(jail->name, cargv, &ca, ns_arg, sizeof(ns_arg));
         if (jail->netns[0]) {
             cargv[ca++] = "--netns";
             cargv[ca++] = jail->netns;
@@ -1211,6 +1220,9 @@ int lochs_cmd_stop(int argc, char **argv) {
                             ld_path, jail_bin, "-r", jail->name, NULL };
 
     int ret = lochs_run(rargv, 0);
+
+    /* Ends every process still in the container */
+    lochs_ns_stop(jail->name);
 
     if (ret == 0) {
         jail->state = JAIL_STATE_STOPPED;
@@ -1324,7 +1336,8 @@ int lochs_cmd_exec(int argc, char **argv) {
     jail_subpath(ld_path, sizeof(ld_path), jail, "/libexec/ld-elf.so.1");
     jail_subpath(jexec_bin, sizeof(jexec_bin), jail, "/usr/sbin/jexec");
 
-    const char **eargv = calloc((size_t)argc + 10, sizeof(*eargv));
+    const char **eargv = calloc((size_t)argc + 12, sizeof(*eargv));
+    char ns_arg[16];
     if (!eargv) {
         fprintf(stderr, "Error: out of memory\n");
         return 1;
@@ -1333,6 +1346,7 @@ int lochs_cmd_exec(int argc, char **argv) {
     eargv[ea++] = lochs_bsdulator_path();
     eargv[ea++] = "-r";
     eargv[ea++] = jail->path;
+    lochs_ns_add_args(jail->name, eargv, &ea, ns_arg, sizeof(ns_arg));
     if (jail->netns[0]) {
         eargv[ea++] = "--netns";
         eargv[ea++] = jail->netns;

@@ -40,6 +40,7 @@
 #include "bsdulator/chain.h"
 #include "bsdulator/signal_emul.h"
 #include "bsdulator/thread_emul.h"
+#include "bsdulator/pidmap.h"
 
 /* Linux futex */
 #define F_WAIT          0
@@ -172,7 +173,7 @@ long thr_emul_new(pid_t pid, uint64_t args[6]) {
 }
 
 static void write_tids(pid_t writer, int k, pid_t tid) {
-    int64_t v = tid;
+    int64_t v = pid_to_ns(tid);  /* the id the program knows */
     if (pend[k].ctid) (void)wr(writer, &v, pend[k].ctid, sizeof(v));
     if (pend[k].ptid) (void)wr(writer, &v, pend[k].ptid, sizeof(v));
 }
@@ -274,16 +275,19 @@ long thr_emul_kill(pid_t pid, uint64_t args[6]) {
     if (fsig && !lsig) return -EINVAL;
     pid_t tgid = thr_tgid(pid);
     if (tid == -1) return kill(tgid, lsig) < 0 ? -errno : 0;
-    return syscall(SYS_tgkill, tgid, (pid_t)tid, lsig) < 0 ? -errno : 0;
+    pid_t htid = pid_from_ns((pid_t)tid, pid);
+    if (htid < 0) return -ESRCH;
+    return syscall(SYS_tgkill, tgid, htid, lsig) < 0 ? -errno : 0;
 }
 
 long thr_emul_kill2(pid_t pid, uint64_t args[6]) {
     /* thr_kill2(pid_t pid, long id, int sig) */
-    (void)pid;
     int fsig = (int)args[2];
     int lsig = fsig ? sig_fbsd_to_linux(fsig) : 0;
     if (fsig && !lsig) return -EINVAL;
-    return syscall(SYS_tgkill, (pid_t)args[0], (pid_t)args[1], lsig) < 0 ? -errno : 0;
+    pid_t hp = pid_from_ns((pid_t)args[0], pid), ht = pid_from_ns((pid_t)args[1], pid);
+    if (hp < 0 || ht < 0) return -ESRCH;
+    return syscall(SYS_tgkill, hp, ht, lsig) < 0 ? -errno : 0;
 }
 
 /* ---------------------------------------------------------------------

@@ -37,6 +37,7 @@
 #include "bsdulator/kqueue_emul.h"
 #include "bsdulator/chain.h"
 #include "bsdulator/thread_emul.h"
+#include "bsdulator/pidmap.h"
 
 /* ---------------------------------------------------------------------
  * FreeBSD constants and structures
@@ -1204,7 +1205,8 @@ static int descendants(pid_t root, int children_only, pid_t *out, int max) {
 long sig_emul_procctl(pid_t pid, uint64_t args[6]) {
     int cmd = (int)args[2];
     uint64_t data = args[3];
-    pid_t target = (args[1] == 0) ? pid : (pid_t)args[1];
+    pid_t target = (args[1] == 0) ? pid : pid_from_ns((pid_t)args[1], pid);
+    if (target < 0) return -ESRCH;
 
     switch (cmd) {
         case FBSD_PROC_REAP_ACQUIRE:
@@ -1227,8 +1229,8 @@ long sig_emul_procctl(pid_t pid, uint64_t args[6]) {
             rs.rs_flags = is_reaper(target) ? FBSD_REAPER_STATUS_OWNED : 0;
             rs.rs_children = (uint32_t)nc;
             rs.rs_descendants = (uint32_t)nd;
-            rs.rs_reaper = is_reaper(target) ? target : 1;
-            rs.rs_pid = nc > 0 ? kids[0] : -1;
+            rs.rs_reaper = is_reaper(target) ? pid_to_ns(target) : 1;
+            rs.rs_pid = nc > 0 ? pid_to_ns(kids[0]) : -1;
             if (wr(pid, &rs, data, sizeof(rs)) < 0) return -EFAULT;
             return 0;
         }
@@ -1245,7 +1247,7 @@ long sig_emul_procctl(pid_t pid, uint64_t args[6]) {
             rk.rk_fpid = -1;
             for (int i = 0; i < nv; i++) {
                 if (kill(victims[i], lsig) == 0) rk.rk_killed++;
-                else if (rk.rk_fpid == -1) rk.rk_fpid = victims[i];
+                else if (rk.rk_fpid == -1) rk.rk_fpid = pid_to_ns(victims[i]);
             }
             if (wr(pid, &rk, data, sizeof(rk)) < 0) return -EFAULT;
             return 0;

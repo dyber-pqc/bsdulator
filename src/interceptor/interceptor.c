@@ -805,6 +805,37 @@ pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp
     
     /* Get network namespace name if configured */
     const char *netns = bsdulator_get_netns();
+
+    /*
+     * Container namespaces (lochs starts a holder process per container).
+     * The PID namespace is joined by this tracer for its children only:
+     * the traced program and everything it starts get container ids, while
+     * the tracer keeps seeing host ids. Mount, UTS and IPC are joined in
+     * the child below.
+     */
+    int ns_pid = bsdulator_get_ns_pid();
+    int ns_fd[3] = { -1, -1, -1 };
+    static const char *ns_name[3] = { "mnt", "uts", "ipc" };
+    static const int ns_type[3] = { CLONE_NEWNS, CLONE_NEWUTS, CLONE_NEWIPC };
+    if (ns_pid > 0) {
+        char p[64];
+        snprintf(p, sizeof(p), "/proc/%d/ns/pid", ns_pid);
+        int pfd = open(p, O_RDONLY | O_CLOEXEC);
+        if (pfd < 0 || setns(pfd, CLONE_NEWPID) < 0) {
+            BSD_ERROR("cannot join the PID namespace of %d: %s", ns_pid, strerror(errno));
+            if (pfd >= 0) close(pfd);
+            return -1;
+        }
+        close(pfd);
+        for (int i = 0; i < 3; i++) {
+            snprintf(p, sizeof(p), "/proc/%d/ns/%s", ns_pid, ns_name[i]);
+            ns_fd[i] = open(p, O_RDONLY | O_CLOEXEC);
+            if (ns_fd[i] < 0) {
+                BSD_ERROR("cannot open %s: %s", p, strerror(errno));
+                return -1;
+            }
+        }
+    }
     
     pid_t pid = fork();
     
@@ -822,6 +853,48 @@ pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp
             _exit(127);
         }
         
+        /* Enter the container's mount, UTS and IPC namespaces */
+        for (int i = 0; i < 3; i++) {
+            if (ns_fd[i] >= 0 && setns(ns_fd[i], ns_type[i]) < 0) {
+                fprintf(stderr, "Failed to enter %s namespace: %s\n", ns_name[i], strerror(errno));
+                _exit(127);
+            }
+        }
+
+        /*
+         * Container processes keep only the capabilities Docker's default
+         * profile keeps, and cannot gain privileges through exec. Root in
+         * a container then cannot load modules, mount, trace other
+         * processes, set the clock, or touch raw I/O on the host.
+         */
+        if (ns_pid > 0) {
+            static const int keep[] = {
+                0 /* CHOWN */, 1 /* DAC_OVERRIDE */, 3 /* FOWNER */, 4 /* FSETID */,
+                5 /* KILL */, 6 /* SETGID */, 7 /* SETUID */, 8 /* SETPCAP */,
+                10 /* NET_BIND_SERVICE */, 13 /* NET_RAW */, 18 /* SYS_CHROOT */,
+                27 /* MKNOD */, 29 /* AUDIT_WRITE */, 31 /* SETFCAP */,
+            };
+            int last = 40;
+            FILE *cf = fopen("/proc/sys/kernel/cap_last_cap", "r");
+            if (cf) {
+                if (fscanf(cf, "%d", &last) != 1) last = 40;
+                fclose(cf);
+            }
+            for (int c = 0; c <= last; c++) {
+                int kept = 0;
+                for (size_t k = 0; k < sizeof(keep) / sizeof(keep[0]); k++)
+                    if (keep[k] == c) kept = 1;
+                if (!kept && prctl(PR_CAPBSET_DROP, c, 0, 0, 0) < 0 && errno != EINVAL) {
+                    fprintf(stderr, "Failed to drop capability %d: %s\n", c, strerror(errno));
+                    _exit(127);
+                }
+            }
+            if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
+                fprintf(stderr, "Failed to set no_new_privs: %s\n", strerror(errno));
+                _exit(127);
+            }
+        }
+
         /* Enter network namespace if specified */
         if (netns && netns[0]) {
             char netns_path[256];
@@ -848,6 +921,8 @@ pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp
         perror("execve");
         _exit(127);
     }
+
+    for (int i = 0; i < 3; i++) if (ns_fd[i] >= 0) close(ns_fd[i]);
     
     int status;
     if (waitpid(pid, &status, 0) < 0) {
