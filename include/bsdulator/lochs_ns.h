@@ -22,4 +22,20 @@ void lochs_ns_stop(const char *name);
  * buf holds the pid text and must outlive argv. Returns 1 if added. */
 int lochs_ns_add_args(const char *name, const char **argv, int *n, char *buf, size_t bufsz);
 
+/* Container uid/gid 0..LOCHS_ID_COUNT-1 is host LOCHS_ID_BASE + id */
+#define LOCHS_ID_BASE  100000
+#define LOCHS_ID_COUNT 65536
+
+/* Shift ownership of a tree into the container id range (files already
+ * shifted are left alone). With use_marker, a tree done once is skipped. */
+int lochs_idshift_tree(const char *dir, int use_marker);
+
+/* The container's own network namespace ("lochs-<name>") with a veth
+ * pair, a private IP and outbound NAT. netns receives its name. */
+int lochs_ns_net_up(const char *name, char *netns, size_t netns_sz);
+void lochs_ns_net_down(const char *name);
+
+/* The container's IP from lochs_ns_net_up, or NULL */
+const char *lochs_ns_ip(const char *name);
+
 #endif /* LOCHS_NS_H */

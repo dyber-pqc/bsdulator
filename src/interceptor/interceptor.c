@@ -27,6 +27,7 @@
 #include <linux/ptrace.h>
 #include <asm/prctl.h>
 #include <sys/prctl.h>
+#include <grp.h>
 #include "bsdulator.h"
 #include "runtime/freebsd_runtime.h"
 #include "bsdulator/jail.h"
@@ -815,6 +816,7 @@ pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp
      */
     int ns_pid = bsdulator_get_ns_pid();
     int ns_fd[3] = { -1, -1, -1 };
+    int user_fd = -1;
     static const char *ns_name[3] = { "mnt", "uts", "ipc" };
     static const int ns_type[3] = { CLONE_NEWNS, CLONE_NEWUTS, CLONE_NEWIPC };
     if (ns_pid > 0) {
@@ -827,6 +829,16 @@ pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp
             return -1;
         }
         close(pfd);
+        {
+            char mine[64] = "", theirs[64] = "";
+            snprintf(p, sizeof(p), "/proc/%d/ns/user", ns_pid);
+            ssize_t a1 = readlink("/proc/self/ns/user", mine, sizeof(mine) - 1);
+            ssize_t a2 = readlink(p, theirs, sizeof(theirs) - 1);
+            if (a1 > 0 && a2 > 0) {
+                mine[a1] = theirs[a2] = '\0';
+                if (strcmp(mine, theirs) != 0) user_fd = open(p, O_RDONLY | O_CLOEXEC);
+            }
+        }
         for (int i = 0; i < 3; i++) {
             snprintf(p, sizeof(p), "/proc/%d/ns/%s", ns_pid, ns_name[i]);
             ns_fd[i] = open(p, O_RDONLY | O_CLOEXEC);
@@ -853,10 +865,44 @@ pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp
             _exit(127);
         }
         
+        /*
+         * Order matters. The network namespace belongs to the host, so it
+         * is joined while this process is still host root; then the
+         * container's user namespace, then the namespaces it owns.
+         */
+        if (netns && netns[0]) {
+            char netns_path[256];
+            snprintf(netns_path, sizeof(netns_path), "/var/run/netns/%s", netns);
+            int netns_fd = open(netns_path, O_RDONLY);
+            if (netns_fd < 0) {
+                fprintf(stderr, "Failed to open netns %s: %s\n", netns_path, strerror(errno));
+                _exit(127);
+            }
+            if (setns(netns_fd, CLONE_NEWNET) < 0) {
+                fprintf(stderr, "Failed to enter netns %s: %s\n", netns, strerror(errno));
+                close(netns_fd);
+                _exit(127);
+            }
+            close(netns_fd);
+        }
+
+        if (user_fd >= 0 && setns(user_fd, CLONE_NEWUSER) < 0) {
+            fprintf(stderr, "Failed to enter user namespace: %s\n", strerror(errno));
+            _exit(127);
+        }
+
         /* Enter the container's mount, UTS and IPC namespaces */
         for (int i = 0; i < 3; i++) {
             if (ns_fd[i] >= 0 && setns(ns_fd[i], ns_type[i]) < 0) {
                 fprintf(stderr, "Failed to enter %s namespace: %s\n", ns_name[i], strerror(errno));
+                _exit(127);
+            }
+        }
+
+        /* Become root of the container: host uid LOCHS_ID_BASE, not 0 */
+        if (user_fd >= 0) {
+            if (setgroups(0, NULL) < 0 || setresgid(0, 0, 0) < 0 || setresuid(0, 0, 0) < 0) {
+                fprintf(stderr, "Failed to become container root: %s\n", strerror(errno));
                 _exit(127);
             }
         }
@@ -894,27 +940,6 @@ pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp
                 _exit(127);
             }
         }
-
-        /* Enter network namespace if specified */
-        if (netns && netns[0]) {
-            char netns_path[256];
-            snprintf(netns_path, sizeof(netns_path), "/var/run/netns/%s", netns);
-            
-            int netns_fd = open(netns_path, O_RDONLY);
-            if (netns_fd < 0) {
-                fprintf(stderr, "Failed to open netns %s: %s\n", netns_path, strerror(errno));
-                _exit(127);
-            }
-            
-            if (setns(netns_fd, CLONE_NEWNET) < 0) {
-                fprintf(stderr, "Failed to enter netns %s: %s\n", netns, strerror(errno));
-                close(netns_fd);
-                _exit(127);
-            }
-            
-            close(netns_fd);
-            BSD_INFO("Entered network namespace: %s", netns);
-        }
         
         raise(SIGSTOP);
         execve(binary, argv, envp);
@@ -923,6 +948,7 @@ pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp
     }
 
     for (int i = 0; i < 3; i++) if (ns_fd[i] >= 0) close(ns_fd[i]);
+    if (user_fd >= 0) close(user_fd);
     
     int status;
     if (waitpid(pid, &status, 0) < 0) {
@@ -1883,6 +1909,7 @@ typedef struct {
     int sc_valid;
     uint64_t sc_raw_args[6];  /* arguments as the program passed them */
     int first_stop;           /* next stop is the new child's initial one */
+    int initial_sigstop_due;  /* its initial SIGSTOP is still to come */
     uint64_t sc_nr;
     uint64_t sc_args[6];
     size_t mmap_alignment;
@@ -1927,6 +1954,7 @@ static process_entry_t* add_process(pid_t pid) {
         entry->skip_post_exec = 0;
         entry->sc_valid = 0;
         entry->first_stop = 1;
+        entry->initial_sigstop_due = 0;
         BSD_TRACE("Added process %d to table (count=%d)", pid, process_count);
         return entry;
     }
@@ -2327,11 +2355,18 @@ int interceptor_wait(interceptor_state_t *state) {
         process_entry_t *se = find_process(state->pid);
         int first = se && se->first_stop;
         if (se) se->first_stop = 0;
-        if (first && sig == SIGSTOP) {
-            /* A new child's initial stop under PTRACE_O_TRACEFORK; a
-             * thr_new thread is pointed at its start function here */
+        if (first) {
+            /* A new task's first stop. Set it up (a thr_new thread is
+             * pointed at its start function) whatever stopped it: a signal
+             * sent right after creation, such as pthread_kill(), has a
+             * lower number than the initial SIGSTOP and arrives first. */
             if (!thr_on_first_stop(state->pid))
                 (void)thr_rfork_child_first_stop(state->pid);
+            if (sig != SIGSTOP && se) se->initial_sigstop_due = 1;
+        }
+        if (sig == SIGSTOP && (first || (se && se->initial_sigstop_due))) {
+            /* The initial stop under PTRACE_O_TRACEFORK: not delivered */
+            if (se) se->initial_sigstop_due = 0;
             state->last_event = EVENT_NONE;
             return 0;
         }

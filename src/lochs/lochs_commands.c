@@ -731,7 +731,8 @@ int lochs_cmd_create(int argc, char **argv) {
  * Start port forwarding using socat
  * Returns PID of forwarder process, or -1 on error
  */
-static pid_t start_port_forward(int host_port, int container_port, const char *protocol) {
+static pid_t start_port_forward(int host_port, int container_port, const char *protocol,
+                                const char *target_ip) {
     /* TCP: socat TCP-LISTEN:host,fork,reuseaddr TCP:127.0.0.1:container */
     /* UDP: socat UDP-LISTEN:host,fork,reuseaddr UDP:127.0.0.1:container */
     char listen_spec[64], connect_spec[64];
@@ -739,8 +740,8 @@ static pid_t start_port_forward(int host_port, int container_port, const char *p
 
     snprintf(listen_spec, sizeof(listen_spec), "%s-LISTEN:%d,fork,reuseaddr",
              udp ? "UDP" : "TCP", host_port);
-    snprintf(connect_spec, sizeof(connect_spec), "%s:127.0.0.1:%d",
-             udp ? "UDP" : "TCP", container_port);
+    snprintf(connect_spec, sizeof(connect_spec), "%s:%s:%d",
+             udp ? "UDP" : "TCP", target_ip ? target_ip : "127.0.0.1", container_port);
 
     const char *argv[] = { "socat", listen_spec, connect_spec, NULL };
     int pid = lochs_run(argv, LOCHS_RUN_NOWAIT | LOCHS_RUN_DETACH);
@@ -892,6 +893,15 @@ int lochs_cmd_start(int argc, char **argv) {
     
     printf("Starting container '%s'...\n", name);
     
+    /* Files into the container's id range (user namespace): the image
+     * once, the container's own layer at every start; before mounting */
+    if (jail->image_path[0] && jail->merged_path[0]) {
+        lochs_idshift_tree(jail->image_path, 1);
+        if (jail->diff_path[0]) lochs_idshift_tree(jail->diff_path, 0);
+    } else {
+        lochs_idshift_tree(jail->path, 1);
+    }
+
     /* Mount overlay filesystem if using COW storage */
     if (jail->image_path[0] && jail->merged_path[0]) {
         if (lochs_storage_mount_container(jail) != 0) {
@@ -901,6 +911,15 @@ int lochs_cmd_start(int argc, char **argv) {
         printf("  Overlay: mounted\n");
     }
     
+    /* Without a lochs network, the container gets its own network
+     * namespace and IP; -p forwards to that IP */
+    if (!jail->network[0]) {
+        if (lochs_ns_net_up(jail->name, jail->netns, sizeof(jail->netns)) == 0)
+            printf("  Network: %s (%s)\n", jail->netns, lochs_ns_ip(jail->name));
+        else
+            fprintf(stderr, "Warning: could not create a network namespace for '%s'\n", name);
+    }
+
     /* Set up network if configured */
     if (jail->network[0]) {
         lochs_networks_load();
@@ -1002,7 +1021,16 @@ int lochs_cmd_start(int argc, char **argv) {
     /* Set up /dev devices inside the container */
     lochs_devfs_setup(jail);
 
-    /* The container's own PID, mount, UTS and IPC namespaces: every
+    /* /dev directories and the env file were created by host root */
+    {
+        char p[LOCHS_MAX_PATH + 32];
+        jail_subpath(p, sizeof(p), jail, "/dev");
+        lochs_idshift_tree(p, 0);
+        jail_subpath(p, sizeof(p), jail, "/.lochs_env");
+        if (access(p, F_OK) == 0) lochs_idshift_tree(p, 0);
+    }
+
+    /* The container's own user, PID, mount, UTS and IPC namespaces: every
      * bsdulator run below joins them */
     if (lochs_ns_start(jail->name) < 0)
         fprintf(stderr, "Warning: could not create namespaces for '%s'; running without them\n", name);
@@ -1086,7 +1114,8 @@ int lochs_cmd_start(int argc, char **argv) {
         printf("Setting up port forwarding...\n");
         for (int i = 0; i < jail->port_count; i++) {
             lochs_port_map_t *p = &jail->ports[i];
-            p->forwarder_pid = start_port_forward(p->host_port, p->container_port, p->protocol);
+            p->forwarder_pid = start_port_forward(p->host_port, p->container_port, p->protocol,
+                                                  lochs_ns_ip(jail->name));
             if (p->forwarder_pid > 0) {
                 printf("  %d -> %d/%s (pid=%d)\n", 
                        p->host_port, p->container_port, p->protocol, p->forwarder_pid);
@@ -1223,6 +1252,10 @@ int lochs_cmd_stop(int argc, char **argv) {
 
     /* Ends every process still in the container */
     lochs_ns_stop(jail->name);
+    if (!jail->network[0] && strncmp(jail->netns, "lochs-", 6) == 0) {
+        lochs_ns_net_down(jail->name);
+        jail->netns[0] = '\0';
+    }
 
     if (ret == 0) {
         jail->state = JAIL_STATE_STOPPED;
