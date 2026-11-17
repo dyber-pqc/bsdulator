@@ -603,7 +603,9 @@ int abi_translate_dirents_to_freebsd(const void *linux_buf, size_t linux_len,
     size_t linux_offset = 0;
     size_t fbsd_offset = 0;
     
-    while (linux_offset < linux_len) {
+    /* The buffer is the program's memory, so another of its threads can
+     * rewrite it under us: trust no length in it */
+    while (linux_offset + 19 < linux_len) {
         /* Linux dirent64 layout:
          * offset 0:  uint64_t d_ino
          * offset 8:  int64_t  d_off  
@@ -625,12 +627,12 @@ int abi_translate_dirents_to_freebsd(const void *linux_buf, size_t linux_len,
         const char *d_name = (const char *)(linux_ent + 19);
         
         /* Sanity check */
-        if (d_reclen == 0 || d_reclen > linux_len - linux_offset) {
+        if (d_reclen < 20 || d_reclen > linux_len - linux_offset) {
             break;
         }
         
-        /* Calculate name length */
-        size_t namelen = strlen(d_name);
+        /* Calculate name length (within the record) */
+        size_t namelen = strnlen(d_name, (size_t)d_reclen - 19);
         if (namelen > 255) namelen = 255;
         
         /* FreeBSD dirent size: fixed header (24 bytes) + name + null + padding to 8 bytes */

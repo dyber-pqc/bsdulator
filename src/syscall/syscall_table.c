@@ -518,6 +518,12 @@ int syscall_translate_args(int freebsd_nr, uint64_t *args) {
      * Return 1 if args were modified, 0 otherwise
      */
     switch (freebsd_nr) {
+        case FBSD_SYS_getdirentries:
+            /* A FreeBSD dirent is at most 8 bytes longer than Linux's, and
+             * a Linux one is at least 24: ask for 3/4 of the buffer, so
+             * the translation always fits in what the program gave */
+            args[2] = (args[2] > 0xffffffffu ? 0xffffffffu : args[2]) / 4 * 3;
+            return 1;
         case FBSD_SYS_open:
             /* open(path, flags, mode) - flags at args[1] */
             args[1] = abi_translate_open_flags(args[1]);
@@ -627,69 +633,11 @@ static long emul_getdtablesize(pid_t pid, uint64_t args[6]) {
 }
 
 static long emul_syscall(pid_t pid, uint64_t args[6]) {
-    /* FreeBSD indirect syscall - arg0 is real syscall number, others shift */
-    int real_syscall = (int)args[0];
-
-    BSD_WARN("indirect syscall: real syscall = %d", real_syscall);
-
-    /* Look up the real syscall */
-    const syscall_entry_t *entry = syscall_get_entry(real_syscall);
-    if (!entry || entry->type == SYSCALL_UNSUPPORTED) {
-        BSD_WARN("indirect syscall %d unsupported", real_syscall);
-        return -ENOSYS;
-    }
-
-    /*
-     * For fork/vfork/clone, we can't execute from BSDulator's context.
-     * Instead, rewrite the child's registers to execute the real syscall.
-     */
-    if (real_syscall == FBSD_SYS_fork || real_syscall == FBSD_SYS_vfork ||
-        entry->linux_nr == SYS_fork || entry->linux_nr == SYS_vfork || 
-        entry->linux_nr == SYS_clone) {
-        
-        struct user_regs_struct regs;
-        if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0) {
-            BSD_ERROR("indirect syscall: failed to get regs");
-            return -ENOSYS;
-        }
-
-        /* Change syscall number from 0 (indirect) to the real Linux syscall */
-        regs.orig_rax = entry->linux_nr;
-        regs.rax = entry->linux_nr;
-        
-        /* Shift arguments: arg1->arg0, arg2->arg1, etc. */
-        regs.rdi = args[1];
-        regs.rsi = args[2];
-        regs.rdx = args[3];
-        regs.r10 = args[4];
-        regs.r8 = args[5];
-        regs.r9 = 0;
-
-        if (ptrace(PTRACE_SETREGS, pid, NULL, &regs) < 0) {
-            BSD_ERROR("indirect syscall: failed to set regs");
-            return -ENOSYS;
-        }
-
-        BSD_WARN("indirect syscall: rewrote syscall 0 -> %d (Linux %d) for fork/vfork",
-                 real_syscall, entry->linux_nr);
-        
-        /* Return special value to indicate "don't skip, let it execute" */
-        return -EAGAIN;  /* Special: means "execute normally" */
-    }
-
-    /* For other translated syscalls, execute directly (they don't fork) */
-    if (entry->type == SYSCALL_TRANSLATED || entry->type == SYSCALL_PASSTHROUGH) {
-        uint64_t shifted_args[6] = { args[1], args[2], args[3], args[4], args[5], 0 };
-        return syscall(entry->linux_nr, shifted_args[0], shifted_args[1],
-                       shifted_args[2], shifted_args[3], shifted_args[4], shifted_args[5]);
-    }
-
-    /* For emulated syscalls, call handler with shifted args */
-    if (entry->type == SYSCALL_EMULATED && entry->handler) {
-        uint64_t shifted_args[6] = { args[1], args[2], args[3], args[4], args[5], 0 };
-        return entry->handler(pid, shifted_args);
-    }
-
+    /* syscall(2) and __syscall(2) are unwrapped at syscall entry, in the
+     * program's registers (interceptor.c, unwrap_indirect), and never get
+     * here. Never run a program's syscall in the tracer itself. */
+    (void)pid;
+    (void)args;
     return -ENOSYS;
 }
 
@@ -742,11 +690,13 @@ static long emul_setegid(pid_t pid, uint64_t args[6]) {
 
 static long emul_mkfifo(pid_t pid, uint64_t args[6]) {
     (void)pid;
-    
-    /* mkfifo(path, mode) -> mknod(path, mode | S_IFIFO, 0) */
-    const char *path = (const char *)args[0];
-    mode_t mode = (mode_t)args[1];
-    return syscall(SYS_mknod, path, mode | 0010000 /* S_IFIFO */, 0);
+
+    /* mkfifo(path, mode) -> mknod(path, mode | S_IFIFO, 0), run by the
+     * program itself (its root, its working directory, its rights);
+     * only permission bits from the mode */
+    args[1] = (args[1] & 07777) | 0010000 /* S_IFIFO */;
+    args[2] = 0;
+    return -EAGAIN;
 }
 
 /*
@@ -1026,31 +976,20 @@ static long emul_cpuset_getaffinity(pid_t pid, uint64_t args[6]) {
     
     BSD_TRACE("cpuset_getaffinity: setsize=%zu mask=0x%lx", setsize, mask_addr);
     
+    /* FreeBSD refuses sets larger than CPU_MAXSIZE (1024 bits): the size
+     * is the program's, and the tracer's work must not be */
+    if (setsize > 128) return -ERANGE;
     if (mask_addr != 0 && setsize >= sizeof(uint64_t)) {
-        /* Set all CPUs as available (up to 64) */
-        uint64_t mask = 0xFFFFFFFFFFFFFFFFULL;
-        
-        /* Write to CHILD's memory */
-        struct iovec local_iov = { &mask, sizeof(mask) };
-        struct iovec remote_iov = { (void *)mask_addr, sizeof(mask) };
-        
-        ssize_t written = process_vm_writev(pid, &local_iov, 1, &remote_iov, 1, 0);
-        if (written < 0) {
-            /* Fallback to ptrace */
-            ptrace(PTRACE_POKEDATA, pid, mask_addr, mask);
-        }
-        
-        /* If setsize > 8, zero out the rest */
-        if (setsize > sizeof(uint64_t)) {
-            uint64_t zero = 0;
-            for (size_t i = sizeof(uint64_t); i < setsize; i += sizeof(uint64_t)) {
-                struct iovec local_z = { &zero, sizeof(zero) };
-                struct iovec remote_z = { (void *)(mask_addr + i), sizeof(zero) };
-                process_vm_writev(pid, &local_z, 1, &remote_z, 1, 0);
-            }
-        }
+        /* All CPUs available (up to 64), the rest of the set zero */
+        uint8_t set[128];
+        memset(set, 0, sizeof(set));
+        memset(set, 0xff, sizeof(uint64_t));
+        struct iovec local_iov = { set, setsize };
+        struct iovec remote_iov = { (void *)mask_addr, setsize };
+        if (process_vm_writev(pid, &local_iov, 1, &remote_iov, 1, 0) != (ssize_t)setsize)
+            return -EFAULT;
     }
-    
+
     return 0;
 }
 
@@ -1196,19 +1135,26 @@ static int translate_pathconf_name(int fbsd_name) {
     }
 }
 
+/*
+ * A path the program passed, as a path the tracer can use to reach the
+ * same file: under /proc/<pid>/root or /proc/<pid>/cwd, so it resolves in
+ * the program's view of the filesystem, not the tracer's.
+ */
+static int tracee_path(pid_t pid, uint64_t addr, char *out, size_t sz) {
+    char p[1024];
+    if (interceptor_read_string(pid, p, (const void *)addr, sizeof(p)) < 0) return -1;
+    int n = snprintf(out, sz, "/proc/%d/%s/%s", (int)pid, p[0] == '/' ? "root" : "cwd",
+                     p[0] == '/' ? p + 1 : p);
+    return n < 0 || (size_t)n >= sz ? -1 : 0;
+}
+
 static long emul_pathconf(pid_t pid, uint64_t args[6]) {
     uint64_t path_addr = args[0];
     int name = (int)args[1];
     
-    /* Read path from child's memory */
-    char path[1024];
-    size_t i;
-    for (i = 0; i < sizeof(path) - 1; i++) {
-        long word = ptrace(PTRACE_PEEKDATA, pid, path_addr + i, NULL);
-        path[i] = (char)(word & 0xFF);
-        if (path[i] == '\0') break;
-    }
-    path[sizeof(path) - 1] = '\0';
+    /* The program's path, seen from its own root and working directory */
+    char path[1100];
+    if (tracee_path(pid, path_addr, path, sizeof(path)) < 0) return -EFAULT;
     
     int linux_name = translate_pathconf_name(name);
     BSD_TRACE("pathconf: path=%s name=%d->%d", path, name, linux_name);
@@ -1273,15 +1219,9 @@ static long emul_lpathconf(pid_t pid, uint64_t args[6]) {
     uint64_t path_addr = args[0];
     int name = (int)args[1];
     
-    /* Read path from child's memory */
-    char path[1024];
-    size_t i;
-    for (i = 0; i < sizeof(path) - 1; i++) {
-        long word = ptrace(PTRACE_PEEKDATA, pid, path_addr + i, NULL);
-        path[i] = (char)(word & 0xFF);
-        if (path[i] == '\0') break;
-    }
-    path[sizeof(path) - 1] = '\0';
+    /* The program's path, seen from its own root and working directory */
+    char path[1100];
+    if (tracee_path(pid, path_addr, path, sizeof(path)) < 0) return -EFAULT;
     
     int linux_name = translate_pathconf_name(name);
     BSD_TRACE("lpathconf: path=%s name=%d->%d", path, name, linux_name);
@@ -1875,7 +1815,8 @@ static uint64_t sockaddr_in_to_linux(pid_t pid, uint64_t addr, socklen_t addrlen
     if (addrlen > sizeof(f)) addrlen = sizeof(f);
     struct iovec local = { f, addrlen };
     struct iovec remote = { (void *)addr, addrlen };
-    if (addrlen < 2 || process_vm_readv(pid, &local, 1, &remote, 1, 0) < 0) return 0;
+    /* All of it: a short read would pass on tracer stack */
+    if (addrlen < 2 || process_vm_readv(pid, &local, 1, &remote, 1, 0) != (ssize_t)addrlen) return 0;
 
     memset(l, 0, sizeof(l));
     uint16_t fam = f[1] == 28 ? 10 : f[1];  /* AF_INET6: FreeBSD 28, Linux 10 */

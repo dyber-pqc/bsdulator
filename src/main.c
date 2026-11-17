@@ -384,6 +384,16 @@ int bsdulator_run(const char *binary, char *const argv[], char *const envp[]) {
     return code;
 }
 
+#if defined(__SANITIZE_ADDRESS__)
+/* Sanitizer build (make fuzz-build). No leak check: it ptraces the
+ * process's own threads, which a non-dumpable tracer cannot allow, and
+ * leaks are not what fuzzing looks for. */
+const char *__asan_default_options(void);
+const char *__asan_default_options(void) {
+    return "detect_leaks=0:print_summary=1";
+}
+#endif
+
 int main(int argc, char *argv[], char *envp[]) {
     int opt;
     int opt_idx = 0;

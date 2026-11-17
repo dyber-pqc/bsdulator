@@ -652,7 +652,7 @@ static int kq_complete(pid_t pid, kqproc_t *p, long rv) {
                 uint64_t d = evs[i].data;
                 if (d & USER_MARK) {
                     int k = (int)(d & 0xffffffffu);
-                    if (k >= p->sh->nkn || !p->sh->kn[k].used || p->sh->kn[k].kq != p->kq) continue;
+                    if (k < 0 || k >= p->sh->nkn || !p->sh->kn[k].used || p->sh->kn[k].kq != p->kq) continue;
                     knote_t *kn = &p->sh->kn[k];
                     if (kn->flags & EV_CLEAR_ && p->drain) p->drain[p->ndrain++] = kn->efd;
                     if (!kn->enabled) continue;
@@ -832,6 +832,11 @@ long kq_emul_kevent(pid_t pid, uint64_t args[6]) {
     if (!p) return -ENOMEM;
     int nchanges = (int)args[2], nevents = (int)args[4];
     if (nchanges < 0 || nevents < 0) return -EINVAL;
+    /* The tracer's memory is not the program's to size: at most 64k
+     * changes per call (4 MB), and no more events than one wait can
+     * deliver (kevent returns up to nevents, so fewer is correct) */
+    if (nchanges > 65536) return -EINVAL;
+    if (nevents > 4 * MAX_WAIT_EVENTS + 1024) nevents = 4 * MAX_WAIT_EVENTS + 1024;
 
     if (ptrace(PTRACE_GETREGS, pid, NULL, &p->entry) < 0) return -EFAULT;
     p->kq = (int)args[0];
@@ -853,7 +858,9 @@ long kq_emul_kevent(pid_t pid, uint64_t args[6]) {
         int64_t ts[2];
         if (rd(pid, ts, args[5], sizeof(ts)) < 0) { free_call(p); return -EFAULT; }
         if (ts[0] < 0 || ts[1] < 0 || ts[1] >= 1000000000) { free_call(p); return -EINVAL; }
-        int64_t ms = ts[0] * 1000 + (ts[1] + 999999) / 1000000;
+        /* No overflow: anything past ~24 days is the longest wait */
+        int64_t ms = ts[0] > 0x7fffffff / 1000 ? 0x7fffffff
+                                                : ts[0] * 1000 + (ts[1] + 999999) / 1000000;
         p->timeout_ms = ms > 0x7fffffff ? 0x7fffffff : ms;
     }
     p->phase = p->scratch ? P_CHANGES : P_SCRATCH;

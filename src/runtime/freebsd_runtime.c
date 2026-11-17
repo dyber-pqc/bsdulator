@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include <sys/random.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,7 +38,14 @@ freebsd_runtime_t g_freebsd_runtime = {0};
 static ssize_t read_process_mem(pid_t pid, void *local, const void *remote, size_t len) {
     struct iovec local_iov = { local, len };
     struct iovec remote_iov = { (void *)remote, len };
-    return syscall(SYS_process_vm_readv, pid, &local_iov, 1, &remote_iov, 1, 0);
+    /* All or nothing: a short read would leave the rest of local as
+     * whatever the tracer had there */
+    ssize_t n = syscall(SYS_process_vm_readv, pid, &local_iov, 1, &remote_iov, 1, 0);
+    if (n >= 0 && (size_t)n != len) {
+        errno = EFAULT;
+        return -1;
+    }
+    return n;
 }
 
 /*
@@ -56,22 +64,20 @@ static ssize_t write_process_mem(pid_t pid, const void *local, void *remote, siz
  * string-based buffer overflow exploitation.
  */
 static void generate_canary(uint8_t *canary, size_t len) {
-    FILE *f = fopen("/dev/urandom", "r");
-    if (f) {
-        size_t n = fread(canary, 1, len, f);
-        fclose(f);
-        if (n == len) {
-            /* Replace any null bytes - FreeBSD convention */
-            for (size_t i = 0; i < len; i++) {
-                if (canary[i] == 0) canary[i] = 0x42;
-            }
-            return;
+    /* From the kernel's generator (no /dev needed); never a guessable
+     * fallback */
+    size_t got = 0;
+    while (got < len) {
+        ssize_t r = getrandom(canary + got, len - got, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "bsdulator: no random bytes for the stack canary: %s\n", strerror(errno));
+            abort();
         }
+        got += (size_t)r;
     }
-    /* Fallback to time-based */
-    srand((unsigned int)time(NULL) ^ getpid());
+    /* Replace any null bytes - FreeBSD convention */
     for (size_t i = 0; i < len; i++) {
-        canary[i] = (uint8_t)(rand() & 0xFF);
         if (canary[i] == 0) canary[i] = 0x42;
     }
 }
@@ -346,36 +352,30 @@ static long handle_kern_sysctl(int mib1, pid_t pid, uint64_t oldp_addr, uint64_t
         }
         
         case KERN_ARND: {
-            /* Return random bytes */
+            /* Random bytes: at most 256 per call, as FreeBSD gives (the
+             * program does not get to size the tracer's buffer) */
             BSD_TRACE("sysctl: kern.arnd (random data), len=%zu", oldlen);
             if (oldp_addr && oldlen > 0) {
-                uint8_t *randbuf = malloc(oldlen);
-                if (!randbuf) return -ENOMEM;
-                
-                FILE *f = fopen("/dev/urandom", "r");
-                if (f) {
-                    size_t n = fread(randbuf, 1, oldlen, f);
-                    fclose(f);
-                    if (n != oldlen) {
-                        free(randbuf);
+                uint8_t randbuf[256];
+                size_t n = oldlen < sizeof(randbuf) ? oldlen : sizeof(randbuf);
+                size_t got = 0;
+                while (got < n) {
+                    ssize_t r = getrandom(randbuf + got, n - got, 0);
+                    if (r < 0) {
+                        if (errno == EINTR) continue;
                         return -EIO;
                     }
-                } else {
-                    /* Fallback */
-                    for (size_t i = 0; i < oldlen; i++) {
-                        randbuf[i] = (uint8_t)(rand() & 0xFF);
-                    }
+                    got += (size_t)r;
                 }
-                
-                if (write_process_mem(pid, randbuf, (void *)oldp_addr, oldlen) < 0) {
-                    free(randbuf);
+                if (write_process_mem(pid, randbuf, (void *)oldp_addr, n) < 0)
                     return -EFAULT;
-                }
-                free(randbuf);
+                if (oldlenp_addr &&
+                    write_process_mem(pid, &n, (void *)oldlenp_addr, sizeof(n)) < 0)
+                    return -EFAULT;
             }
             return 0;
         }
-        
+
         default:
             BSD_WARN("Unhandled kern sysctl: %d", mib1);
             return -ENOENT;

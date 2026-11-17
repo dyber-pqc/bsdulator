@@ -1543,13 +1543,17 @@ ssize_t interceptor_write_mem(pid_t pid, const void *local, void *remote, size_t
 
 ssize_t interceptor_read_string(pid_t pid, char *local, const void *remote, size_t maxlen) {
     size_t i;
-    
+
+    if (maxlen == 0) return -1;
     for (i = 0; i < maxlen - 1; i += sizeof(long)) {
         errno = 0;
         long data = ptrace(PTRACE_PEEKDATA, pid, (char *)remote + i, NULL);
         if (errno != 0) {
+            /* Unterminated up to unreadable memory: what was read, no
+             * more (the rest of local is not the program's) */
+            local[i] = '\0';
             if (i == 0) return -1;
-            break;
+            return (ssize_t)i;
         }
         
         size_t remaining = maxlen - 1 - i;
@@ -2252,7 +2256,10 @@ typedef struct {
     uint64_t mmap_alloc_size;
 } process_entry_t;
 
-static process_entry_t process_table[512];
+/* Every task the tracer follows (threads included); slots of ended ones
+ * are reused. One it cannot track is ended (interceptor_wait). */
+#define PROC_MAX 4096
+static process_entry_t process_table[PROC_MAX];
 static int process_count = 0;
 static pid_t main_pid = 0;  /* Track original/main process */
 
@@ -2279,7 +2286,7 @@ static process_entry_t* add_process(pid_t pid) {
             break;
         }
     }
-    if (!entry && process_count < 512) {
+    if (!entry && process_count < PROC_MAX) {
         entry = &process_table[process_count++];
     }
     if (entry) {
@@ -2420,7 +2427,14 @@ int interceptor_wait(interceptor_state_t *state) {
         
         /* Auto-add to process table if not already there */
         if (!find_process(result)) {
-            add_process(result);
+            if (!add_process(result)) {
+                /* No room to track it: a task whose syscalls the tracer
+                 * cannot follow must not run at all */
+                BSD_ERROR("too many tasks to trace; ending %d", (int)result);
+                kill(result, SIGKILL);
+                state->last_event = EVENT_NONE;
+                return 0;
+            }
             /* A new child can stop before its parent's fork event is
              * seen; take its jail from the parent now. */
             pid_t parent = parent_of(result);
@@ -2522,6 +2536,12 @@ int interceptor_wait(interceptor_state_t *state) {
             
             struct user_regs_struct regs;
             if (ptrace(PTRACE_GETREGS, state->pid, NULL, &regs) < 0) {
+                if (errno == ESRCH) {
+                    /* Killed since it stopped (a sibling thread's
+                     * exit_group, a SIGKILL): its exit comes next */
+                    state->last_event = EVENT_NONE;
+                    return 0;
+                }
                 BSD_ERROR("Failed to get registers: %s", strerror(errno));
                 return -1;
             }
@@ -2819,6 +2839,43 @@ static uint64_t pending_mmap_alloc_size = 0;
  * them at that process's exit, so exit handling (stat translation, mmap
  * alignment, return translation) uses the right syscall.
  */
+/*
+ * syscall(2) and __syscall(2): the number is the first argument and the
+ * rest shift down one, the last coming from the stack (as FreeBSD's
+ * cpu_fetch_syscall_args does). Unwrap them here, in the program's own
+ * registers, so the real call is handled exactly as if made directly: the
+ * tracer never runs a program's syscall in its own process. A nested
+ * indirect call becomes an unknown number (ENOSYS).
+ */
+#define FBSD_SYS___syscall 198
+static void unwrap_indirect(interceptor_state_t *state) {
+    struct user_regs_struct regs;
+    if (ptrace(PTRACE_GETREGS, state->pid, NULL, &regs) < 0) return;
+    uint64_t real = regs.rdi;
+    if (real == FBSD_SYS_syscall || real == FBSD_SYS___syscall) real = (uint64_t)-2;
+    uint64_t last = 0;
+    if (interceptor_read_mem(state->pid, &last, (const void *)(regs.rsp + 8), sizeof(last)) !=
+        (ssize_t)sizeof(last))
+        last = 0;
+    regs.orig_rax = real;
+    regs.rdi = regs.rsi;
+    regs.rsi = regs.rdx;
+    regs.rdx = regs.r10;
+    regs.r10 = regs.r8;
+    regs.r8 = regs.r9;
+    regs.r9 = last;
+    if (ptrace(PTRACE_SETREGS, state->pid, NULL, &regs) < 0) return;
+    state->syscall_nr = real;
+    state->args[0] = regs.rdi;
+    state->args[1] = regs.rsi;
+    state->args[2] = regs.rdx;
+    state->args[3] = regs.r10;
+    state->args[4] = regs.r8;
+    state->args[5] = regs.r9;
+    process_entry_t *pe = find_process(state->pid);
+    if (pe) memcpy(pe->sc_raw_args, state->args, sizeof(pe->sc_raw_args));
+}
+
 static void save_syscall_state(const interceptor_state_t *state) {
     process_entry_t *e = find_process(state->pid);
     if (!e) return;
@@ -2981,6 +3038,10 @@ int interceptor_run(interceptor_state_t *state) {
                     break;
                 }
 
+                if (state->syscall_nr == FBSD_SYS_syscall ||
+                    state->syscall_nr == FBSD_SYS___syscall)
+                    unwrap_indirect(state);
+
                 int linux_nr;
                 syscall_result_t result = syscall_translate((int)state->syscall_nr, &linux_nr);
                 
@@ -3055,7 +3116,10 @@ int interceptor_run(interceptor_state_t *state) {
                             BSD_TRACE("  Translating %llu -> %d",
                                       (unsigned long long)state->syscall_nr, linux_nr);
                             if (interceptor_set_syscall(state->pid, (uint64_t)linux_nr) < 0) {
-                                BSD_ERROR("Failed to set syscall number");
+                                /* Never let a FreeBSD number run as a
+                                 * Linux syscall: gone already, or ended */
+                                if (errno != ESRCH) BSD_ERROR("Failed to set syscall number");
+                                kill(state->pid, SIGKILL);
                             }
                         }
                         
@@ -3119,6 +3183,7 @@ int interceptor_run(interceptor_state_t *state) {
                                 case FBSD_SYS_jail_attach: actual_linux_nr = 161; break;  /* SYS_chroot - jail_attach rewrites to chroot */
                                 case FBSD_SYS_sigsuspend:  actual_linux_nr = SYS_rt_sigsuspend; break;
                                 case FBSD_SYS_procctl:     actual_linux_nr = SYS_prctl; break;
+                                case FBSD_SYS_mkfifo:      actual_linux_nr = SYS_mknod; break;
                                 case FBSD_SYS_wait6:       actual_linux_nr = SYS_wait4; break;
                                 case FBSD_SYS_ioctl:       actual_linux_nr = SYS_ioctl; break;
                                 case FBSD_SYS_fcntl:       actual_linux_nr = SYS_fcntl; break;
@@ -3157,6 +3222,7 @@ int interceptor_run(interceptor_state_t *state) {
                                 (int)state->syscall_nr == FBSD_SYS_connect ||
                                 (int)state->syscall_nr == FBSD_SYS_sendto ||
                                 (int)state->syscall_nr == FBSD_SYS_procctl ||
+                                (int)state->syscall_nr == FBSD_SYS_mkfifo ||
                                 (int)state->syscall_nr == FBSD_SYS_wait6 ||
                                 (int)state->syscall_nr == FBSD_SYS_ioctl ||
                                 (int)state->syscall_nr == FBSD_SYS_fcntl ||
@@ -3176,7 +3242,9 @@ int interceptor_run(interceptor_state_t *state) {
                                 BSD_TRACE("  Translating emulated syscall %llu -> %d",
                                           (unsigned long long)state->syscall_nr, actual_linux_nr);
                                 if (interceptor_set_syscall(state->pid, (uint64_t)actual_linux_nr) < 0) {
-                                    BSD_ERROR("Failed to set syscall number for emulated syscall");
+                                    if (errno != ESRCH)
+                                        BSD_ERROR("Failed to set syscall number for emulated syscall");
+                                    kill(state->pid, SIGKILL);
                                 }
                             }
                             state->translated_count++;
@@ -3505,9 +3573,13 @@ int interceptor_run(interceptor_state_t *state) {
                             ssize_t nread = process_vm_readv(state->pid, &local_iov, 1, &remote_iov, 1, 0);
                             if (nread == (ssize_t)linux_bytes) {
                                 /* Translate to FreeBSD format */
+                                /* Never more than the program's buffer */
+                                size_t room = linux_bytes * 2;
+                                process_entry_t *dpe = find_process(state->pid);
+                                if (dpe && dpe->sc_raw_args[2] < room) room = dpe->sc_raw_args[2];
                                 int fbsd_bytes = abi_translate_dirents_to_freebsd(
                                     linux_buf, linux_bytes,
-                                    fbsd_buf, linux_bytes * 2);
+                                    fbsd_buf, room);
                                 
                                 if (fbsd_bytes > 0) {
                                     /* Write FreeBSD dirents back to child memory */

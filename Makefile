@@ -6,6 +6,13 @@ CFLAGS = -Wall -Wextra -Werror -std=c11
 CFLAGS += -I$(INCDIR) -I$(SRCDIR)
 LDFLAGS = 
 
+# Sanitizer build (make fuzz-build): every memory error or undefined
+# behaviour in the tracer is reported and ends it
+ifdef SANITIZE
+CFLAGS += -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined -Wno-format-truncation
+LDFLAGS += -fsanitize=address,undefined -static-libasan -static-libubsan
+endif
+
 # Directories
 SRCDIR = src
 INCDIR = include
@@ -75,11 +82,13 @@ verbose: $(TARGET) $(LOCHS_TARGET)
 # Link BSDulator
 $(TARGET): $(OBJS)
 	@echo "  LINK    $@"
+	@mkdir -p $(dir $@)
 	@$(CC) $(OBJS) -o $@ $(LDFLAGS)
 
 # Link Lochs CLI
 $(LOCHS_TARGET): $(LOCHS_OBJS)
 	@echo "  LINK    $@"
+	@mkdir -p $(dir $@)
 	@$(CC) $(LOCHS_OBJS) -o $@ $(LDFLAGS)
 
 # Compile
@@ -120,6 +129,12 @@ $(OBJDIR)/lochs/lochs_registry.o: $(SRCDIR)/lochs/lochs_registry.c $(INCDIR)/bsd
 $(OBJDIR)/lochs/lochs_exec.o: $(SRCDIR)/lochs/lochs_exec.c $(INCDIR)/bsdulator/lochs_exec.h
 $(LOCHS_OBJS): $(INCDIR)/bsdulator/lochs_exec.h $(INCDIR)/bsdulator/lochs_ns.h
 
+# Tracer fuzzing (tests/freebsd/syscall_fuzz.c, run by tests/fuzz_tracer.sh):
+# fuzz/bsdulator with AddressSanitizer and UBSan, built apart from the
+# normal binaries (the script pairs it with the normal lochs)
+fuzz-build:
+	@$(MAKE) --no-print-directory OBJDIR=obj-fuzz BINDIR=fuzz SANITIZE=1 fuzz/bsdulator
+
 # Unit tests for the no-shell exec helpers
 TEST_EXEC = $(BINDIR)/tests/test_lochs_exec
 $(TEST_EXEC): tests/test_lochs_exec.c $(OBJDIR)/lochs/lochs_exec.o
@@ -150,7 +165,7 @@ test-seccomp: $(TEST_SECCOMP)
 # Clean
 clean:
 	@echo "  CLEAN"
-	@rm -rf $(OBJDIR) $(TARGET) $(LOCHS_TARGET) $(TEST_EXEC) $(TEST_SIGNAL) $(TEST_SECCOMP)
+	@rm -rf $(OBJDIR) $(TARGET) $(LOCHS_TARGET) $(TEST_EXEC) $(TEST_SIGNAL) $(TEST_SECCOMP) obj-fuzz fuzz
 
 # Install
 install: $(TARGET) $(LOCHS_TARGET)
@@ -213,4 +228,4 @@ help:
 	@echo "  setup-freebsd - Download FreeBSD base system"
 	@echo "  help          - Show this help"
 
-.PHONY: all debug verbose clean install install-service uninstall test test-exec test-signal test-seccomp setup-freebsd help package package-deb package-rpm
+.PHONY: all debug verbose fuzz-build clean install install-service uninstall test test-exec test-signal test-seccomp setup-freebsd help package package-deb package-rpm

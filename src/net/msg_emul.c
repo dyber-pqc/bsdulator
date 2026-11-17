@@ -125,7 +125,9 @@ static size_t cmsgs_to_fbsd(const uint8_t *in, size_t len, uint8_t *out) {
         memcpy(&clen, in + i, 8);
         memcpy(&level, in + i + 8, 4);
         memcpy(&type, in + i + 12, 4);
-        if (clen < 16 || i + clen > len) break;
+        /* clen is the program's (its memory can change under us): no
+         * wrap-around in i + clen */
+        if (clen < 16 || clen > len - i) break;
         uint32_t c32 = (uint32_t)clen;
         int32_t fl = level == L_SOL_SOCKET ? FBSD_SOL_SOCKET : level;
         memset(out + i, 0, 16);
@@ -189,7 +191,7 @@ static long build(pid_t pid, uint64_t fmsg_addr, int for_recv,
             uint8_t f[NAME_MAX_], l[NAME_MAX_];
             memset(l, 0, sizeof(l));
             if (rd(pid, f, fm->msg_name, fm->msg_namelen) < 0) return -EFAULT;
-            uint16_t fam = f[1] == 28 ? 10 : f[1];
+            uint16_t fam = fm->msg_namelen < 2 ? 0 : (f[1] == 28 ? 10 : f[1]);
             memcpy(l, &fam, 2);
             if (fm->msg_namelen > 2) memcpy(l + 2, f + 2, fm->msg_namelen - 2);
             if (wr(pid, l, lname, fm->msg_namelen) < 0) return -EFAULT;

@@ -1127,7 +1127,7 @@ long emul_jail(pid_t pid, uint64_t args[6]) {
     struct iovec remote = { (void *)jail_addr, sizeof(fbsd_jail) };
     
     ssize_t n = process_vm_readv(pid, &local, 1, &remote, 1, 0);
-    if (n < 0) {
+    if (n != (ssize_t)sizeof(fbsd_jail)) {
         BSD_WARN("jail(): failed to read jail structure");
         return -EFAULT;
     }
