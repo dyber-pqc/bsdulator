@@ -742,7 +742,7 @@ static pid_t start_port_forward(int host_port, int container_port, const char *p
              udp ? "UDP" : "TCP", container_port);
 
     const char *argv[] = { "socat", listen_spec, connect_spec, NULL };
-    int pid = lochs_run(argv, LOCHS_RUN_NOWAIT);
+    int pid = lochs_run(argv, LOCHS_RUN_NOWAIT | LOCHS_RUN_DETACH);
     return pid > 0 ? (pid_t)pid : -1;
 }
 
@@ -1031,6 +1031,9 @@ int lochs_cmd_start(int argc, char **argv) {
     snprintf(path_arg, sizeof(path_arg), "path=%s", jail->path);
 
     jargv[ja++] = lochs_bsdulator_path();
+    /* Resolve FreeBSD paths (libraries, ld-elf) against this container */
+    jargv[ja++] = "-r";
+    jargv[ja++] = jail->path;
     if (jail->netns[0]) {
         jargv[ja++] = "--netns";
         jargv[ja++] = jail->netns;
@@ -1095,11 +1098,13 @@ int lochs_cmd_start(int argc, char **argv) {
         /* Run CMD in the background through the jail's own /bin/sh, so
          * the host never parses it; join the cgroup first if active. */
         char jexec_bin[LOCHS_MAX_PATH + 32];
-        const char *cargv[12];
+        const char *cargv[16];
         int ca = 0;
 
         jail_subpath(jexec_bin, sizeof(jexec_bin), jail, "/usr/sbin/jexec");
         cargv[ca++] = lochs_bsdulator_path();
+        cargv[ca++] = "-r";
+        cargv[ca++] = jail->path;
         if (jail->netns[0]) {
             cargv[ca++] = "--netns";
             cargv[ca++] = jail->netns;
@@ -1113,7 +1118,7 @@ int lochs_cmd_start(int argc, char **argv) {
         cargv[ca] = NULL;
 
         if (lochs_run_in_cgroup(cargv, jail->cgroup_applied ? cgroup_procs : NULL,
-                                LOCHS_RUN_NOWAIT) < 0)
+                                LOCHS_RUN_NOWAIT | LOCHS_RUN_DETACH) < 0)
             fprintf(stderr, "  Warning: failed to launch CMD\n");
     }
 
@@ -1202,8 +1207,8 @@ int lochs_cmd_stop(int argc, char **argv) {
     char ld_path[LOCHS_MAX_PATH + 32], jail_bin[LOCHS_MAX_PATH + 32];
     jail_subpath(ld_path, sizeof(ld_path), jail, "/libexec/ld-elf.so.1");
     jail_subpath(jail_bin, sizeof(jail_bin), jail, "/usr/sbin/jail");
-    const char *rargv[] = { lochs_bsdulator_path(), ld_path, jail_bin,
-                            "-r", jail->name, NULL };
+    const char *rargv[] = { lochs_bsdulator_path(), "-r", jail->path,
+                            ld_path, jail_bin, "-r", jail->name, NULL };
 
     int ret = lochs_run(rargv, 0);
 
@@ -1319,13 +1324,15 @@ int lochs_cmd_exec(int argc, char **argv) {
     jail_subpath(ld_path, sizeof(ld_path), jail, "/libexec/ld-elf.so.1");
     jail_subpath(jexec_bin, sizeof(jexec_bin), jail, "/usr/sbin/jexec");
 
-    const char **eargv = calloc((size_t)argc + 8, sizeof(*eargv));
+    const char **eargv = calloc((size_t)argc + 10, sizeof(*eargv));
     if (!eargv) {
         fprintf(stderr, "Error: out of memory\n");
         return 1;
     }
     int ea = 0;
     eargv[ea++] = lochs_bsdulator_path();
+    eargv[ea++] = "-r";
+    eargv[ea++] = jail->path;
     if (jail->netns[0]) {
         eargv[ea++] = "--netns";
         eargv[ea++] = jail->netns;

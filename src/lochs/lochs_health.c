@@ -171,9 +171,11 @@ static int health_exec_check(const lochs_jail_t *jail,
     snprintf(ld_path, sizeof(ld_path), "%s/libexec/ld-elf.so.1", jail->path);
     snprintf(jexec_path, sizeof(jexec_path), "%s/usr/sbin/jexec", jail->path);
 
-    const char *argv[12];
+    const char *argv[16];
     int ac = 0;
     argv[ac++] = lochs_bsdulator_path();
+    argv[ac++] = "-r";
+    argv[ac++] = jail->path;
     if (jail->netns[0]) {
         argv[ac++] = "--netns";
         argv[ac++] = jail->netns;

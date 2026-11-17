@@ -53,6 +53,8 @@ int lochs_run_in_cgroup(const char *const argv[], const char *cgroup_procs,
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
+        if (flags & LOCHS_RUN_DETACH)
+            setsid();
         if (cgroup_procs) {
             int cfd = open(cgroup_procs, O_WRONLY);
             if (cfd < 0) _exit(126);

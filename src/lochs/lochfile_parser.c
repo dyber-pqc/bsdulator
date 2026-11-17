@@ -411,7 +411,7 @@ static int run_in_jail(const char *build_dir, const char *command) {
     snprintf(ld_path, sizeof(ld_path), "%s/libexec/ld-elf.so.1", build_dir);
     snprintf(sh_path, sizeof(sh_path), "%s/bin/sh", build_dir);
 
-    const char *argv[] = { lochs_bsdulator_path(), ld_path, sh_path,
+    const char *argv[] = { lochs_bsdulator_path(), "-r", build_dir, ld_path, sh_path,
                            "-c", command, NULL };
     return lochs_run(argv, 0);
 }

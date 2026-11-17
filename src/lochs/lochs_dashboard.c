@@ -1069,12 +1069,13 @@ static void api_container_exec(int fd, const char *name, http_request_t *req) {
     snprintf(jexec_path, sizeof(jexec_path), "%s/usr/sbin/jexec", jail->path);
 
     if (jail->netns[0]) {
-        const char *argv[] = { "/usr/local/bin/bsdulator", "--netns", jail->netns,
+        const char *argv[] = { lochs_bsdulator_path(), "-r", jail->path,
+                               "--netns", jail->netns,
                                ld_path, jexec_path, jail->name,
                                "/bin/sh", "-c", user_cmd, NULL };
         run_and_reply(fd, argv, 8192);
     } else {
-        const char *argv[] = { "/usr/local/bin/bsdulator",
+        const char *argv[] = { lochs_bsdulator_path(), "-r", jail->path,
                                ld_path, jexec_path, jail->name,
                                "/bin/sh", "-c", user_cmd, NULL };
         run_and_reply(fd, argv, 8192);

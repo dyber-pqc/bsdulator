@@ -15,6 +15,10 @@
 /* Flags for lochs_run() */
 #define LOCHS_RUN_QUIET   0x1   /* send stdout and stderr to /dev/null */
 #define LOCHS_RUN_NOWAIT  0x2   /* do not wait; return the child's PID */
+#define LOCHS_RUN_DETACH  0x4   /* child calls setsid(): it outlives this
+                                   process's session (needed under WSL, which
+                                   kills a session's processes when the
+                                   wsl.exe that started it exits) */
 
 /*
  * Run argv[0] (looked up in PATH) with the NULL-terminated argv.

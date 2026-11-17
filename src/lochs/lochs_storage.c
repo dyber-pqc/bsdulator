@@ -41,6 +41,28 @@ static void safe_strcpy(char *dst, const char *src, size_t dst_size) {
 }
 
 /*
+ * True if path is currently a mount point, per /proc/self/mountinfo
+ * (field 5 is the mount point; spaces in it are escaped as \040).
+ */
+static int is_mountpoint(const char *path) {
+    FILE *f = fopen("/proc/self/mountinfo", "r");
+    if (!f) return 0;
+
+    char line[4096];
+    int found = 0;
+    while (!found && fgets(line, sizeof(line), f)) {
+        char *save = NULL;
+        char *field = strtok_r(line, " ", &save);
+        for (int i = 1; field && i < 5; i++)
+            field = strtok_r(NULL, " ", &save);
+        if (field && strcmp(field, path) == 0)
+            found = 1;
+    }
+    fclose(f);
+    return found;
+}
+
+/*
  * Check if ZFS is available on this system
  */
 int lochs_storage_is_zfs_available(void) {
@@ -178,9 +200,12 @@ int lochs_storage_mount_container(lochs_jail_t *jail) {
     /* OverlayFS backend */
     char opts[4096];
 
-    if (jail->overlay_mounted) {
+    /* The saved flag can be stale: a reboot, or a WSL distro shutting down
+     * while idle, drops every mount. Trust the kernel's mount table. */
+    if (jail->overlay_mounted && is_mountpoint(jail->merged_path)) {
         return 0;
     }
+    jail->overlay_mounted = 0;
 
     if (!jail->image_path[0] || !jail->diff_path[0]) {
         fprintf(stderr, "Error: Container storage not initialized\n");
