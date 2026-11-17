@@ -129,6 +129,57 @@ void freebsd_runtime_set_execpath(const char *path) {
 }
 
 /*
+ * Path of each process's program, as the program sees it. With direct
+ * execution through ld-elf.so.1 the kernel's view (/proc/pid/exe) is the
+ * linker, so it is recorded at exec from the linker's arguments.
+ */
+#define MAX_EXE_PATHS 512
+static struct { pid_t pid; char path[1024]; } exe_paths[MAX_EXE_PATHS];
+
+static int exe_slot(pid_t pid, int create) {
+    int free_i = -1;
+    for (int i = 0; i < MAX_EXE_PATHS; i++) {
+        if (exe_paths[i].pid == pid) return i;
+        if (free_i < 0 && exe_paths[i].pid == 0) free_i = i;
+    }
+    if (!create || free_i < 0) return -1;
+    exe_paths[free_i].pid = pid;
+    exe_paths[free_i].path[0] = '\0';
+    return free_i;
+}
+
+const char *freebsd_exe_path(pid_t pid) {
+    int i = exe_slot(pid, 0);
+    return i >= 0 && exe_paths[i].path[0] ? exe_paths[i].path : NULL;
+}
+
+void freebsd_exe_path_inherit(pid_t parent, pid_t child) {
+    int p = exe_slot(parent, 0);
+    if (p < 0) return;
+    int c = exe_slot(child, 1);
+    if (c >= 0) memcpy(exe_paths[c].path, exe_paths[p].path, sizeof(exe_paths[c].path));
+}
+
+void freebsd_exe_path_forget(pid_t pid) {
+    int i = exe_slot(pid, 0);
+    if (i >= 0) exe_paths[i].pid = 0;
+}
+
+static void set_exe_path(pid_t pid, const char *path) {
+    int i = exe_slot(pid, 1);
+    if (i < 0) return;
+    /* Outside a jail the path is on the host under the FreeBSD root;
+     * the program knows it without that prefix. */
+    const char *root = bsdulator_get_freebsd_root();
+    char absroot[1024];
+    if (root && root[0] && realpath(root, absroot)) {
+        size_t rl = strlen(absroot);
+        if (rl > 1 && strncmp(path, absroot, rl) == 0 && path[rl] == '/') path += rl;
+    }
+    snprintf(exe_paths[i].path, sizeof(exe_paths[i].path), "%s", path);
+}
+
+/*
  * Handle kern.* sysctl queries
  */
 static long handle_kern_sysctl(int mib1, pid_t pid, uint64_t oldp_addr, uint64_t oldlenp_addr) {
@@ -575,6 +626,21 @@ long freebsd_handle_sysctl(pid_t pid, uint64_t args[6]) {
             return handle_sysctl_sysctl(mib, namelen, pid, oldp_addr, oldlenp_addr, newp_addr, newlen);
             
         case CTL_KERN:
+            if (mib[1] == 14 /* KERN_PROC */ && namelen >= 4 && mib[2] == 12 /* KERN_PROC_PATHNAME */) {
+                pid_t who = mib[3] == -1 ? pid : (pid_t)mib[3];
+                const char *pth = freebsd_exe_path(who);
+                if (!pth) return -ENOENT;
+                size_t len = strlen(pth) + 1, have = 0;
+                if (oldlenp_addr && read_process_mem(pid, &have, (void *)oldlenp_addr, sizeof(have)) < 0)
+                    return -EFAULT;
+                if (oldp_addr) {
+                    if (have < len) return -ENOMEM;
+                    if (write_process_mem(pid, pth, (void *)oldp_addr, len) < 0) return -EFAULT;
+                }
+                if (oldlenp_addr && write_process_mem(pid, &len, (void *)oldlenp_addr, sizeof(len)) < 0)
+                    return -EFAULT;
+                return 0;
+            }
             return handle_kern_sysctl(mib[1], pid, oldp_addr, oldlenp_addr);
             
         case CTL_HW:
@@ -1007,6 +1073,31 @@ int freebsd_setup_stack(pid_t pid, uint64_t entry, uint64_t phdr,
      * We use linux_execfn which points to the executed binary path.
      */
     uint64_t execpath_addr = linux_execfn;  /* Use Linux's AT_EXECFN location */
+
+    /* The program is the linker's argument: ld-elf.so.1 -b <exe> -- ...
+     * (execs inside the engine) or ld-elf.so.1 <exe> ... (the first one).
+     * Report it as AT_EXECPATH and remember it for kern.proc.pathname. */
+    if (argc >= 2) {
+        uint64_t av[3] = {0, 0, 0};
+        char a1[8] = "";
+        (void)read_process_mem(pid, av, (void *)(argc_ptr + 8), sizeof(av));
+        if (av[1]) (void)read_process_mem(pid, a1, (void *)av[1], 3);
+        uint64_t exe = (strcmp(a1, "-b") == 0 && argc >= 3) ? av[2] : av[1];
+        /* Read the string in small pieces: it may end near the top of
+         * the stack mapping */
+        char pbuf[1024];
+        size_t got = 0;
+        int done = 0;
+        while (exe && !done && got + 64 < sizeof(pbuf)) {
+            if (read_process_mem(pid, pbuf + got, (void *)(exe + got), 64) < 0) break;
+            if (memchr(pbuf + got, '\0', 64)) done = 1;
+            got += 64;
+        }
+        if (done && pbuf[0]) {
+            set_exe_path(pid, pbuf);
+            execpath_addr = exe;
+        }
+    }
     
     /* 
      * Build FreeBSD auxv with CORRECT FreeBSD type numbers!

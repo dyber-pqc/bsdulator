@@ -35,6 +35,8 @@
 #include "bsdulator/syscall.h"
 #include "bsdulator/signal_emul.h"
 #include "bsdulator/kqueue_emul.h"
+#include "bsdulator/chain.h"
+#include "bsdulator/thread_emul.h"
 
 /* ---------------------------------------------------------------------
  * FreeBSD constants and structures
@@ -285,11 +287,19 @@ static void fs_sanitize(fset_t *s) {
  * Per-process state
  * ------------------------------------------------------------------- */
 
+/* Signal actions: one table per process, shared by its threads */
 typedef struct {
-    pid_t    pid;
+    int      refs;
     uint64_t handler[FBSD_NSIG + 1];
     int32_t  flags[FBSD_NSIG + 1];
     fset_t   hmask[FBSD_NSIG + 1];
+} sig_act_t;
+
+/* Per thread: mask, pending signals, alternate stack, ... */
+typedef struct {
+    pid_t    pid;             /* thread id */
+    pid_t    tgid;            /* process id */
+    sig_act_t *act;
     fset_t   blocked;
     fset_t   pending;
     struct fbsd_siginfo pinfo[FBSD_NSIG + 1];
@@ -320,7 +330,11 @@ static sig_proc_t *new_proc(pid_t pid) {
         if (!procs[i]) {
             sig_proc_t *p = calloc(1, sizeof(*p));
             if (!p) return NULL;
+            p->act = calloc(1, sizeof(sig_act_t));
+            if (!p->act) { free(p); return NULL; }
+            p->act->refs = 1;
             p->pid = pid;
+            p->tgid = thr_tgid(pid);
             p->altstack.ss_flags = FBSD_SS_DISABLE;
             procs[i] = p;
             return p;
@@ -346,12 +360,27 @@ void sig_proc_fork(pid_t parent, pid_t child) {
     if (!c || !pp) return;
     /* fork(2): dispositions, mask and alternate stack are inherited;
      * pending signals are not. */
-    memcpy(c->handler, pp->handler, sizeof(c->handler));
-    memcpy(c->flags, pp->flags, sizeof(c->flags));
-    memcpy(c->hmask, pp->hmask, sizeof(c->hmask));
+    memcpy(c->act->handler, pp->act->handler, sizeof(c->act->handler));
+    memcpy(c->act->flags, pp->act->flags, sizeof(c->act->flags));
+    memcpy(c->act->hmask, pp->act->hmask, sizeof(c->act->hmask));
     c->blocked = pp->in_sigsuspend ? pp->saved_mask : pp->blocked;
     c->altstack = pp->altstack;
     c->fastblock_ptr = pp->fastblock_ptr;
+}
+
+void sig_thread_create(pid_t creator, pid_t thread) {
+    if (find_proc(thread)) return;
+    sig_proc_t *pp = find_proc(creator);
+    sig_proc_t *c = new_proc(thread);
+    if (!c || !pp) return;
+    /* A thread shares its process's actions and starts with its
+     * creator's mask; no pending signals, no alternate stack, and libthr
+     * registers its own sigfastblock word. */
+    free(c->act);
+    c->act = pp->act;
+    c->act->refs++;
+    c->tgid = pp->tgid;
+    c->blocked = pp->in_sigsuspend ? pp->saved_mask : pp->blocked;
 }
 
 void sig_proc_exec(pid_t pid) {
@@ -360,9 +389,9 @@ void sig_proc_exec(pid_t pid) {
     /* execve(2): caught signals revert to SIG_DFL, ignored stay ignored;
      * the mask and pending set survive; the alternate stack is reset. */
     for (int s = 1; s <= FBSD_NSIG; s++) {
-        if (p->handler[s] != FBSD_SIG_IGN) p->handler[s] = FBSD_SIG_DFL;
-        p->flags[s] = 0;
-        memset(&p->hmask[s], 0, sizeof(fset_t));
+        if (p->act->handler[s] != FBSD_SIG_IGN) p->act->handler[s] = FBSD_SIG_DFL;
+        p->act->flags[s] = 0;
+        memset(&p->act->hmask[s], 0, sizeof(fset_t));
     }
     p->altstack.ss_sp = 0;
     p->altstack.ss_size = 0;
@@ -377,6 +406,7 @@ void sig_proc_exec(pid_t pid) {
 void sig_proc_exit(pid_t pid) {
     for (int i = 0; i < MAX_SIG_PROCS; i++) {
         if (procs[i] && procs[i]->pid == pid) {
+            if (--procs[i]->act->refs == 0) free(procs[i]->act);
             free(procs[i]);
             procs[i] = NULL;
             return;
@@ -542,8 +572,8 @@ static int restore_context(pid_t pid, sig_proc_t *p, uint64_t uc_addr) {
  */
 static int deliver(pid_t pid, sig_proc_t *p, int fsig,
                    const struct fbsd_siginfo *si, struct user_regs_struct *r) {
-    uint64_t handler = p->handler[fsig];
-    int fl = p->flags[fsig];
+    uint64_t handler = p->act->handler[fsig];
+    int fl = p->act->flags[fsig];
     struct user_regs_struct saved = *r;
 
     /* Interrupted syscall: restart it after the handler, or fail it
@@ -611,12 +641,12 @@ static int deliver(pid_t pid, sig_proc_t *p, int fsig,
 
     /* Mask while the handler runs */
     p->in_sigsuspend = 0;
-    fs_or(&p->blocked, &p->hmask[fsig]);
+    fs_or(&p->blocked, &p->act->hmask[fsig]);
     if (!(fl & FBSD_SA_NODEFER)) fs_add(&p->blocked, fsig);
     fs_sanitize(&p->blocked);
     if (fl & FBSD_SA_RESETHAND) {
-        p->handler[fsig] = FBSD_SIG_DFL;
-        p->flags[fsig] &= ~FBSD_SA_SIGINFO;
+        p->act->handler[fsig] = FBSD_SIG_DFL;
+        p->act->flags[fsig] &= ~FBSD_SA_SIGINFO;
     }
     BSD_TRACE("signal: delivered %d to pid %d, handler 0x%lx", fsig, pid, (unsigned long)handler);
     return 0;
@@ -632,7 +662,7 @@ static void pend(sig_proc_t *p, int fsig, const struct fbsd_siginfo *si) {
 static int next_ready(sig_proc_t *p) {
     for (int s = 1; s <= FBSD_NSIG; s++) {
         if (!fs_has(&p->pending, s) || fs_has(&p->blocked, s)) continue;
-        uint64_t h = p->handler[s];
+        uint64_t h = p->act->handler[s];
         if (h == FBSD_SIG_IGN || (h == FBSD_SIG_DFL && default_ignored(s))) {
             fs_del(&p->pending, s);
             continue;
@@ -645,9 +675,9 @@ static int next_ready(sig_proc_t *p) {
 /* Deliver one pending signal that is no longer blocked. */
 static void deliver_pending(pid_t pid, sig_proc_t *p) {
     int s = next_ready(p);
-    if (s < 1 || s > FBSD_NSIG || fastblocked(pid, p) || kq_busy(pid)) return;
+    if (s < 1 || s > FBSD_NSIG || fastblocked(pid, p) || kq_busy(pid) || chain_busy(pid)) return;
     fs_del(&p->pending, s);
-    if (p->handler[s] == FBSD_SIG_DFL) {
+    if (p->act->handler[s] == FBSD_SIG_DFL) {
         /* Default action (terminate, stop): let the kernel do it. */
         int lsig = sig_fbsd_to_linux(s);
         if (lsig) syscall(SYS_tgkill, pid, pid, lsig);
@@ -710,7 +740,7 @@ int sig_on_signal(pid_t pid, int lsig) {
         return 0;
     }
 
-    uint64_t h = p->handler[fsig];
+    uint64_t h = p->act->handler[fsig];
     int fault = have && lsi.si_code > 0 &&
                 (fsig == FBSD_SIGSEGV || fsig == FBSD_SIGBUS || fsig == FBSD_SIGILL ||
                  fsig == FBSD_SIGFPE || fsig == FBSD_SIGTRAP);
@@ -718,15 +748,26 @@ int sig_on_signal(pid_t pid, int lsig) {
     if (fault && (fs_has(&p->blocked, fsig) || h == FBSD_SIG_IGN)) return lsig;
 
     if (h == FBSD_SIG_IGN) return 0;
-    if (fsig == FBSD_SIGCHLD && (p->flags[fsig] & FBSD_SA_NOCLDSTOP) && have &&
+    if (fsig == FBSD_SIGCHLD && (p->act->flags[fsig] & FBSD_SA_NOCLDSTOP) && have &&
         (lsi.si_code == CLD_STOPPED || lsi.si_code == CLD_CONTINUED))
         return 0;
     if (fs_has(&p->blocked, fsig)) {
+        /* A signal sent to the process (not to this thread) goes to a
+         * thread that does not block it, as on FreeBSD. */
+        if (have && lsi.si_code != SI_TKILL) {
+            for (int i = 0; i < MAX_SIG_PROCS; i++) {
+                sig_proc_t *o = procs[i];
+                if (o && o != p && o->tgid == p->tgid && !fs_has(&o->blocked, fsig)) {
+                    syscall(SYS_tgkill, o->tgid, o->pid, lsig);
+                    return 0;
+                }
+            }
+        }
         pend(p, fsig, &si);
         return 0;
     }
     if (h == FBSD_SIG_DFL) return default_ignored(fsig) ? 0 : lsig;
-    if (fastblocked(pid, p) || kq_busy(pid)) {
+    if (fastblocked(pid, p) || kq_busy(pid) || chain_busy(pid)) {
         /* Deferred: delivered when the process leaves the critical
          * section, or when its kevent() chain returns. */
         pend(p, fsig, &si);
@@ -829,16 +870,16 @@ long sig_emul_sigaction(pid_t pid, uint64_t args[6]) {
     }
     if (oact) {
         struct fbsd_sigaction oa;
-        oa.handler = p->handler[sig];
-        oa.flags = p->flags[sig];
-        oa.mask = p->hmask[sig];
+        oa.handler = p->act->handler[sig];
+        oa.flags = p->act->flags[sig];
+        oa.mask = p->act->hmask[sig];
         if (wr(pid, &oa, oact, sizeof(oa)) < 0) return -EFAULT;
     }
     if (act) {
-        p->handler[sig] = na.handler;
-        p->flags[sig] = na.flags;
-        p->hmask[sig] = na.mask;
-        fs_sanitize(&p->hmask[sig]);
+        p->act->handler[sig] = na.handler;
+        p->act->flags[sig] = na.flags;
+        p->act->hmask[sig] = na.mask;
+        fs_sanitize(&p->act->hmask[sig]);
         /* Setting SIG_IGN (or SIG_DFL for a default-ignored signal)
          * discards it if pending. */
         if (na.handler == FBSD_SIG_IGN ||

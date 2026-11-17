@@ -31,6 +31,7 @@
 #include "bsdulator/interceptor.h"
 #include "bsdulator/syscall.h"
 #include "bsdulator/kqueue_emul.h"
+#include "bsdulator/thread_emul.h"
 
 int abi_translate_errno(int linux_errno);
 
@@ -131,17 +132,24 @@ typedef struct {
 } left_t;
 
 enum { CALL_NONE, CALL_KQUEUE, CALL_KEVENT };
-enum { P_CHANGES, P_SYNC, P_WAIT, P_DRAIN, P_DONE };
+enum { P_SCRATCH, P_CHANGES, P_SYNC, P_WAIT, P_DRAIN, P_DONE };
 enum { OP_NONE, OP_CREATE, OP_MMAP, OP_CTL, OP_EVENTFD, OP_UADD, OP_TRIGGER,
-       OP_UDEL, OP_UCLOSE, OP_SYNC, OP_WAIT, OP_DRAIN };
+       OP_UDEL, OP_UCLOSE, OP_SYNC, OP_WAIT, OP_DRAIN, OP_SCRATCH };
 
+/* Knotes and epoll registrations: per process, shared by its threads */
 typedef struct {
-    pid_t pid;
-    uint64_t scratch;
-
+    pid_t tgid;
+    int refs;
     knote_t   *kn;  int nkn;
     fdstate_t *fs;  int nfs;
     left_t    *left; int nleft;
+} kqshared_t;
+
+/* Per thread: scratch memory and the call in progress */
+typedef struct {
+    pid_t pid;
+    uint64_t scratch;
+    kqshared_t *sh;
 
     /* call in progress */
     int call;
@@ -176,10 +184,21 @@ static kqproc_t *find_proc(pid_t pid) {
 static kqproc_t *get_proc(pid_t pid) {
     kqproc_t *p = find_proc(pid);
     if (p) return p;
+    pid_t tgid = thr_tgid(pid);
+    kqshared_t *sh = NULL;
+    for (int i = 0; i < MAX_KQ_PROCS; i++)
+        if (procs[i] && procs[i]->sh->tgid == tgid) { sh = procs[i]->sh; break; }
     for (int i = 0; i < MAX_KQ_PROCS; i++) {
         if (!procs[i]) {
             p = calloc(1, sizeof(*p));
             if (!p) return NULL;
+            if (!sh) {
+                sh = calloc(1, sizeof(*sh));
+                if (!sh) { free(p); return NULL; }
+                sh->tgid = tgid;
+            }
+            sh->refs++;
+            p->sh = sh;
             p->pid = pid;
             procs[i] = p;
             return p;
@@ -199,9 +218,12 @@ static void free_call(kqproc_t *p) {
 
 static void free_proc(kqproc_t *p) {
     free_call(p);
-    free(p->kn);
-    free(p->fs);
-    free(p->left);
+    if (--p->sh->refs == 0) {
+        free(p->sh->kn);
+        free(p->sh->fs);
+        free(p->sh->left);
+        free(p->sh);
+    }
     free(p);
 }
 
@@ -239,40 +261,40 @@ static int wr(pid_t pid, const void *src, uint64_t addr, size_t len) {
  * ------------------------------------------------------------------- */
 
 static int kn_find(kqproc_t *p, int kq, uint64_t ident, int16_t filter) {
-    for (int i = 0; i < p->nkn; i++)
-        if (p->kn[i].used && p->kn[i].kq == kq && p->kn[i].ident == ident &&
-            p->kn[i].filter == filter)
+    for (int i = 0; i < p->sh->nkn; i++)
+        if (p->sh->kn[i].used && p->sh->kn[i].kq == kq && p->sh->kn[i].ident == ident &&
+            p->sh->kn[i].filter == filter)
             return i;
     return -1;
 }
 
 static int kn_new(kqproc_t *p) {
-    for (int i = 0; i < p->nkn; i++)
-        if (!p->kn[i].used) { memset(&p->kn[i], 0, sizeof(knote_t)); p->kn[i].used = 1; return i; }
-    knote_t *n = realloc(p->kn, (size_t)(p->nkn + 16) * sizeof(knote_t));
+    for (int i = 0; i < p->sh->nkn; i++)
+        if (!p->sh->kn[i].used) { memset(&p->sh->kn[i], 0, sizeof(knote_t)); p->sh->kn[i].used = 1; return i; }
+    knote_t *n = realloc(p->sh->kn, (size_t)(p->sh->nkn + 16) * sizeof(knote_t));
     if (!n) return -1;
-    memset(n + p->nkn, 0, 16 * sizeof(knote_t));
-    p->kn = n;
-    p->nkn += 16;
+    memset(n + p->sh->nkn, 0, 16 * sizeof(knote_t));
+    p->sh->kn = n;
+    p->sh->nkn += 16;
     return kn_new(p);
 }
 
 static fdstate_t *fs_get(kqproc_t *p, int kq, int fd, int create) {
     int free_i = -1;
-    for (int i = 0; i < p->nfs; i++) {
-        if (p->fs[i].used && p->fs[i].kq == kq && p->fs[i].fd == fd) return &p->fs[i];
-        if (!p->fs[i].used && free_i < 0) free_i = i;
+    for (int i = 0; i < p->sh->nfs; i++) {
+        if (p->sh->fs[i].used && p->sh->fs[i].kq == kq && p->sh->fs[i].fd == fd) return &p->sh->fs[i];
+        if (!p->sh->fs[i].used && free_i < 0) free_i = i;
     }
     if (!create) return NULL;
     if (free_i < 0) {
-        fdstate_t *n = realloc(p->fs, (size_t)(p->nfs + 16) * sizeof(fdstate_t));
+        fdstate_t *n = realloc(p->sh->fs, (size_t)(p->sh->nfs + 16) * sizeof(fdstate_t));
         if (!n) return NULL;
-        memset(n + p->nfs, 0, 16 * sizeof(fdstate_t));
-        p->fs = n;
-        free_i = p->nfs;
-        p->nfs += 16;
+        memset(n + p->sh->nfs, 0, 16 * sizeof(fdstate_t));
+        p->sh->fs = n;
+        free_i = p->sh->nfs;
+        p->sh->nfs += 16;
     }
-    fdstate_t *f = &p->fs[free_i];
+    fdstate_t *f = &p->sh->fs[free_i];
     memset(f, 0, sizeof(*f));
     f->used = 1;
     f->kq = kq;
@@ -285,13 +307,13 @@ static uint32_t wanted_mask(kqproc_t *p, int kq, int fd) {
     uint32_t m = 0;
     int r = kn_find(p, kq, (uint64_t)fd, EVFILT_READ_);
     int w = kn_find(p, kq, (uint64_t)fd, EVFILT_WRITE_);
-    if (r >= 0 && p->kn[r].enabled) {
+    if (r >= 0 && p->sh->kn[r].enabled) {
         m |= L_EPOLLIN | L_EPOLLRDHUP;
-        if (p->kn[r].flags & EV_CLEAR_) m |= L_EPOLLET;
+        if (p->sh->kn[r].flags & EV_CLEAR_) m |= L_EPOLLET;
     }
-    if (w >= 0 && p->kn[w].enabled) {
+    if (w >= 0 && p->sh->kn[w].enabled) {
         m |= L_EPOLLOUT;
-        if (p->kn[w].flags & EV_CLEAR_) m |= L_EPOLLET;
+        if (p->sh->kn[w].flags & EV_CLEAR_) m |= L_EPOLLET;
     }
     return m;
 }
@@ -299,24 +321,24 @@ static uint32_t wanted_mask(kqproc_t *p, int kq, int fd) {
 /* Forget everything about kq, or about fd in all kqueues (it was closed;
  * the kernel already dropped it from epoll). */
 static void forget_kq(kqproc_t *p, int kq) {
-    for (int i = 0; i < p->nkn; i++) if (p->kn[i].used && p->kn[i].kq == kq) p->kn[i].used = 0;
-    for (int i = 0; i < p->nfs; i++) if (p->fs[i].used && p->fs[i].kq == kq) p->fs[i].used = 0;
+    for (int i = 0; i < p->sh->nkn; i++) if (p->sh->kn[i].used && p->sh->kn[i].kq == kq) p->sh->kn[i].used = 0;
+    for (int i = 0; i < p->sh->nfs; i++) if (p->sh->fs[i].used && p->sh->fs[i].kq == kq) p->sh->fs[i].used = 0;
     int j = 0;
-    for (int i = 0; i < p->nleft; i++) if (p->left[i].kq != kq) p->left[j++] = p->left[i];
-    p->nleft = j;
+    for (int i = 0; i < p->sh->nleft; i++) if (p->sh->left[i].kq != kq) p->sh->left[j++] = p->sh->left[i];
+    p->sh->nleft = j;
 }
 
 static void forget_fd(kqproc_t *p, int fd) {
-    for (int i = 0; i < p->nkn; i++)
-        if (p->kn[i].used && p->kn[i].filter != EVFILT_USER_ && p->kn[i].ident == (uint64_t)fd)
-            p->kn[i].used = 0;
-    for (int i = 0; i < p->nfs; i++)
-        if (p->fs[i].used && p->fs[i].fd == fd) p->fs[i].used = 0;
+    for (int i = 0; i < p->sh->nkn; i++)
+        if (p->sh->kn[i].used && p->sh->kn[i].filter != EVFILT_USER_ && p->sh->kn[i].ident == (uint64_t)fd)
+            p->sh->kn[i].used = 0;
+    for (int i = 0; i < p->sh->nfs; i++)
+        if (p->sh->fs[i].used && p->sh->fs[i].fd == fd) p->sh->fs[i].used = 0;
     int j = 0;
-    for (int i = 0; i < p->nleft; i++)
-        if (!(p->left[i].ev.filter != EVFILT_USER_ && p->left[i].ev.ident == (uint64_t)fd))
-            p->left[j++] = p->left[i];
-    p->nleft = j;
+    for (int i = 0; i < p->sh->nleft; i++)
+        if (!(p->sh->left[i].ev.filter != EVFILT_USER_ && p->sh->left[i].ev.ident == (uint64_t)fd))
+            p->sh->left[j++] = p->sh->left[i];
+    p->sh->nleft = j;
 }
 
 void kq_after_syscall(pid_t pid, uint64_t nr, const uint64_t args[6]) {
@@ -371,12 +393,12 @@ static void add_out(kqproc_t *p, const struct fbsd_kevent *ev) {
         p->out[p->nout++] = *ev;
         return;
     }
-    left_t *n = realloc(p->left, (size_t)(p->nleft + 1) * sizeof(left_t));
+    left_t *n = realloc(p->sh->left, (size_t)(p->sh->nleft + 1) * sizeof(left_t));
     if (!n) return;
-    p->left = n;
-    p->left[p->nleft].kq = p->kq;
-    p->left[p->nleft].ev = *ev;
-    p->nleft++;
+    p->sh->left = n;
+    p->sh->left[p->sh->nleft].kq = p->kq;
+    p->sh->left[p->sh->nleft].ev = *ev;
+    p->sh->nleft++;
 }
 
 /* A change failed: report it as EV_ERROR (FreeBSD errno in data). */
@@ -423,7 +445,7 @@ static int apply_change(pid_t pid, kqproc_t *p, int at_entry) {
     if (k < 0) {
         k = kn_new(p);
         if (k < 0) { add_error(p, c, ENOMEM); p->ci++; return 0; }
-        knote_t *n = &p->kn[k];
+        knote_t *n = &p->sh->kn[k];
         n->kq = p->kq;
         n->ident = c->ident;
         n->filter = filter;
@@ -431,7 +453,7 @@ static int apply_change(pid_t pid, kqproc_t *p, int at_entry) {
         n->enabled = 1;
         p->op_new_kn = 1;
     }
-    knote_t *n = &p->kn[k];
+    knote_t *n = &p->sh->kn[k];
     p->op_kn = k;
 
     if (fl & EV_ADD_) {
@@ -529,7 +551,7 @@ static int kq_complete(pid_t pid, kqproc_t *p, long rv) {
                 if (ctl(pid, p, 0, L_EPOLL_CTL_ADD, p->op_fd, p->op_mask, (uint64_t)(uint32_t)p->op_fd) == 0) return 1;
             } else if (rv < 0 && p->op_ctl != L_EPOLL_CTL_DEL) {
                 add_error(p, c, (int)-rv);
-                if (p->op_new_kn) p->kn[p->op_kn].used = 0;
+                if (p->op_new_kn) p->sh->kn[p->op_kn].used = 0;
                 if (f && f->mask == 0) f->used = 0;
             } else {
                 if (f) {
@@ -545,7 +567,7 @@ static int kq_complete(pid_t pid, kqproc_t *p, long rv) {
 
         case OP_EVENTFD: {
             struct fbsd_kevent *c = &p->changes[p->ci];
-            knote_t *n = &p->kn[p->op_kn];
+            knote_t *n = &p->sh->kn[p->op_kn];
             if (rv < 0) {
                 add_error(p, c, (int)-rv);
                 n->used = 0;
@@ -565,7 +587,7 @@ static int kq_complete(pid_t pid, kqproc_t *p, long rv) {
             if (rv < 0) add_error(p, c, (int)-rv);
             else if (c->fflags & NOTE_TRIGGER_) {
                 uint64_t one = 1;
-                knote_t *n = &p->kn[p->op_kn];
+                knote_t *n = &p->sh->kn[p->op_kn];
                 if (wr(pid, &one, p->scratch + SCRATCH_U64, 8) == 0) {
                     p->op = OP_TRIGGER;
                     if (issue(pid, p, 0, SYS_write, (uint64_t)n->efd, p->scratch + SCRATCH_U64, 8, 0, 0, 0) == 0)
@@ -585,7 +607,7 @@ static int kq_complete(pid_t pid, kqproc_t *p, long rv) {
         }
 
         case OP_UDEL: {
-            knote_t *n = &p->kn[p->op_kn];
+            knote_t *n = &p->sh->kn[p->op_kn];
             int efd = n->efd;
             n->used = 0;
             p->op = OP_UCLOSE;
@@ -630,8 +652,8 @@ static int kq_complete(pid_t pid, kqproc_t *p, long rv) {
                 uint64_t d = evs[i].data;
                 if (d & USER_MARK) {
                     int k = (int)(d & 0xffffffffu);
-                    if (k >= p->nkn || !p->kn[k].used || p->kn[k].kq != p->kq) continue;
-                    knote_t *kn = &p->kn[k];
+                    if (k >= p->sh->nkn || !p->sh->kn[k].used || p->sh->kn[k].kq != p->kq) continue;
+                    knote_t *kn = &p->sh->kn[k];
                     if (kn->flags & EV_CLEAR_ && p->drain) p->drain[p->ndrain++] = kn->efd;
                     if (!kn->enabled) continue;
                     struct fbsd_kevent o;
@@ -653,8 +675,8 @@ static int kq_complete(pid_t pid, kqproc_t *p, long rv) {
                                               : (L_EPOLLOUT | L_EPOLLHUP | L_EPOLLERR);
                     if (!(e & trig)) continue;
                     int k = kn_find(p, p->kq, (uint64_t)fd, filt);
-                    if (k < 0 || !p->kn[k].enabled) continue;
-                    knote_t *kn = &p->kn[k];
+                    if (k < 0 || !p->sh->kn[k].enabled) continue;
+                    knote_t *kn = &p->sh->kn[k];
                     struct fbsd_kevent o;
                     memset(&o, 0, sizeof(o));
                     o.ident = (uint64_t)fd;
@@ -683,6 +705,12 @@ static int kq_complete(pid_t pid, kqproc_t *p, long rv) {
             p->drain_i++;
             break;
 
+        case OP_SCRATCH:
+            if (rv < 0 && rv > -4096) { finish(pid, p, rv); return 2; }
+            p->scratch = (uint64_t)rv;
+            p->phase = P_CHANGES;
+            break;
+
         default:
             break;
     }
@@ -694,14 +722,23 @@ static int kq_complete(pid_t pid, kqproc_t *p, long rv) {
 static int kq_run(pid_t pid, kqproc_t *p, int at_entry) {
     for (;;) {
         switch (p->phase) {
+            case P_SCRATCH:
+                /* This thread's scratch memory (threads share kqueues) */
+                p->op = OP_SCRATCH;
+                if (issue(pid, p, at_entry, SYS_mmap, 0, SCRATCH_SIZE, 3,
+                          0x22, (uint64_t)-1, 0) == 0)
+                    return 1;
+                p->phase = P_DONE;
+                continue;
+
             case P_CHANGES:
                 if (p->ci >= p->nchanges) { p->phase = P_SYNC; continue; }
                 if (apply_change(pid, p, at_entry)) return 1;
                 continue;
 
             case P_SYNC:
-                for (int i = 0; i < p->nfs; i++) {
-                    fdstate_t *f = &p->fs[i];
+                for (int i = 0; i < p->sh->nfs; i++) {
+                    fdstate_t *f = &p->sh->fs[i];
                     if (!f->used || f->kq != p->kq || !f->dirty) continue;
                     uint32_t want = wanted_mask(p, p->kq, f->fd);
                     f->dirty = 0;
@@ -716,11 +753,11 @@ static int kq_run(pid_t pid, kqproc_t *p, int at_entry) {
             case P_WAIT: {
                 /* Events that did not fit last time come first */
                 int j = 0;
-                for (int i = 0; i < p->nleft; i++) {
-                    if (p->left[i].kq == p->kq && p->nout < p->nevents) p->out[p->nout++] = p->left[i].ev;
-                    else p->left[j++] = p->left[i];
+                for (int i = 0; i < p->sh->nleft; i++) {
+                    if (p->sh->left[i].kq == p->kq && p->nout < p->nevents) p->out[p->nout++] = p->sh->left[i].ev;
+                    else p->sh->left[j++] = p->sh->left[i];
                 }
-                p->nleft = j;
+                p->sh->nleft = j;
                 if (p->nout > 0 || p->nevents == 0) { p->phase = P_DONE; continue; }
                 int maxev = p->nevents < MAX_WAIT_EVENTS ? p->nevents : MAX_WAIT_EVENTS;
                 p->op = OP_WAIT;
@@ -795,7 +832,6 @@ long kq_emul_kevent(pid_t pid, uint64_t args[6]) {
     if (!p) return -ENOMEM;
     int nchanges = (int)args[2], nevents = (int)args[4];
     if (nchanges < 0 || nevents < 0) return -EINVAL;
-    if (!p->scratch) return -EBADF;  /* not a kqueue made here */
 
     if (ptrace(PTRACE_GETREGS, pid, NULL, &p->entry) < 0) return -EFAULT;
     p->kq = (int)args[0];
@@ -820,7 +856,7 @@ long kq_emul_kevent(pid_t pid, uint64_t args[6]) {
         int64_t ms = ts[0] * 1000 + (ts[1] + 999999) / 1000000;
         p->timeout_ms = ms > 0x7fffffff ? 0x7fffffff : ms;
     }
-    p->phase = P_CHANGES;
+    p->phase = p->scratch ? P_CHANGES : P_SCRATCH;
     p->call = CALL_KEVENT;
 
     if (kq_run(pid, p, 1)) return -EAGAIN;  /* first step issued */

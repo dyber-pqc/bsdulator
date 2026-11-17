@@ -184,4 +184,9 @@ int freebsd_build_auxv(uint64_t *auxv, int max_entries,
                        uint64_t entry, uint64_t phdr,
                        int phent, int phnum);
 
+/* Program path of a process (kern.proc.pathname), and its lifecycle */
+const char *freebsd_exe_path(pid_t pid);
+void freebsd_exe_path_inherit(pid_t parent, pid_t child);
+void freebsd_exe_path_forget(pid_t pid);
+
 #endif /* FREEBSD_RUNTIME_H */

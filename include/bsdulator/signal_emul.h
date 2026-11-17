@@ -31,6 +31,7 @@ int sig_linux_to_fbsd(int linux_sig);
 /* Process lifecycle */
 void sig_proc_start(pid_t pid);
 void sig_proc_fork(pid_t parent, pid_t child);
+void sig_thread_create(pid_t creator, pid_t thread);  /* shares actions */
 void sig_proc_exec(pid_t pid);
 void sig_proc_exit(pid_t pid);
 

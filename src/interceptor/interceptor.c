@@ -33,6 +33,8 @@
 #include "bsdulator/signal_emul.h"
 #include "bsdulator/kqueue_emul.h"
 #include "bsdulator/msg_emul.h"
+#include "bsdulator/chain.h"
+#include "bsdulator/thread_emul.h"
 
 #ifndef __NR_process_vm_readv
 #define __NR_process_vm_readv 310
@@ -1813,7 +1815,7 @@ typedef struct {
     uint64_t mmap_alloc_size;
 } process_entry_t;
 
-static process_entry_t process_table[64];
+static process_entry_t process_table[512];
 static int process_count = 0;
 static pid_t main_pid = 0;  /* Track original/main process */
 
@@ -1840,7 +1842,7 @@ static process_entry_t* add_process(pid_t pid) {
             break;
         }
     }
-    if (!entry && process_count < 64) {
+    if (!entry && process_count < 512) {
         entry = &process_table[process_count++];
     }
     if (entry) {
@@ -1887,6 +1889,8 @@ static void remove_process(pid_t pid) {
     jail_forget_process(pid);
     sig_proc_exit(pid);
     kq_proc_exit(pid);
+    chain_proc_exit(pid);
+    freebsd_exe_path_forget(pid);
 }
 
 /* Count active processes */
@@ -1943,7 +1947,7 @@ int interceptor_wait(interceptor_state_t *state) {
     int status;
     pid_t result;
     
-    result = waitpid(-1, &status, 0);
+    result = waitpid(-1, &status, __WALL);
     
     /* Update pid to the process that actually stopped */
     if (result > 0) {
@@ -2122,6 +2126,7 @@ int interceptor_wait(interceptor_state_t *state) {
                     add_process((pid_t)child_pid);
                     jail_inherit_process(state->pid, (pid_t)child_pid);
                     sig_proc_fork(state->pid, (pid_t)child_pid);
+                    freebsd_exe_path_inherit(state->pid, (pid_t)child_pid);
                     
                     if (pending_count < 32) { 
                         pending_children[pending_count++] = child_pid; 
@@ -2142,6 +2147,7 @@ int interceptor_wait(interceptor_state_t *state) {
                     add_process((pid_t)child_pid);
                     jail_inherit_process(state->pid, (pid_t)child_pid);
                     sig_proc_fork(state->pid, (pid_t)child_pid);
+                    freebsd_exe_path_inherit(state->pid, (pid_t)child_pid);
                     
                     if (pending_count < 32) { 
                         pending_children[pending_count++] = child_pid; 
@@ -2159,7 +2165,12 @@ int interceptor_wait(interceptor_state_t *state) {
                     /* Add child to process table */
                     add_process((pid_t)clone_child_pid);
                     jail_inherit_process(state->pid, (pid_t)clone_child_pid);
-                    sig_proc_fork(state->pid, (pid_t)clone_child_pid);
+                    if (thr_tgid((pid_t)clone_child_pid) == thr_tgid(state->pid))
+                        sig_thread_create(state->pid, (pid_t)clone_child_pid);
+                    else
+                        sig_proc_fork(state->pid, (pid_t)clone_child_pid);
+                    thr_on_clone(state->pid, (pid_t)clone_child_pid);
+                    freebsd_exe_path_inherit(state->pid, (pid_t)clone_child_pid);
                     
                     if (pending_count < 32) { 
                         pending_children[pending_count++] = clone_child_pid; 
@@ -2242,7 +2253,10 @@ int interceptor_wait(interceptor_state_t *state) {
         int first = se && se->first_stop;
         if (se) se->first_stop = 0;
         if (first && sig == SIGSTOP) {
-            /* A new child's initial stop under PTRACE_O_TRACEFORK */
+            /* A new child's initial stop under PTRACE_O_TRACEFORK; a
+             * thr_new thread is pointed at its start function here */
+            if (!thr_on_first_stop(state->pid))
+                (void)thr_rfork_child_first_stop(state->pid);
             state->last_event = EVENT_NONE;
             return 0;
         }
@@ -2481,6 +2495,11 @@ int interceptor_run(interceptor_state_t *state) {
             case EVENT_SYSCALL_ENTER: {
                 state->syscall_count++;
 
+                if (chain_busy(state->pid)) {
+                    /* A step of a syscall chain: already Linux */
+                    save_syscall_state(state);
+                    break;
+                }
                 if (kq_on_syscall_entry(state->pid)) {
                     /* A step of a kevent/kqueue chain: already Linux */
                     save_syscall_state(state);
@@ -2639,7 +2658,11 @@ int interceptor_run(interceptor_state_t *state) {
                                 case 0:                    /* indirect syscall: handler set it */
                                 case FBSD_SYS_kqueue:
                                 case FBSD_SYS_kqueuex:
-                                case FBSD_SYS_kevent:      actual_linux_nr = -2; break;  /* handler set it */
+                                case FBSD_SYS_kevent:
+                                case FBSD_SYS__umtx_op:
+                                case FBSD_SYS_thr_exit:    actual_linux_nr = -2; break;  /* handler set it */
+                                case FBSD_SYS_thr_new:
+                                case FBSD_SYS_rfork:       actual_linux_nr = SYS_clone; break;
                                 case FBSD_SYS_sigwait:
                                 case FBSD_SYS_sigtimedwait:
                                 case FBSD_SYS_sigwaitinfo: actual_linux_nr = SYS_rt_sigtimedwait; break;
@@ -2654,6 +2677,8 @@ int interceptor_run(interceptor_state_t *state) {
                             if ((int)state->syscall_nr == FBSD_SYS_setsockopt ||
                                 (int)state->syscall_nr == FBSD_SYS_getsockopt ||
                                 (int)state->syscall_nr == FBSD_SYS_socket ||
+                                (int)state->syscall_nr == FBSD_SYS_thr_new ||
+                                (int)state->syscall_nr == FBSD_SYS_rfork ||
                                 (int)state->syscall_nr == FBSD_SYS_sendmsg ||
                                 (int)state->syscall_nr == FBSD_SYS_recvmsg ||
                                 (int)state->syscall_nr == FBSD_SYS_bind ||
@@ -2708,6 +2733,13 @@ int interceptor_run(interceptor_state_t *state) {
                  * one did: handle the exit with this process's own syscall
                  * number, arguments and pending mmap fixup. */
                 restore_syscall_state(state);
+                {
+                    int cr = chain_on_exit(state->pid);
+                    if (cr) {
+                        if (cr == 2) sig_after_syscall(state->pid, state->syscall_nr, state->args);
+                        break;
+                    }
+                }
                 {
                     /* kevent/kqueue chains run several Linux syscalls */
                     int kr = kq_on_syscall_exit(state->pid);
@@ -3077,6 +3109,7 @@ int interceptor_run(interceptor_state_t *state) {
                 sig_after_syscall(state->pid, state->syscall_nr, state->args);
                 kq_after_syscall(state->pid, state->syscall_nr, state->args);
                 msg_after_syscall(state->pid, state->syscall_nr);
+                thr_after_syscall(state->pid, state->syscall_nr);
                 break;
             }
             

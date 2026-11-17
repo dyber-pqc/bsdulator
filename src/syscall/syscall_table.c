@@ -42,6 +42,8 @@
 #include "bsdulator/signal_emul.h"
 #include "bsdulator/kqueue_emul.h"
 #include "bsdulator/msg_emul.h"
+#include "bsdulator/thread_emul.h"
+#include "bsdulator/jail.h"
 #include "../runtime/freebsd_runtime.h"
 
 /* Forward declarations for emulation handlers */
@@ -60,7 +62,6 @@ static long emul_getsockopt(pid_t pid, uint64_t args[6]);
  */
 static long emul_issetugid(pid_t pid, uint64_t args[6]);
 static long emul_yield(pid_t pid, uint64_t args[6]);
-static long emul_rfork(pid_t pid, uint64_t args[6]);
 static long emul_cap_enter(pid_t pid, uint64_t args[6]);
 static long emul_cap_getmode(pid_t pid, uint64_t args[6]);
 static long emul_cap_rights_limit(pid_t pid, uint64_t args[6]);
@@ -72,14 +73,11 @@ static long emul_seteuid(pid_t pid, uint64_t args[6]);
 static long emul_setegid(pid_t pid, uint64_t args[6]);
 static long emul_mkfifo(pid_t pid, uint64_t args[6]);
 static long emul_thr_self(pid_t pid, uint64_t args[6]);
-static long emul_thr_exit(pid_t pid, uint64_t args[6]);
-static long emul_thr_kill(pid_t pid, uint64_t args[6]);
 static long emul_thr_wake(pid_t pid, uint64_t args[6]);
 static long emul_clock_gettime(pid_t pid, uint64_t args[6]);
 static long emul_cpuset_getaffinity(pid_t pid, uint64_t args[6]);
 static long emul_minherit(pid_t pid, uint64_t args[6]);
 static long emul_rtprio_thread(pid_t pid, uint64_t args[6]);
-static long emul_umtx_op(pid_t pid, uint64_t args[6]);
 static long emul_sysarch(pid_t pid, uint64_t args[6]);
 static long emul_pathconf(pid_t pid, uint64_t args[6]);
 static long emul_fpathconf(pid_t pid, uint64_t args[6]);
@@ -143,7 +141,7 @@ int syscall_init(void) {
      * Process control syscalls
      */
     EMUL(FBSD_SYS_syscall, "syscall", emul_syscall);
-    TRANS(FBSD_SYS_exit, SYS_exit, "exit");
+    TRANS(FBSD_SYS_exit, SYS_exit_group, "exit");  /* the whole process, all threads */
     TRANS(FBSD_SYS_fork, SYS_fork, "fork");
     TRANS(FBSD_SYS_vfork, SYS_vfork, "vfork");
     TRANS(FBSD_SYS_execve, SYS_execve, "execve");
@@ -381,11 +379,13 @@ int syscall_init(void) {
      * Threading syscalls - needed for libthr
      */
     EMUL(FBSD_SYS_thr_self, "thr_self", emul_thr_self);
-    EMUL(FBSD_SYS_thr_exit, "thr_exit", emul_thr_exit);
-    EMUL(FBSD_SYS_thr_kill, "thr_kill", emul_thr_kill);
+    EMUL(FBSD_SYS_thr_new, "thr_new", thr_emul_new);
+    EMUL(FBSD_SYS_thr_exit, "thr_exit", thr_emul_exit);
+    EMUL(FBSD_SYS_thr_kill, "thr_kill", thr_emul_kill);
+    EMUL(FBSD_SYS_thr_kill2, "thr_kill2", thr_emul_kill2);
     EMUL(FBSD_SYS_thr_wake, "thr_wake", emul_thr_wake);
     EMUL(FBSD_SYS_rtprio_thread, "rtprio_thread", emul_rtprio_thread);
-    EMUL(FBSD_SYS__umtx_op, "_umtx_op", emul_umtx_op);
+    EMUL(FBSD_SYS__umtx_op, "_umtx_op", thr_emul_umtx_op);
     
     /*
      * CPU affinity - FreeBSD syscall 487
@@ -432,7 +432,7 @@ int syscall_init(void) {
     EMUL(FBSD_SYS___sysctlbyname, "__sysctlbyname", emul_sysctlbyname);
     EMUL(FBSD_SYS_issetugid, "issetugid", emul_issetugid);
     EMUL(FBSD_SYS_yield, "yield", emul_yield);
-    EMUL(FBSD_SYS_rfork, "rfork", emul_rfork);
+    EMUL(FBSD_SYS_rfork, "rfork", thr_emul_rfork);
     
     /* Jail syscalls - core of Jailhouse */
     EMUL(FBSD_SYS_jail, "jail", emul_jail);
@@ -714,18 +714,6 @@ static long emul_yield(pid_t pid, uint64_t args[6]) {
     return sched_yield();
 }
 
-static long emul_rfork(pid_t pid, uint64_t args[6]) {
-    (void)pid;
-    (void)args;
-    
-    /*
-     * rfork is similar to Linux clone()
-     * TODO: Implement proper flag translation
-     */
-    BSD_WARN("rfork not implemented, using fork()");
-    return fork();
-}
-
 static long emul_seteuid(pid_t pid, uint64_t args[6]) {
     (void)pid;
     
@@ -787,16 +775,7 @@ static long emul_thr_self(pid_t pid, uint64_t args[6]) {
     return 0;  /* Success */
 }
 
-static long emul_thr_exit(pid_t pid, uint64_t args[6]) {
-    (void)pid;
-    
-    /* Thread exit - translate to exit_group or exit */
-    long *state = (long *)args[0];
-    (void)state;  /* FreeBSD writes exit state here */
-    
-    /* Just exit the thread */
-    return syscall(SYS_exit, 0);
-}
+
 
 /*
  * thr_wake - wake a thread
@@ -871,92 +850,7 @@ static long emul_rtprio_thread(pid_t pid, uint64_t args[6]) {
 #define UMTX_OP_SHM            25
 #define UMTX_OP_ROBUST_LISTS   26
 
-static long emul_umtx_op(pid_t pid, uint64_t args[6]) {
-    (void)pid;
 
-    uint64_t obj = args[0];
-    int op = (int)args[1];
-    unsigned long val = (unsigned long)args[2];
-    /* void *uaddr = (void *)args[3]; */
-    /* void *uaddr2 = (void *)args[4]; */
-
-    BSD_TRACE("_umtx_op: op=%d obj=0x%lx val=%lu", op, obj, val);
-
-    switch (op) {
-    case UMTX_OP_WAIT:
-    case UMTX_OP_WAIT_UINT:
-    case UMTX_OP_WAIT_UINT_PRIVATE:
-        /*
-         * Wait until *obj != val. Map to futex WAIT.
-         * For now, return 0 (success / spurious wakeup) to let the caller
-         * retry its check. This avoids blocking the ptrace tracer.
-         */
-        BSD_TRACE("_umtx_op WAIT: returning spurious wakeup");
-        return 0;
-
-    case UMTX_OP_WAKE:
-    case UMTX_OP_WAKE_PRIVATE:
-        /* Wake up to 'val' threads waiting on obj */
-        BSD_TRACE("_umtx_op WAKE: obj=0x%lx count=%lu", obj, val);
-        return 0;
-
-    case UMTX_OP_NWAKE_PRIVATE:
-        /* Wake multiple addresses at once */
-        BSD_TRACE("_umtx_op NWAKE_PRIVATE: count=%lu", val);
-        return 0;
-
-    case UMTX_OP_MUTEX_TRYLOCK:
-    case UMTX_OP_MUTEX_LOCK:
-    case UMTX_OP_MUTEX_UNLOCK:
-    case UMTX_OP_MUTEX_WAIT:
-    case UMTX_OP_MUTEX_WAKE2:
-        /* Mutex operations — return success to let userspace handle contention */
-        BSD_TRACE("_umtx_op MUTEX op=%d: returning success", op);
-        return 0;
-
-    case UMTX_OP_CV_WAIT:
-        /* Condition variable wait — return spurious wakeup */
-        BSD_TRACE("_umtx_op CV_WAIT: returning spurious wakeup");
-        return 0;
-
-    case UMTX_OP_CV_SIGNAL:
-        /* Wake one thread on condition variable */
-        BSD_TRACE("_umtx_op CV_SIGNAL");
-        return 0;
-
-    case UMTX_OP_CV_BROADCAST:
-        /* Wake all threads on condition variable */
-        BSD_TRACE("_umtx_op CV_BROADCAST");
-        return 0;
-
-    case UMTX_OP_SET_CEILING:
-        /* Priority ceiling for mutex — return success */
-        return 0;
-
-    case UMTX_OP_RW_RDLOCK:
-    case UMTX_OP_RW_WRLOCK:
-    case UMTX_OP_RW_UNLOCK:
-        /* Read-write lock operations — return success */
-        BSD_TRACE("_umtx_op RW op=%d: returning success", op);
-        return 0;
-
-    case UMTX_OP_SEM2_WAIT:
-        /* Semaphore wait — return spurious wakeup */
-        return 0;
-
-    case UMTX_OP_SEM2_WAKE:
-        /* Semaphore wake */
-        return 0;
-
-    case UMTX_OP_ROBUST_LISTS:
-        /* Robust mutex list registration — return success */
-        return 0;
-
-    default:
-        BSD_WARN("_umtx_op: unknown op=%d, returning success", op);
-        return 0;
-    }
-}
 
 /*
  * Jail syscall emulation - implemented in src/jail/jail.c
@@ -1032,23 +926,7 @@ static long emul_cap_fcntls_limit(pid_t pid, uint64_t args[6]) {
     return -ENOSYS;
 }
 
-/*
- * thr_kill - send signal to a specific thread
- * FIXED: Use child's pid, not BSDulator's getpid()!
- */
-static long emul_thr_kill(pid_t pid, uint64_t args[6]) {
-    /* thr_kill(long id, int sig) -> tgkill(tgid, tid, sig) */
-    long tid = (long)args[0];
-    int sig = (int)args[1];
-    
-    BSD_TRACE("thr_kill: child_pid=%d tid=%ld sig=%d", pid, tid, sig);
-    
-    /* Translate signal number */
-    sig = abi_translate_signal(sig);
-    
-    /* Use tgkill - send signal to specific thread in the CHILD process */
-    return syscall(SYS_tgkill, pid, tid, sig);
-}
+
 
 /*
  * clock_gettime - translate FreeBSD clock IDs to Linux
@@ -1830,11 +1708,88 @@ static long emul_ioctl(pid_t pid, uint64_t args[6]) {
  * __realpathat - resolve pathname relative to directory fd
  * int __realpathat(int fd, const char *path, char *buf, size_t size, int flags)
  */
+/* Host path of a /proc/<pid>/... link, or "" */
+static void proc_link(pid_t pid, const char *what, char *out, size_t sz) {
+    char l[64];
+    snprintf(l, sizeof(l), "/proc/%d/%s", (int)pid, what);
+    ssize_t n = readlink(l, out, sz - 1);
+    out[n > 0 ? n : 0] = '\0';
+}
+
+/* Strip prefix root (a host directory) from host path p: "" -> "/" */
+static const char *under_root(const char *p, const char *rootdir) {
+    size_t rl = strlen(rootdir);
+    if (rl <= 1) return p;
+    if (strncmp(p, rootdir, rl) == 0 && (p[rl] == '/' || p[rl] == '\0'))
+        return p[rl] ? p + rl : "/";
+    return NULL;
+}
+
 static long emul_realpathat(pid_t pid, uint64_t args[6]) {
-    (void)pid;
-    int fd = (int)args[0];
-    /* For now, return success with empty buffer - most uses are optional */
-    BSD_TRACE("__realpathat: fd=%d (stub - returning success)", fd);
+    /* __realpathat(fd, path, buf, size, flags): canonical absolute path
+     * as the process sees it (inside its jail) */
+    int dfd = (int)args[0];
+    char path[4096], rootdir[4096], base[4096], absp[8192], host[4096];
+    if (interceptor_read_string(pid, path, (const void *)args[1], sizeof(path)) <= 0) return -EFAULT;
+    if (!path[0]) return -ENOENT;
+
+    proc_link(pid, "root", rootdir, sizeof(rootdir));
+    if (!rootdir[0]) strcpy(rootdir, "/");
+
+    if (path[0] == '/') {
+        snprintf(absp, sizeof(absp), "%s", path);
+    } else {
+        char what[32];
+        if (dfd == -100) snprintf(what, sizeof(what), "cwd");
+        else snprintf(what, sizeof(what), "fd/%d", dfd);
+        proc_link(pid, what, base, sizeof(base));
+        const char *b = under_root(base, rootdir);
+        if (!b) return -ENOENT;
+        snprintf(absp, sizeof(absp), "%s/%s", strcmp(b, "/") ? b : "", path);
+    }
+
+    /* Outside a jail, FreeBSD paths mean the FreeBSD root when it has them */
+    const char *froot = bsdulator_get_freebsd_root();
+    char fabs[4096] = "";
+    if (jail_get_process_jid(pid) <= 0 && froot && froot[0] && realpath(froot, fabs)) {
+        char cand[8192];
+        snprintf(cand, sizeof(cand), "%s%s", fabs, absp);
+        if (access(cand, F_OK) == 0) {
+            snprintf(absp, sizeof(absp), "%s", cand);
+            snprintf(rootdir, sizeof(rootdir), "%s", fabs);
+        }
+    }
+
+    char rl[64];
+    snprintf(rl, sizeof(rl), "/proc/%d/root", (int)pid);
+    int rfd = open(strcmp(rootdir, "/") && jail_get_process_jid(pid) <= 0 ? rootdir : rl,
+                   O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (rfd < 0) return -errno;
+    const char *rel = absp;
+    if (jail_get_process_jid(pid) <= 0 && strcmp(rootdir, "/")) {
+        const char *u = under_root(absp, rootdir);
+        if (u) rel = u;
+    }
+    struct { uint64_t flags, mode, resolve; } how = { O_PATH | O_CLOEXEC, 0, 0x10 /* RESOLVE_IN_ROOT */ };
+    int fd = (int)syscall(437 /* openat2 */, rfd, rel, &how, sizeof(how));
+    if (fd < 0 && errno == ENOSYS) fd = openat(rfd, rel[0] == '/' ? rel + 1 : rel, O_PATH | O_CLOEXEC);
+    int err = errno;
+    close(rfd);
+    if (fd < 0) return -err;
+
+    char self[64];
+    snprintf(self, sizeof(self), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(self, host, sizeof(host) - 1);
+    close(fd);
+    if (n <= 0) return -ENOENT;
+    host[n] = '\0';
+    const char *res = under_root(host, rootdir);
+    if (!res) res = host;
+    size_t len = strlen(res) + 1;
+    if (len > (size_t)args[3]) return -ENAMETOOLONG;
+    struct iovec lv = { (void *)res, len };
+    struct iovec rv = { (void *)args[2], len };
+    if (process_vm_writev(pid, &lv, 1, &rv, 1, 0) < 0) return -EFAULT;
     return 0;
 }
 
