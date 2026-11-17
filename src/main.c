@@ -20,6 +20,8 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 
 #include "bsdulator.h"
 
@@ -30,14 +32,79 @@ static char *netns_name = NULL;
 static int ns_holder_pid = 0;
 static interceptor_state_t *global_state = NULL;
 
-/* Signal handler for clean shutdown */
-static void signal_handler(int sig) {
-    if (global_state && global_state->pid > 0) {
-        BSD_INFO("Caught signal %d, terminating traced process", sig);
-        kill(global_state->pid, SIGKILL);
-    }
-    exit(128 + sig);
+/*
+ * bsdulator runs as two processes. The front is what the caller waits for:
+ * it exits with the program's exit code as soon as the program exits, like
+ * "docker exec". The tracer, its child, traces the program and everything
+ * it starts, and keeps going after the program exits while daemons or
+ * background jobs it started are still running. Messages from the tracer
+ * to the front: { MSG_PID, host pid } then { MSG_EXIT, code }.
+ */
+enum { MSG_PID = 1, MSG_EXIT = 2 };
+static int report_fd = -1;
+static volatile sig_atomic_t front_target = 0;
+
+static void report(int type, int value) {
+    if (report_fd < 0) return;
+    int m[2] = { type, value };
+    ssize_t w = write(report_fd, m, sizeof(m));
+    (void)w;
 }
+
+/* The program has exited: tell the front, then carry on detached */
+static void tracer_main_exited(int code) {
+    report(MSG_EXIT, code);
+    if (report_fd >= 0) close(report_fd);
+    report_fd = -1;
+    /* Off the caller's terminal and output: a pipe the caller reads to
+     * the end must not wait for the daemons */
+    setsid();
+    int nfd = open("/dev/null", O_RDWR);
+    if (nfd >= 0) {
+        dup2(nfd, 0);
+        dup2(nfd, 1);
+        dup2(nfd, 2);
+        if (nfd > 2) close(nfd);
+    }
+}
+
+/* Front: pass on signals sent with kill(); terminal ones (Ctrl-C) already
+ * reach the program, which is in the same process group */
+static void front_signal(int sig, siginfo_t *si, void *uc) {
+    (void)uc;
+    if (si && si->si_code > 0) return;
+    if (front_target > 0) kill((pid_t)front_target, sig);
+}
+
+static void front_wait(pid_t tracer, int fd) {
+    front_target = tracer;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = front_signal;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    static const int fwd[] = { SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2, SIGWINCH };
+    for (size_t i = 0; i < sizeof(fwd) / sizeof(fwd[0]); i++) sigaction(fwd[i], &sa, NULL);
+
+    int m[2];
+    for (;;) {
+        ssize_t n = read(fd, m, sizeof(m));
+        if (n < 0 && errno == EINTR) continue;
+        if (n != (ssize_t)sizeof(m)) break;
+        if (m[0] == MSG_PID) front_target = m[1];
+        else if (m[0] == MSG_EXIT) _exit(m[1]);
+    }
+    /* The tracer ended without a report: use its own status */
+    int st = 0;
+    while (waitpid(tracer, &st, 0) < 0 && errno == EINTR) {}
+    if (WIFEXITED(st)) _exit(WEXITSTATUS(st));
+    if (WIFSIGNALED(st)) _exit(128 + WTERMSIG(st));
+    _exit(1);
+}
+
+/* Tracer: the program gets terminal signals itself; SIGTERM ends the
+ * tracer, and the kernel then kills every traced process (EXITKILL) */
+static void tracer_ignore(int sig) { (void)sig; }
 
 static void print_version(void) {
     printf("BSDulator v%d.%d.%d\n",
@@ -101,9 +168,10 @@ int bsdulator_init(void) {
         return -1;
     }
     
-    /* Set up signal handlers */
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    /* Handlers, not SIG_IGN: exec resets them for the traced program */
+    signal(SIGINT, tracer_ignore);
+    signal(SIGQUIT, tracer_ignore);
+    signal(SIGHUP, tracer_ignore);
     
     BSD_INFO("Initialization complete");
     return 0;
@@ -232,12 +300,35 @@ int bsdulator_run(const char *binary, char *const argv[], char *const envp[]) {
         BSD_WARN("Interpreter: %s", info.interp);
     }
     
+    /* Split into the front (returns the exit code) and the tracer */
+    int rp[2];
+    if (pipe2(rp, O_CLOEXEC) < 0) {
+        BSD_ERROR("pipe: %s", strerror(errno));
+        return 1;
+    }
+    fflush(stdout);
+    fflush(stderr);
+    pid_t tracer = fork();
+    if (tracer < 0) {
+        BSD_ERROR("fork: %s", strerror(errno));
+        return 1;
+    }
+    if (tracer > 0) {
+        close(rp[1]);
+        front_wait(tracer, rp[0]);
+    }
+    close(rp[0]);
+    report_fd = rp[1];
+    interceptor_set_main_exit_hook(tracer_main_exited);
+
     /* Spawn the process under ptrace */
     pid_t pid = interceptor_spawn(binary, argv, (char *const *)envp);
     if (pid < 0) {
         BSD_ERROR("Failed to spawn process: %s", strerror(errno));
+        report(MSG_EXIT, 127);
         return 1;
     }
+    report(MSG_PID, (int)pid);
     
     BSD_INFO("Spawned process with PID %d", (int)pid);
     
@@ -260,11 +351,9 @@ int bsdulator_run(const char *binary, char *const argv[], char *const envp[]) {
     global_state = NULL;
     
     /* Return the exit code from the traced process */
-    if (state.last_event == EVENT_EXIT) {
-        return state.exit_code;
-    }
-    
-    return ret;
+    int code = state.last_event == EVENT_EXIT ? state.exit_code : (ret < 0 ? 1 : ret);
+    report(MSG_EXIT, code);
+    return code;
 }
 
 int main(int argc, char *argv[], char *envp[]) {

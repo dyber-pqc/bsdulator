@@ -45,9 +45,14 @@
 #define __NR_process_vm_writev 311
 #endif
 
+#ifndef PTRACE_O_EXITKILL
+#define PTRACE_O_EXITKILL 0x100000
+#endif
+/* EXITKILL: if the tracer dies, the kernel kills every tracee, so no
+ * FreeBSD program ever runs on without syscall translation */
 #define PTRACE_OPTIONS (PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK | \
                         PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE | \
-                        PTRACE_O_TRACEEXEC)
+                        PTRACE_O_TRACEEXEC | PTRACE_O_EXITKILL)
 
 int interceptor_init(void) {
     BSD_TRACE("Initializing interceptor subsystem");
@@ -2050,6 +2055,33 @@ static int count_active_processes(void) {
     return count;
 }
 
+static int main_exited = 0, main_exit_code = 0;
+static void (*main_exit_hook)(int) = NULL;
+
+void interceptor_set_main_exit_hook(void (*hook)(int exit_code)) {
+    main_exit_hook = hook;
+}
+
+/*
+ * The first traced process has exited with code. Returns 1 when tracing
+ * is over, 0 when others are still running and tracing goes on.
+ */
+static int on_main_exit(interceptor_state_t *state, int code) {
+    main_exited = 1;
+    main_exit_code = code;
+    state->exit_code = code;
+    int active = count_active_processes();
+    if (active == 0) {
+        state->running = false;
+        state->last_event = EVENT_EXIT;
+        return 1;
+    }
+    BSD_INFO("Main process exited (%d); still tracing %d processes", code, active);
+    if (main_exit_hook) main_exit_hook(code);
+    state->last_event = EVENT_NONE;
+    return 0;
+}
+
 /* Check if a process is active */
 static int is_process_active(pid_t pid) {
     process_entry_t *entry = find_process(pid);
@@ -2127,6 +2159,7 @@ int interceptor_wait(interceptor_state_t *state) {
         if (errno == ECHILD) {
             state->running = false;
             state->last_event = EVENT_EXIT;
+            if (main_exited) state->exit_code = main_exit_code;
             return 0;
         }
         BSD_ERROR("waitpid() failed: %s", strerror(errno));
@@ -2139,12 +2172,9 @@ int interceptor_wait(interceptor_state_t *state) {
         /* Mark this process as exited in our table */
         remove_process(state->pid);
         
-        if (state->pid == main_pid) {
-            /* Main process exited - we're done */
-            state->running = false;
-            state->last_event = EVENT_EXIT;
-            state->exit_code = WEXITSTATUS(status);
-            BSD_TRACE("Main process exited with code %d", state->exit_code);
+        if (state->pid == main_pid && !main_exited) {
+            /* Processes it started keep being traced until they exit */
+            on_main_exit(state, WEXITSTATUS(status));
             return 0;
         }
         
@@ -2156,7 +2186,7 @@ int interceptor_wait(interceptor_state_t *state) {
             /* No more processes - we're done */
             state->running = false;
             state->last_event = EVENT_EXIT;
-            state->exit_code = 0;
+            state->exit_code = main_exited ? main_exit_code : 0;
             return 0;
         }
         
@@ -2171,11 +2201,8 @@ int interceptor_wait(interceptor_state_t *state) {
         /* Mark this process as exited */
         remove_process(state->pid);
         
-        if (state->pid == main_pid) {
-            state->running = false;
-            state->last_event = EVENT_EXIT;
-            state->exit_code = 128 + WTERMSIG(status);
-            BSD_TRACE("Main process killed by signal %d", WTERMSIG(status));
+        if (state->pid == main_pid && !main_exited) {
+            on_main_exit(state, 128 + WTERMSIG(status));
             return 0;
         }
         
@@ -2186,7 +2213,7 @@ int interceptor_wait(interceptor_state_t *state) {
         if (active == 0) {
             state->running = false;
             state->last_event = EVENT_EXIT;
-            state->exit_code = 128 + WTERMSIG(status);
+            state->exit_code = main_exited ? main_exit_code : 128 + WTERMSIG(status);
             return 0;
         }
         
@@ -2610,6 +2637,8 @@ int interceptor_run(interceptor_state_t *state) {
     process_count = 0;
     
     main_pid = state->pid;  /* Set global main_pid */
+    main_exited = 0;
+    main_exit_code = 0;
     add_process(main_pid);  /* Add main process to table */
     {
         process_entry_t *me = find_process(main_pid);

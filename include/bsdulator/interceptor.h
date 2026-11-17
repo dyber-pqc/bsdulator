@@ -126,6 +126,13 @@ ssize_t interceptor_read_string(pid_t pid, char *local, const void *remote, size
 /* Main interception loop - runs until process exits */
 int interceptor_run(interceptor_state_t *state);
 
+/*
+ * Called once when the first traced process exits while processes it
+ * started (a daemon, a background job) are still running. Tracing goes on
+ * until they have all exited; the final exit code stays the first one's.
+ */
+void interceptor_set_main_exit_hook(void (*hook)(int exit_code));
+
 /* Print statistics */
 void interceptor_print_stats(const interceptor_state_t *state);
 
