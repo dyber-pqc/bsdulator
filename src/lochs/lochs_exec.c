@@ -14,8 +14,13 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/fsuid.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <grp.h>
+#include <linux/capability.h>
 
 #define LOCHS_SELF_PATH_MAX 4096
 
@@ -36,6 +41,61 @@ static void redirect_to_devnull(int fd) {
     if (devnull >= 0) {
         dup2(devnull, fd);
         if (devnull != fd) close(devnull);
+    }
+}
+
+/* ---------------------------------------------------------------------
+ * Acting as the container's root
+ *
+ * Container files are owned by container ids, and with idmapped layers a
+ * file host root creates in the container cannot be stored at all (host
+ * uid 0 has no container id). So lochs creates files there as container
+ * root: its host uid, with root's capabilities kept.
+ * ------------------------------------------------------------------- */
+
+static unsigned int croot_id = 0;
+
+void lochs_croot_set(unsigned int host_id) {
+    croot_id = host_id;
+}
+
+/* Make the effective (and, for exec, inheritable) capabilities equal to
+ * the permitted ones */
+static void caps_restore(int for_exec) {
+    struct __user_cap_header_struct h = { _LINUX_CAPABILITY_VERSION_3, 0 };
+    struct __user_cap_data_struct d[2];
+    if (syscall(SYS_capget, &h, d) < 0) return;
+    for (int i = 0; i < 2; i++) {
+        d[i].effective = d[i].permitted;
+        if (for_exec) d[i].inheritable = d[i].permitted;
+    }
+    if (syscall(SYS_capset, &h, d) < 0) { /* best effort */ }
+}
+
+void lochs_croot_enter(void) {
+    if (!croot_id) return;
+    setfsgid(croot_id);
+    setfsuid(croot_id);
+    caps_restore(0);   /* setfsuid dropped the file capabilities */
+}
+
+void lochs_croot_leave(void) {
+    if (!croot_id) return;
+    setfsuid(0);
+    setfsgid(0);
+}
+
+/* In a child before exec: become container root, keeping every capability
+ * across the exec as ambient capabilities */
+static void become_croot(void) {
+    if (!croot_id) return;
+    if (prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) < 0) _exit(126);
+    if (setgroups(0, NULL) < 0 || setresgid(croot_id, croot_id, croot_id) < 0 ||
+        setresuid(croot_id, croot_id, croot_id) < 0) _exit(126);
+    caps_restore(1);
+    for (int c = 0; c <= 63; c++) {
+        if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, c, 0, 0) < 0 && errno == EINVAL && c > 40)
+            break;
     }
 }
 
@@ -67,6 +127,8 @@ int lochs_run_in_cgroup(const char *const argv[], const char *cgroup_procs,
             redirect_to_devnull(STDOUT_FILENO);
             redirect_to_devnull(STDERR_FILENO);
         }
+        if (flags & LOCHS_RUN_AS_CROOT)
+            become_croot();
         execvp(argv[0], (char *const *)argv);
         _exit(127);
     }

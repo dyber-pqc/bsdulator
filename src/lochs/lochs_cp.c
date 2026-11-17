@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include "bsdulator/lochs_ns.h"
 #include "bsdulator/lochs.h"
 #include "bsdulator/lochs_exec.h"
 
@@ -96,9 +97,20 @@ int lochs_cmd_cp(int argc, char **argv) {
      * passed as arguments, never through a shell. */
     int r;
 
+    /* Into a running container, files are created as its root: they must
+     * belong to a container id (see lochs_ns.c) */
+    int as = 0;
+    if (dst_is_container && lochs_ns_pid(cname) > 0) {
+        lochs_croot_set(lochs_ns_base(cname));
+        as = LOCHS_RUN_AS_CROOT;
+    }
+    /* Host owners mean nothing in a container: copies in belong to
+     * container root, copies out keep the owner */
+    const char *keep = dst_is_container ? "--preserve=mode,timestamps" : "-p";
+
     if (S_ISDIR(st.st_mode)) {
-        const char *cp_argv[] = { "cp", "-rp", "--", resolved_src, resolved_dst, NULL };
-        r = lochs_run(cp_argv, 0);
+        const char *cp_argv[] = { "cp", "-r", keep, "--", resolved_src, resolved_dst, NULL };
+        r = lochs_run(cp_argv, as);
     } else {
         /* Ensure parent directory exists for destination */
         char parent[sizeof(resolved_dst)];
@@ -107,13 +119,13 @@ int lochs_cmd_cp(int argc, char **argv) {
         if (slash && slash != parent) {
             *slash = '\0';
             const char *mk_argv[] = { "mkdir", "-p", "--", parent, NULL };
-            if (lochs_run(mk_argv, 0) != 0) {
+            if (lochs_run(mk_argv, as) != 0) {
                 fprintf(stderr, "Error: failed to create parent directory\n");
                 return 1;
             }
         }
-        const char *cp_argv[] = { "cp", "-p", "--", resolved_src, resolved_dst, NULL };
-        r = lochs_run(cp_argv, 0);
+        const char *cp_argv[] = { "cp", keep, "--", resolved_src, resolved_dst, NULL };
+        r = lochs_run(cp_argv, as);
     }
     if (r == 0) {
         printf("Copied %s -> %s\n",

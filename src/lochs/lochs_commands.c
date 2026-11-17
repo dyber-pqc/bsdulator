@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <time.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <stdint.h>
 #include <signal.h>
@@ -777,7 +778,7 @@ static int lochs_devfs_setup(lochs_jail_t *jail) {
         const char *argv[] = { "mkdir", "-p",
             jail_subpath(p1, sizeof(p1), jail, "/dev/pts"),
             jail_subpath(p3, sizeof(p3), jail, "/dev/shm"), NULL };
-        if (lochs_run(argv, 0) != 0) {
+        if (lochs_run(argv, LOCHS_RUN_AS_CROOT) != 0) {
             fprintf(stderr, "Warning: failed to create /dev directories\n");
             return -1;
         }
@@ -795,7 +796,7 @@ static int lochs_devfs_setup(lochs_jail_t *jail) {
 
         /* Create target file for bind mount */
         const char *touch_argv[] = { "touch", p1, NULL };
-        lochs_run(touch_argv, LOCHS_RUN_QUIET);
+        lochs_run(touch_argv, LOCHS_RUN_QUIET | LOCHS_RUN_AS_CROOT);
         /* Bind mount from host */
         const char *mount_argv[] = { "mount", "--bind", host_dev, p1, NULL };
         if (lochs_run(mount_argv, LOCHS_RUN_QUIET) != 0) {
@@ -825,14 +826,16 @@ static int lochs_devfs_setup(lochs_jail_t *jail) {
         jail_subpath(p1, sizeof(p1), jail, "/dev/fd");
         if (lstat(p1, &st) == 0 && S_ISDIR(st.st_mode)) {
             jail_subpath(p2, sizeof(p2), jail, "/dev/fd/fd");
+            lochs_croot_enter();
             unlink(p2);
             rmdir(p1);
+            lochs_croot_leave();
         }
     }
     for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); i++) {
         const char *argv[] = { "ln", "-sf", links[i][0],
             jail_subpath(p1, sizeof(p1), jail, links[i][1]), NULL };
-        lochs_run(argv, LOCHS_RUN_QUIET);
+        lochs_run(argv, LOCHS_RUN_QUIET | LOCHS_RUN_AS_CROOT);
     }
 
     /* /proc is mounted by the container's PID 1 (lochs_ns.c), so it
@@ -840,7 +843,7 @@ static int lochs_devfs_setup(lochs_jail_t *jail) {
     {
         const char *mk_argv[] = { "mkdir", "-p",
             jail_subpath(p1, sizeof(p1), jail, "/proc"), NULL };
-        lochs_run(mk_argv, 0);
+        lochs_run(mk_argv, LOCHS_RUN_AS_CROOT);
     }
 
     printf("  Devices: /dev mounted\n");
@@ -901,22 +904,57 @@ int lochs_cmd_start(int argc, char **argv) {
     
     printf("Starting container '%s'...\n", name);
     
-    /* Files into the container's id range (user namespace): the image
-     * once, the container's own layer at every start; before mounting */
-    if (jail->image_path[0] && jail->merged_path[0]) {
-        lochs_idshift_tree(jail->image_path, 1);
-        if (jail->diff_path[0]) lochs_idshift_tree(jail->diff_path, 0);
-    } else {
-        lochs_idshift_tree(jail->path, 1);
+    /*
+     * The container's id range (user namespace). With idmapped layers each
+     * container has its own and the layers keep container ids on disk;
+     * otherwise all share LOCHS_ID_BASE and the layers are chown-shifted
+     * into it (see lochs_ns.c).
+     */
+    int layered = jail->image_path[0] && jail->merged_path[0];
+    int overlay = layered && jail->storage_backend != LOCHS_STORAGE_ZFS;
+    int idmapped = overlay && lochs_idmap_supported();
+    uid_t ids = idmapped ? lochs_ids_alloc(jail->name) : (uid_t)LOCHS_ID_BASE;
+    if (overlay && !idmapped)
+        fprintf(stderr, "Note: this kernel cannot mount idmapped layers (Linux 5.19+); "
+                        "'%s' shares id range %d with other containers\n", name, LOCHS_ID_BASE);
+    if (layered) {
+        lochs_image_ids(jail->image_path, idmapped ? 0 : (uid_t)LOCHS_ID_BASE);
+        if (jail->diff_path[0]) {
+            if (idmapped) lochs_idshift_tree(jail->diff_path, LOCHS_ID_BASE, 0);
+            else lochs_idshift_tree(jail->diff_path, 0, LOCHS_ID_BASE);
+        }
+    } else if (jail->path[0]) {
+        lochs_image_ids(jail->path, LOCHS_ID_BASE);
     }
+    lochs_ns_set_base(jail->name, ids);
+    lochs_croot_set(ids);
 
     /* Mount overlay filesystem if using COW storage */
     if (jail->image_path[0] && jail->merged_path[0]) {
-        if (lochs_storage_mount_container(jail) != 0) {
+        int mr;
+        if (idmapped) {
+            /* A mount left from before (another range, or none) is
+             * replaced, never reused */
+            umount2(jail->merged_path, MNT_DETACH);
+            char cdir[LOCHS_MAX_PATH];
+            snprintf(cdir, sizeof(cdir), "%s", jail->diff_path);
+            char *slash = strrchr(cdir, '/');
+            if (slash) *slash = '\0';
+            mr = lochs_idmap_mount_overlay(jail->name, ids, jail->image_path, cdir,
+                                           jail->merged_path);
+            if (mr == 0) jail->overlay_mounted = 1;
+        } else {
+            mr = lochs_storage_mount_container(jail);
+        }
+        if (mr != 0) {
             fprintf(stderr, "Error: failed to mount container filesystem\n");
             return 1;
         }
-        printf("  Overlay: mounted\n");
+        if (idmapped)
+            printf("  Overlay: mounted (ids %u-%u)\n", (unsigned)ids,
+                   (unsigned)(ids + LOCHS_ID_COUNT - 1));
+        else
+            printf("  Overlay: mounted\n");
     }
     
     /* Without a lochs network, the container gets its own network
@@ -978,7 +1016,7 @@ int lochs_cmd_start(int argc, char **argv) {
             /* Create mount point in container */
             snprintf(mount_point, sizeof(mount_point), "%s%s", jail->path, v->container_path);
             const char *mkdir_argv[] = { "mkdir", "-p", mount_point, NULL };
-            lochs_run(mkdir_argv, 0);
+            lochs_run(mkdir_argv, LOCHS_RUN_AS_CROOT);
 
             /* Bind mount the host path */
             const char *bind_argv[] = { "mount", "--bind", v->host_path, mount_point, NULL };
@@ -1013,7 +1051,9 @@ int lochs_cmd_start(int argc, char **argv) {
     if (jail->env_count > 0) {
         char env_file[2048];
         snprintf(env_file, sizeof(env_file), "%s/.lochs_env", jail->path);
+        lochs_croot_enter();
         FILE *ef = fopen(env_file, "w");
+        lochs_croot_leave();
         if (ef) {
             for (int i = 0; i < jail->env_count; i++) {
                 /* Quote the value so the jail's shell reads it literally */
@@ -1028,15 +1068,6 @@ int lochs_cmd_start(int argc, char **argv) {
 
     /* Set up /dev devices inside the container */
     lochs_devfs_setup(jail);
-
-    /* /dev directories and the env file were created by host root */
-    {
-        char p[LOCHS_MAX_PATH + 32];
-        jail_subpath(p, sizeof(p), jail, "/dev");
-        lochs_idshift_tree(p, 0);
-        jail_subpath(p, sizeof(p), jail, "/.lochs_env");
-        if (access(p, F_OK) == 0) lochs_idshift_tree(p, 0);
-    }
 
     /* The container's own user, PID, mount, UTS and IPC namespaces: every
      * bsdulator run below joins them */
@@ -1286,6 +1317,7 @@ int lochs_cmd_stop(int argc, char **argv) {
         lochs_storage_unmount_container(jail);
         printf("  Overlay: unmounted\n");
     }
+    lochs_idmap_unmount(jail->name);
     
     /* Save state */
     lochs_state_save();
@@ -1331,6 +1363,7 @@ int lochs_cmd_rm(int argc, char **argv) {
     
     /* Destroy container storage (overlay directories) */
     lochs_storage_destroy_container(jail);
+    lochs_ids_free(name);
     
     if (lochs_jail_remove(name) == 0) {
         printf("Removed container '%s'\n", name);

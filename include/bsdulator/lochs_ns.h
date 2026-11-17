@@ -22,13 +22,40 @@ void lochs_ns_stop(const char *name);
  * buf holds the pid text and must outlive argv. Returns 1 if added. */
 int lochs_ns_add_args(const char *name, const char **argv, int *n, char *buf, size_t bufsz);
 
-/* Container uid/gid 0..LOCHS_ID_COUNT-1 is host LOCHS_ID_BASE + id */
+/* Container uid/gid N is host <base> + N. Each container has its own base
+ * (LOCHS_ID_BASE + k * LOCHS_ID_COUNT, k >= 1); LOCHS_ID_BASE itself is the
+ * range shared by all containers on kernels without idmapped layers. */
 #define LOCHS_ID_BASE  100000
 #define LOCHS_ID_COUNT 65536
 
-/* Shift ownership of a tree into the container id range (files already
- * shifted are left alone). With use_marker, a tree done once is skipped. */
-int lochs_idshift_tree(const char *dir, int use_marker);
+/* The container's own range: allocated at first use, kept until freed
+ * (lochs rm). Returns its base. */
+uid_t lochs_ids_alloc(const char *name);
+void lochs_ids_free(const char *name);
+
+/* The range a running container uses (set at start, before
+ * lochs_ns_start, which maps it); LOCHS_ID_BASE if unset */
+void lochs_ns_set_base(const char *name, uid_t base);
+uid_t lochs_ns_base(const char *name);
+
+/* Move ownership in a tree from ids from..from+COUNT-1 to to..; other
+ * owners and device nodes are left alone */
+int lochs_idshift_tree(const char *dir, uid_t from, uid_t to);
+
+/* Bring an image layer (shared by containers) to ids want..: 0 for
+ * container ids on disk (idmapped mounts), LOCHS_ID_BASE for the shared
+ * range. Remembers the image's state; lochs_image_ids_forget drops it. */
+int lochs_image_ids(const char *image_path, uid_t want);
+void lochs_image_ids_forget(const char *image_path);
+
+/* Can this kernel mount an overlay over idmapped layers? */
+int lochs_idmap_supported(void);
+
+/* Mount the container's overlay at merged over idmapped views of image and
+ * cdir (holding diff/ and work/), for ids base..; and undo it */
+int lochs_idmap_mount_overlay(const char *name, uid_t base, const char *image,
+                              const char *cdir, const char *merged);
+void lochs_idmap_unmount(const char *name);
 
 /* The container's own network namespace ("lochs-<name>") with a veth
  * pair, a private IP and outbound NAT. netns receives its name. */

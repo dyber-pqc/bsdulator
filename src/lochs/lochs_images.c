@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <time.h>
 
+#include "bsdulator/lochs_ns.h"
 #include "bsdulator/lochs.h"
 #include "bsdulator/lochs_exec.h"
 
@@ -690,6 +691,7 @@ int lochs_image_remove(const char *image_name) {
     
     const char *rm_argv[] = { "rm", "-rf", "--", img->path, NULL };
     int ret = lochs_run(rm_argv, 0);
+    lochs_image_ids_forget(img->path);
 
     if (ret != 0) {
         fprintf(stderr, "Warning: Failed to remove image directory\n");

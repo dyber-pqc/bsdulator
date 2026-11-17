@@ -15,6 +15,11 @@
 /* Flags for lochs_run() */
 #define LOCHS_RUN_QUIET   0x1   /* send stdout and stderr to /dev/null */
 #define LOCHS_RUN_NOWAIT  0x2   /* do not wait; return the child's PID */
+#define LOCHS_RUN_AS_CROOT 0x8  /* run as the container's root (the uid set
+                                   with lochs_croot_set()), with every
+                                   capability: what it creates in the
+                                   container belongs to container root. Not
+                                   for mount(8), which refuses non-root. */
 #define LOCHS_RUN_DETACH  0x4   /* child calls setsid(): it outlives this
                                    process's session (needed under WSL, which
                                    kills a session's processes when the
@@ -26,6 +31,17 @@
  * the child PID with LOCHS_RUN_NOWAIT, or -1 if it could not be started.
  */
 int lochs_run(const char *const argv[], int flags);
+
+/*
+ * Container root's host uid/gid for LOCHS_RUN_AS_CROOT and
+ * lochs_croot_enter(); 0 (the default) means host root.
+ */
+void lochs_croot_set(unsigned int host_id);
+
+/* Until lochs_croot_leave(), files this process creates belong to
+ * container root (filesystem uid/gid switch; capabilities kept). */
+void lochs_croot_enter(void);
+void lochs_croot_leave(void);
 
 /*
  * Like lochs_run(), but the child first writes its PID to cgroup_procs

@@ -949,7 +949,7 @@ pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp
             }
         }
 
-        /* Become root of the container: host uid LOCHS_ID_BASE, not 0 */
+        /* Become root of the container: its own host uid range, not 0 */
         if (user_fd >= 0) {
             if (setgroups(0, NULL) < 0 || setresgid(0, 0, 0) < 0 || setresuid(0, 0, 0) < 0) {
                 fprintf(stderr, "Failed to become container root: %s\n", strerror(errno));

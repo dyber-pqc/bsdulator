@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/file.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
@@ -40,6 +41,8 @@
 static void pid_file(const char *name, char *out, size_t sz) {
     snprintf(out, sz, NS_DIR "/%s.pid", name);
 }
+
+static void base_file(const char *name, char *out, size_t sz);
 
 static void on_chld(int sig) { (void)sig; }
 
@@ -205,7 +208,7 @@ pid_t lochs_ns_start(const char *name, const char *root) {
     if (read(up[0], &userns, 1) != 1) userns = 0;
     if (userns) {
         char path[64], map[64];
-        snprintf(map, sizeof(map), "0 %d %d\n", LOCHS_ID_BASE, LOCHS_ID_COUNT);
+        snprintf(map, sizeof(map), "0 %u %d\n", (unsigned)lochs_ns_base(name), LOCHS_ID_COUNT);
         const char *files[2] = { "uid_map", "gid_map" };
         for (int i = 0; i < 2 && ok; i++) {
             snprintf(path, sizeof(path), "/proc/%d/%s", (int)h, files[i]);
@@ -247,6 +250,8 @@ void lochs_ns_stop(const char *name) {
     char path[512];
     pid_file(name, path, sizeof(path));
     unlink(path);
+    base_file(name, path, sizeof(path));
+    unlink(path);
 }
 
 int lochs_ns_add_args(const char *name, const char **argv, int *n, char *buf, size_t bufsz) {
@@ -259,12 +264,106 @@ int lochs_ns_add_args(const char *name, const char **argv, int *n, char *buf, si
 }
 
 /* ---------------------------------------------------------------------
- * File ownership in the container's id range
+ * Container id ranges
  *
- * Container uid/gid N is host LOCHS_ID_BASE + N. Image and container files
- * are shifted once into that range (Docker's userns-remap does the same).
- * chown clears setuid/setgid bits, so the mode is restored after it.
+ * Container uid/gid N is host <base> + N, and every container has its own
+ * base (LOCHS_ID_BASE + k * LOCHS_ID_COUNT, k >= 1), kept in
+ * /var/lib/lochs/ids/<name> from its first start until `lochs rm`. Root of
+ * one container is then nobody to another container's files and processes.
+ *
+ * Image and container layers keep container ids on disk (0..65535). At
+ * start the image and the container's own layer are mounted idmapped to
+ * the container's range, and the overlay is built on those mounts (Linux
+ * 5.19+). On older kernels lochs falls back to one shared range,
+ * LOCHS_ID_BASE, with the layers chown-shifted into it on disk.
  * ------------------------------------------------------------------- */
+
+#define IDS_DIR "/var/lib/lochs/ids"
+#define IDMNT_DIR "/var/lib/lochs/idmnt"
+
+static long read_long(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    long v = -1;
+    if (fscanf(f, "%ld", &v) != 1) v = -1;
+    fclose(f);
+    return v;
+}
+
+static int write_long(const char *path, long v) {
+    char tmp[600];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return -1;
+    fprintf(f, "%ld\n", v);
+    if (fclose(f) != 0) return -1;
+    return rename(tmp, path);
+}
+
+uid_t lochs_ids_alloc(const char *name) {
+    char path[512];
+    mkdir("/var/lib/lochs", 0755);
+    mkdir(IDS_DIR, 0700);
+    snprintf(path, sizeof(path), IDS_DIR "/%s", name);
+    long v = read_long(path);
+    if (v >= (long)LOCHS_ID_BASE + LOCHS_ID_COUNT) return (uid_t)v;
+
+    int lfd = open(IDS_DIR "/.lock", O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lfd >= 0) flock(lfd, LOCK_EX);
+    v = read_long(path);
+    if (v < (long)LOCHS_ID_BASE + LOCHS_ID_COUNT) {
+        /* Lowest slot no other container holds */
+        static unsigned char used[8192];
+        memset(used, 0, sizeof(used));
+        DIR *d = opendir(IDS_DIR);
+        struct dirent *e;
+        while (d && (e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.' || strchr(e->d_name, '.')) continue;
+            char p2[600];
+            snprintf(p2, sizeof(p2), IDS_DIR "/%s", e->d_name);
+            long b = read_long(p2);
+            long k = (b - LOCHS_ID_BASE) / LOCHS_ID_COUNT;
+            if (b > LOCHS_ID_BASE && k > 0 && k < (long)sizeof(used)) used[k] = 1;
+        }
+        if (d) closedir(d);
+        long k = 1;
+        while (k < (long)sizeof(used) && used[k]) k++;
+        v = k < (long)sizeof(used) ? (long)LOCHS_ID_BASE + k * LOCHS_ID_COUNT : -1;
+        if (v > 0 && write_long(path, v) < 0) v = -1;
+    }
+    if (lfd >= 0) close(lfd);   /* releases the lock */
+    return v > 0 ? (uid_t)v : (uid_t)LOCHS_ID_BASE;
+}
+
+void lochs_ids_free(const char *name) {
+    char path[512];
+    snprintf(path, sizeof(path), IDS_DIR "/%s", name);
+    unlink(path);
+}
+
+/* The range of a running container (written at start) */
+static void base_file(const char *name, char *out, size_t sz) {
+    snprintf(out, sz, NS_DIR "/%s.ids", name);
+}
+
+void lochs_ns_set_base(const char *name, uid_t base) {
+    char path[512];
+    mkdir("/var/lib/lochs", 0755);
+    mkdir(NS_DIR, 0700);
+    base_file(name, path, sizeof(path));
+    write_long(path, (long)base);
+}
+
+uid_t lochs_ns_base(const char *name) {
+    char path[512];
+    base_file(name, path, sizeof(path));
+    long v = read_long(path);
+    return v >= LOCHS_ID_BASE ? (uid_t)v : (uid_t)LOCHS_ID_BASE;
+}
+
+/* --- ownership shifting --------------------------------------------- */
+
+static uid_t shift_from, shift_to;
 
 static int shift_one(const char *path, const struct stat *st, int flag, struct FTW *ftw) {
     (void)flag; (void)ftw;
@@ -272,28 +371,217 @@ static int shift_one(const char *path, const struct stat *st, int flag, struct F
     if (S_ISCHR(st->st_mode) || S_ISBLK(st->st_mode)) return 0;
     uid_t u = st->st_uid;
     gid_t g = st->st_gid;
-    if (u >= (uid_t)LOCHS_ID_COUNT && g >= (gid_t)LOCHS_ID_COUNT) return 0;  /* already shifted */
-    uid_t nu = u < (uid_t)LOCHS_ID_COUNT ? u + LOCHS_ID_BASE : u;
-    gid_t ng = g < (gid_t)LOCHS_ID_COUNT ? g + LOCHS_ID_BASE : g;
+    uid_t nu = (u >= shift_from && u - shift_from < (uid_t)LOCHS_ID_COUNT) ? u - shift_from + shift_to : u;
+    gid_t ng = (g >= shift_from && g - shift_from < (gid_t)LOCHS_ID_COUNT) ? g - shift_from + shift_to : g;
+    if (nu == u && ng == g) return 0;
     if (lchown(path, nu, ng) < 0) return 0;  /* keep going */
+    /* chown clears setuid/setgid bits: restore the mode */
     if (!S_ISLNK(st->st_mode) && (st->st_mode & (S_ISUID | S_ISGID)))
         chmod(path, st->st_mode & 07777);
     return 0;
 }
 
-int lochs_idshift_tree(const char *dir, int use_marker) {
-    char marker[1024];
-    snprintf(marker, sizeof(marker), "%s/.lochs-idmap-%d", dir, LOCHS_ID_BASE);
-    if (use_marker && access(marker, F_OK) == 0) return 0;
+int lochs_idshift_tree(const char *dir, uid_t from, uid_t to) {
+    if (from == to) return 0;
     struct stat st;
     if (lstat(dir, &st) < 0) return -1;
-    if (nftw(dir, shift_one, 64, FTW_PHYS | FTW_MOUNT) < 0) return -1;
-    if (use_marker) {
-        int fd = open(marker, O_WRONLY | O_CREAT | O_CLOEXEC, 0444);
-        if (fd >= 0) {
-            if (fchown(fd, LOCHS_ID_BASE, LOCHS_ID_BASE) < 0) { /* not fatal */ }
-            close(fd);
+    shift_from = from;
+    shift_to = to;
+    return nftw(dir, shift_one, 64, FTW_PHYS | FTW_MOUNT) < 0 ? -1 : 0;
+}
+
+/* An image's layer is shared by containers: its current shift is kept in
+ * IDS_DIR/image.<dir name>. Older lochs marked a shifted image with a
+ * .lochs-idmap-100000 file in its root. */
+int lochs_image_ids(const char *image_path, uid_t want) {
+    char state[600], marker[1100];
+    const char *b = strrchr(image_path, '/');
+    b = b ? b + 1 : image_path;
+    mkdir("/var/lib/lochs", 0755);
+    mkdir(IDS_DIR, 0700);
+    snprintf(state, sizeof(state), IDS_DIR "/image.%s", b);
+    snprintf(marker, sizeof(marker), "%s/.lochs-idmap-%d", image_path, LOCHS_ID_BASE);
+    long cur = read_long(state);
+    if (cur < 0) cur = access(marker, F_OK) == 0 ? LOCHS_ID_BASE : 0;
+    if ((uid_t)cur != want) {
+        printf("  Ids: shifting image files to %s ids (once)\n", want ? "host" : "container");
+        if (lochs_idshift_tree(image_path, (uid_t)cur, want) < 0) return -1;
+    }
+    unlink(marker);
+    return write_long(state, (long)want);
+}
+
+void lochs_image_ids_forget(const char *image_path) {
+    char state[600];
+    const char *b = strrchr(image_path, '/');
+    b = b ? b + 1 : image_path;
+    snprintf(state, sizeof(state), IDS_DIR "/image.%s", b);
+    unlink(state);
+}
+
+/* --- idmapped layers ------------------------------------------------ */
+
+#ifndef SYS_open_tree
+#define SYS_open_tree 428
+#endif
+#ifndef SYS_move_mount
+#define SYS_move_mount 429
+#endif
+#ifndef SYS_mount_setattr
+#define SYS_mount_setattr 442
+#endif
+#define L_OPEN_TREE_CLONE 1
+#define L_OPEN_TREE_CLOEXEC O_CLOEXEC
+#define L_MOVE_MOUNT_F_EMPTY_PATH 0x00000004
+#define L_MOUNT_ATTR_IDMAP 0x00100000
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 0x1000
+#endif
+struct l_mount_attr { unsigned long long attr_set, attr_clr, propagation, userns_fd; };
+
+/* A user namespace mapping container ids to base.., for idmapped mounts.
+ * Its helper process is gone on return; the fd keeps it alive. */
+static int userns_for(uid_t base) {
+    int p[2];
+    if (pipe(p) < 0) return -1;
+    pid_t c = fork();
+    if (c < 0) { close(p[0]); close(p[1]); return -1; }
+    if (c == 0) {
+        close(p[0]);
+        char ok = unshare(CLONE_NEWUSER) == 0;
+        ssize_t w = write(p[1], &ok, 1);
+        (void)w;
+        pause();
+        _exit(0);
+    }
+    close(p[1]);
+    char ok = 0;
+    if (read(p[0], &ok, 1) != 1) ok = 0;
+    close(p[0]);
+    int fd = -1;
+    if (ok) {
+        char path[64], map[64];
+        snprintf(map, sizeof(map), "0 %u %d\n", (unsigned)base, LOCHS_ID_COUNT);
+        const char *files[2] = { "uid_map", "gid_map" };
+        int good = 1;
+        for (int i = 0; i < 2 && good; i++) {
+            snprintf(path, sizeof(path), "/proc/%d/%s", (int)c, files[i]);
+            int mfd = open(path, O_WRONLY | O_CLOEXEC);
+            if (mfd < 0 || write(mfd, map, strlen(map)) != (ssize_t)strlen(map)) good = 0;
+            if (mfd >= 0) close(mfd);
         }
+        snprintf(path, sizeof(path), "/proc/%d/ns/user", (int)c);
+        if (good) fd = open(path, O_RDONLY | O_CLOEXEC);
+    }
+    kill(c, SIGKILL);
+    waitpid(c, NULL, 0);
+    return fd;
+}
+
+/* Attach an idmapped copy of src at dst */
+static int idmap_mount(const char *src, const char *dst, int ufd) {
+    int t = (int)syscall(SYS_open_tree, AT_FDCWD, src, L_OPEN_TREE_CLONE | L_OPEN_TREE_CLOEXEC);
+    if (t < 0) return -1;
+    struct l_mount_attr a = { L_MOUNT_ATTR_IDMAP, 0, 0, (unsigned long long)ufd };
+    int r = (int)syscall(SYS_mount_setattr, t, "", AT_EMPTY_PATH, &a, sizeof(a));
+    if (r == 0) {
+        mkdir(dst, 0700);
+        r = (int)syscall(SYS_move_mount, t, "", AT_FDCWD, dst, L_MOVE_MOUNT_F_EMPTY_PATH);
+    }
+    int e = errno;
+    close(t);
+    errno = e;
+    return r;
+}
+
+static int kernel_at_least(int maj, int min) {
+    FILE *f = fopen("/proc/sys/kernel/osrelease", "r");
+    if (!f) return 0;
+    int a = 0, b = 0;
+    int n = fscanf(f, "%d.%d", &a, &b);
+    fclose(f);
+    return n == 2 && (a > maj || (a == maj && b >= min));
+}
+
+int lochs_idmap_supported(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    cached = 0;
+    /* LOCHS_NO_IDMAP=1 forces the shared-range fallback (for testing it) */
+    const char *no = getenv("LOCHS_NO_IDMAP");
+    if (no && no[0] == '1') return 0;
+    /* Overlay over idmapped layers needs 5.19 */
+    if (!kernel_at_least(5, 19)) return 0;
+    int ufd = userns_for(LOCHS_ID_BASE);
+    if (ufd < 0) return 0;
+    mkdir("/var/lib/lochs", 0755);
+    int t = (int)syscall(SYS_open_tree, AT_FDCWD, "/var/lib/lochs", L_OPEN_TREE_CLONE | L_OPEN_TREE_CLOEXEC);
+    if (t >= 0) {
+        struct l_mount_attr a = { L_MOUNT_ATTR_IDMAP, 0, 0, (unsigned long long)ufd };
+        cached = syscall(SYS_mount_setattr, t, "", AT_EMPTY_PATH, &a, sizeof(a)) == 0;
+        close(t);
+    }
+    close(ufd);
+    return cached;
+}
+
+static void idmnt_paths(const char *name, char *dir, char *lower, char *rw, size_t sz) {
+    snprintf(dir, sz, IDMNT_DIR "/%s", name);
+    snprintf(lower, sz, IDMNT_DIR "/%s/lower", name);
+    snprintf(rw, sz, IDMNT_DIR "/%s/rw", name);
+}
+
+void lochs_idmap_unmount(const char *name) {
+    char dir[512], lower[512], rw[512];
+    idmnt_paths(name, dir, lower, rw, sizeof(dir));
+    umount2(lower, MNT_DETACH);
+    umount2(rw, MNT_DETACH);
+    rmdir(lower);
+    rmdir(rw);
+    rmdir(dir);
+}
+
+/*
+ * Mount the container's overlay at merged over idmapped views of the image
+ * and of the container directory (which holds diff/ and work/). The mount
+ * is made with container root's filesystem ids: overlayfs does its own
+ * work (work dir, copy-up) with the mounter's, which must have a container
+ * id. Returns 0, or -1 with nothing left mounted.
+ */
+int lochs_idmap_mount_overlay(const char *name, uid_t base, const char *image,
+                              const char *cdir, const char *merged) {
+    char dir[512], lower[512], rw[512];
+    idmnt_paths(name, dir, lower, rw, sizeof(dir));
+    lochs_idmap_unmount(name);   /* left over from a crash */
+    mkdir(IDMNT_DIR, 0700);
+    mkdir(dir, 0700);
+    int ufd = userns_for(base);
+    if (ufd < 0) return -1;
+    int r = idmap_mount(image, lower, ufd);
+    if (r == 0) r = idmap_mount(cdir, rw, ufd);
+    close(ufd);
+    if (r < 0) {
+        fprintf(stderr, "Error: idmapped mount failed: %s\n", strerror(errno));
+        lochs_idmap_unmount(name);
+        return -1;
+    }
+    char opts[2048];
+    snprintf(opts, sizeof(opts), "lowerdir=%s,upperdir=%s/diff,workdir=%s/work", lower, rw, rw);
+    lochs_croot_set(base);
+    fflush(stdout);
+    fflush(stderr);
+    pid_t c = fork();
+    if (c == 0) {
+        lochs_croot_enter();
+        _exit(mount("overlay", merged, "overlay", 0, opts) == 0 ? 0 : errno);
+    }
+    int st = 0;
+    waitpid(c, &st, 0);
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        fprintf(stderr, "Error: overlay mount failed: %s\n",
+                WIFEXITED(st) ? strerror(WEXITSTATUS(st)) : "helper died");
+        lochs_idmap_unmount(name);
+        return -1;
     }
     return 0;
 }
