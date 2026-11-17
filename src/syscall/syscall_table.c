@@ -39,6 +39,7 @@
 #endif
 #include <asm/prctl.h>  /* For ARCH_SET_FS, etc. */
 #include "bsdulator.h"
+#include "bsdulator/signal_emul.h"
 #include "../runtime/freebsd_runtime.h"
 
 /* Forward declarations for emulation handlers */
@@ -75,14 +76,10 @@ static long emul_thr_exit(pid_t pid, uint64_t args[6]);
 static long emul_thr_kill(pid_t pid, uint64_t args[6]);
 static long emul_thr_wake(pid_t pid, uint64_t args[6]);
 static long emul_clock_gettime(pid_t pid, uint64_t args[6]);
-static long emul_sigprocmask(pid_t pid, uint64_t args[6]);
-static long emul_sigaction(pid_t pid, uint64_t args[6]);
-static long emul_sigfastblock(pid_t pid, uint64_t args[6]);
 static long emul_cpuset_getaffinity(pid_t pid, uint64_t args[6]);
 static long emul_minherit(pid_t pid, uint64_t args[6]);
 static long emul_rtprio_thread(pid_t pid, uint64_t args[6]);
 static long emul_umtx_op(pid_t pid, uint64_t args[6]);
-static long emul_getcontext(pid_t pid, uint64_t args[6]);
 static long emul_sysarch(pid_t pid, uint64_t args[6]);
 static long emul_pathconf(pid_t pid, uint64_t args[6]);
 static long emul_fpathconf(pid_t pid, uint64_t args[6]);
@@ -322,16 +319,19 @@ int syscall_init(void) {
      * FreeBSD sigset_t = 16 bytes (128 signals)
      * Linux sigset_t = 8 bytes (64 signals)
      */
-    EMUL(FBSD_SYS_sigaction, "sigaction", emul_sigaction);
-    EMUL(FBSD_SYS_sigprocmask, "sigprocmask", emul_sigprocmask);
-    TRANS(FBSD_SYS_sigpending, SYS_rt_sigpending, "sigpending");
-    TRANS(FBSD_SYS_sigsuspend, SYS_rt_sigsuspend, "sigsuspend");
-    TRANS(FBSD_SYS_sigaltstack, SYS_sigaltstack, "sigaltstack");
-    TRANS(FBSD_SYS_sigwait, SYS_rt_sigtimedwait, "sigwait");
-    TRANS(FBSD_SYS_sigtimedwait, SYS_rt_sigtimedwait, "sigtimedwait");
-    TRANS(FBSD_SYS_sigwaitinfo, SYS_rt_sigtimedwait, "sigwaitinfo");
+    /* FreeBSD signal state is kept per process by the tracer
+     * (src/signal/signal_emul.c). */
+    EMUL(FBSD_SYS_sigaction, "sigaction", sig_emul_sigaction);
+    EMUL(FBSD_SYS_sigprocmask, "sigprocmask", sig_emul_sigprocmask);
+    EMUL(FBSD_SYS_sigpending, "sigpending", sig_emul_sigpending);
+    EMUL(FBSD_SYS_sigsuspend, "sigsuspend", sig_emul_sigsuspend);
+    EMUL(FBSD_SYS_sigaltstack, "sigaltstack", sig_emul_sigaltstack);
+    EMUL(FBSD_SYS_sigwait, "sigwait", sig_emul_sigwait);
+    EMUL(FBSD_SYS_sigtimedwait, "sigtimedwait", sig_emul_sigtimedwait);
+    EMUL(FBSD_SYS_sigwaitinfo, "sigwaitinfo", sig_emul_sigwaitinfo);
     TRANS(FBSD_SYS_sigqueue, SYS_rt_sigqueueinfo, "sigqueue");
-    EMUL(FBSD_SYS_sigfastblock, "sigfastblock", emul_sigfastblock);
+    EMUL(FBSD_SYS_sigfastblock, "sigfastblock", sig_emul_sigfastblock);
+    EMUL(FBSD_SYS_sigreturn, "sigreturn", sig_emul_sigreturn);
     
     /*
      * Resource limit syscalls
@@ -374,6 +374,8 @@ int syscall_init(void) {
      * Pipe syscalls
      */
     TRANS(FBSD_SYS_pipe2, SYS_pipe2, "pipe2");
+    EMUL(FBSD_SYS_procctl, "procctl", sig_emul_procctl);
+    EMUL(FBSD_SYS_wait6, "wait6", sig_emul_wait6);
     
     /*
      * Threading syscalls - needed for libthr
@@ -398,7 +400,9 @@ int syscall_init(void) {
     /*
      * Context syscalls
      */
-    EMUL(FBSD_SYS_getcontext, "getcontext", emul_getcontext);
+    EMUL(FBSD_SYS_getcontext, "getcontext", sig_emul_getcontext);
+    EMUL(FBSD_SYS_setcontext, "setcontext", sig_emul_setcontext);
+    EMUL(FBSD_SYS_swapcontext, "swapcontext", sig_emul_swapcontext);
     
     /*
      * Misc syscalls
@@ -526,10 +530,19 @@ int syscall_translate_args(int freebsd_nr, uint64_t *args) {
             return 1;
             
         case FBSD_SYS_kill:
-        case FBSD_SYS_sigaction:
-        case FBSD_SYS_sigprocmask:
-            /* Translate signal number */
-            args[0] = abi_translate_signal(args[0]);
+            /* kill(pid, sig): the signal is the second argument */
+            if (args[1] != 0 && sig_fbsd_to_linux((int)args[1]) != 0)
+                args[1] = (uint64_t)sig_fbsd_to_linux((int)args[1]);
+            return 1;
+
+        case FBSD_SYS_pipe2:
+            /* pipe2(fds, flags): O_CLOEXEC and O_NONBLOCK differ */
+            args[1] = abi_translate_open_flags(args[1]);
+            return 1;
+
+        case FBSD_SYS_wait4:
+            /* wait4(pid, status, options, rusage) */
+            args[2] = sig_wait_options_to_linux(args[2]);
             return 1;
             
         case FBSD_SYS_fcntl:
@@ -1444,236 +1457,8 @@ static long emul_clock_gettime(pid_t pid, uint64_t args[6]) {
     return ret;
 }
 
-/*
- * sigprocmask - FreeBSD uses 16-byte sigset_t, Linux uses 8-byte
- * FIXED: Must read/write from CHILD's memory!
- * FIXED: Translate 'how' parameter (FreeBSD uses 1/2/3, Linux uses 0/1/2)
- */
-static long emul_sigprocmask(pid_t pid, uint64_t args[6]) {
-    int fbsd_how = (int)args[0];
-    uint64_t set_addr = args[1];     /* Pointer in CHILD's memory */
-    uint64_t oldset_addr = args[2];  /* Pointer in CHILD's memory */
-    
-    /*
-     * Translate 'how' parameter:
-     * FreeBSD: SIG_BLOCK=1, SIG_UNBLOCK=2, SIG_SETMASK=3
-     * Linux:   SIG_BLOCK=0, SIG_UNBLOCK=1, SIG_SETMASK=2
-     */
-    int linux_how;
-    if (fbsd_how >= 1 && fbsd_how <= 3) {
-        linux_how = fbsd_how - 1;
-    } else {
-        BSD_ERROR("sigprocmask: invalid how=%d", fbsd_how);
-        return -EINVAL;
-    }
-    
-    BSD_TRACE("sigprocmask: fbsd_how=%d -> linux_how=%d set=0x%lx oldset=0x%lx", 
-              fbsd_how, linux_how, set_addr, oldset_addr);
-    
-    /* FreeBSD sigset_t is 16 bytes (128 bits), Linux is 8 bytes (64 bits) */
-    uint64_t fbsd_set[2] = {0, 0};
-    uint64_t linux_set = 0;
-    uint64_t linux_oldset = 0;
-    
-    /* Read set from child's memory if provided */
-    if (set_addr != 0) {
-        struct iovec local_iov = { fbsd_set, sizeof(fbsd_set) };
-        struct iovec remote_iov = { (void *)set_addr, sizeof(fbsd_set) };
-        
-        ssize_t nread = process_vm_readv(pid, &local_iov, 1, &remote_iov, 1, 0);
-        if (nread < 0) {
-            /* Fallback to ptrace */
-            fbsd_set[0] = ptrace(PTRACE_PEEKDATA, pid, set_addr, NULL);
-            fbsd_set[1] = ptrace(PTRACE_PEEKDATA, pid, set_addr + 8, NULL);
-        }
-        linux_set = fbsd_set[0];  /* Use first 64 bits */
-    }
-    
-    /* Call Linux sigprocmask with TRANSLATED how value */
-    long ret = syscall(SYS_rt_sigprocmask, linux_how, 
-                       set_addr ? &linux_set : NULL, 
-                       oldset_addr ? &linux_oldset : NULL, 
-                       sizeof(linux_set));
-    
-    /* Write oldset to child's memory if requested */
-    if (ret == 0 && oldset_addr != 0) {
-        uint64_t fbsd_oldset[2] = { linux_oldset, 0 };
-        
-        struct iovec local_iov = { fbsd_oldset, sizeof(fbsd_oldset) };
-        struct iovec remote_iov = { (void *)oldset_addr, sizeof(fbsd_oldset) };
-        
-        ssize_t written = process_vm_writev(pid, &local_iov, 1, &remote_iov, 1, 0);
-        if (written < 0) {
-            /* Fallback to ptrace */
-            ptrace(PTRACE_POKEDATA, pid, oldset_addr, fbsd_oldset[0]);
-            ptrace(PTRACE_POKEDATA, pid, oldset_addr + 8, fbsd_oldset[1]);
-        }
-    }
-    
-    return ret;
-}
 
-/*
- * sigaction - FreeBSD struct sigaction differs from Linux
- */
-static long emul_sigaction(pid_t pid, uint64_t args[6]) {
-    int sig = (int)args[0];
-    uint64_t act_addr = args[1];     /* FreeBSD sigaction in child's memory */
-    uint64_t oldact_addr = args[2];  /* FreeBSD sigaction in child's memory */
-    
-    /* Translate signal number */
-    /* SIGTHR (32) is FreeBSD threading signal - stub it */
-    if (sig == 32) {
-        BSD_TRACE("sigaction: SIGTHR stubbed");
-        return 0;
-    }
-    /* SIGINFO (29) has no Linux equivalent - stub it */
-    if (sig == 29) {
-        BSD_TRACE("sigaction: SIGINFO stubbed (no Linux equivalent)");
-        return 0;
-    }
-    /* SIGEMT (7) has no Linux equivalent - stub it */
-    if (sig == 7) {
-        BSD_TRACE("sigaction: SIGEMT stubbed (no Linux equivalent)");
-        return 0;
-    }
-    
-    int linux_sig = abi_translate_signal(sig);
-    BSD_TRACE("sigaction: sig=%d -> linux_sig=%d", sig, linux_sig);
-    
-    /*
-     * FreeBSD and Linux sigaction structures are different:
-     * FreeBSD: { handler(8), flags(4), mask(16) } = 28 bytes
-     * Linux:   { handler(8), flags(8), restorer(8), mask(128) } = 152 bytes
-     * 
-     * We need to translate between them properly.
-     */
-    
-    struct {
-        uint64_t sa_handler;
-        uint64_t sa_flags;
-        void (*sa_restorer)(void);
-        uint64_t sa_mask[16];  /* 128 bytes for 1024 signals */
-    } linux_act, linux_oldact;
-    
-    memset(&linux_act, 0, sizeof(linux_act));
-    memset(&linux_oldact, 0, sizeof(linux_oldact));
-    
-    if (act_addr) {
-        /* Read FreeBSD sigaction from child memory */
-        uint8_t fbsd_act[32];
-        struct iovec local = { fbsd_act, sizeof(fbsd_act) };
-        struct iovec remote = { (void *)act_addr, sizeof(fbsd_act) };
-        if (process_vm_readv(pid, &local, 1, &remote, 1, 0) > 0) {
-            /* FreeBSD layout: handler(8) + flags(4) + mask(16) */
-            memcpy(&linux_act.sa_handler, fbsd_act, 8);
-            uint32_t fbsd_flags;
-            memcpy(&fbsd_flags, fbsd_act + 8, 4);
-            linux_act.sa_flags = fbsd_flags;  /* Flags are mostly compatible */
-            /* Copy first 16 bytes of mask (128 signals) */
-            memcpy(&linux_act.sa_mask, fbsd_act + 12, 16);
-            BSD_TRACE("sigaction: read fbsd act: handler=0x%lx flags=0x%x",
-                      linux_act.sa_handler, fbsd_flags);
-        } else {
-            BSD_WARN("sigaction: failed to read act from child");
-        }
-    }
-    
-    long ret = syscall(SYS_rt_sigaction, linux_sig, 
-                       act_addr ? &linux_act : NULL,
-                       oldact_addr ? &linux_oldact : NULL,
-                       8);  /* Linux expects 8 bytes (64 signals) for sigset size */
-    
-    BSD_TRACE("sigaction: rt_sigaction returned %ld", ret);
-    
-    if (ret == 0 && oldact_addr) {
-        /* Write back FreeBSD sigaction to child memory */
-        uint8_t fbsd_oldact[32];
-        memset(fbsd_oldact, 0, sizeof(fbsd_oldact));
-        memcpy(fbsd_oldact, &linux_oldact.sa_handler, 8);
-        uint32_t fbsd_flags = (uint32_t)linux_oldact.sa_flags;
-        memcpy(fbsd_oldact + 8, &fbsd_flags, 4);
-        memcpy(fbsd_oldact + 12, &linux_oldact.sa_mask, 16);
-        
-        struct iovec local = { fbsd_oldact, sizeof(fbsd_oldact) };
-        struct iovec remote = { (void *)oldact_addr, sizeof(fbsd_oldact) };
-        process_vm_writev(pid, &local, 1, &remote, 1, 0);
-    }
-    
-    return ret;
-}
 
-/*
- * sigfastblock - fast signal blocking for userspace threading
- * FreeBSD: int sigfastblock(int cmd, void *ptr)
- */
-/*
- * sigfastblock commands
- */
-#define SIGFASTBLOCK_SETPTR   1
-#define SIGFASTBLOCK_UNBLOCK  2
-#define SIGFASTBLOCK_UNSETPTR 3
-
-/* Per-process sigfastblock pointer tracking */
-static uint64_t sigfastblock_ptr_addr = 0;
-
-static long emul_sigfastblock(pid_t pid, uint64_t args[6]) {
-    int cmd = (int)args[0];
-    uint64_t ptr = args[1];
-
-    BSD_TRACE("sigfastblock: cmd=%d ptr=0x%lx", cmd, ptr);
-
-    switch (cmd) {
-    case SIGFASTBLOCK_SETPTR:
-        /* Record the address of the fast-block counter in the child */
-        sigfastblock_ptr_addr = ptr;
-        BSD_TRACE("sigfastblock: SETPTR -> 0x%lx", ptr);
-        return 0;
-
-    case SIGFASTBLOCK_UNBLOCK:
-        /* Deliver any pending signals. Check if the block counter is now 0 */
-        if (sigfastblock_ptr_addr) {
-            uint32_t block_val = 0;
-            struct iovec local = { &block_val, sizeof(block_val) };
-            struct iovec remote = { (void *)sigfastblock_ptr_addr, sizeof(block_val) };
-            if (process_vm_readv(pid, &local, 1, &remote, 1, 0) >= 0) {
-                BSD_TRACE("sigfastblock: UNBLOCK block_val=%u", block_val);
-                /* If block counter is 0, signals are now unblocked.
-                 * We rely on Linux's normal signal delivery. */
-            }
-        }
-        return 0;
-
-    case SIGFASTBLOCK_UNSETPTR:
-        /* Remove the pointer */
-        sigfastblock_ptr_addr = 0;
-        return 0;
-
-    default:
-        BSD_WARN("sigfastblock: unknown cmd=%d", cmd);
-        return 0;
-    }
-}
-
-/*
- * getcontext - get user context
- * FreeBSD: int getcontext(ucontext_t *ucp)
- */
-static long emul_getcontext(pid_t pid, uint64_t args[6]) {
-    (void)pid;
-    
-    uint64_t ucp_addr = args[0];
-    
-    BSD_TRACE("getcontext: ucp=0x%lx (stub)", ucp_addr);
-    
-    /*
-     * getcontext saves the current context for later use with setcontext.
-     * This is complex to implement properly as it needs to save all registers.
-     * For now, just return success - this is used for setjmp/longjmp style code
-     * which may still work if not actually used.
-     */
-    return 0;
-}
 
 /*
  * cpuset_getaffinity - get CPU affinity

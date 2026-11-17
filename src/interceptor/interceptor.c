@@ -30,6 +30,7 @@
 #include "bsdulator.h"
 #include "runtime/freebsd_runtime.h"
 #include "bsdulator/jail.h"
+#include "bsdulator/signal_emul.h"
 
 #ifndef __NR_process_vm_readv
 #define __NR_process_vm_readv 310
@@ -1801,6 +1802,8 @@ typedef struct {
     int skip_post_exec;  /* Skip phantom syscall stop after exec (per-process!) */
     /* The syscall this process is inside (saved at entry, used at exit) */
     int sc_valid;
+    uint64_t sc_raw_args[6];  /* arguments as the program passed them */
+    int first_stop;           /* next stop is the new child's initial one */
     uint64_t sc_nr;
     uint64_t sc_args[6];
     size_t mmap_alignment;
@@ -1844,6 +1847,7 @@ static process_entry_t* add_process(pid_t pid) {
         entry->in_syscall = 0;
         entry->skip_post_exec = 0;
         entry->sc_valid = 0;
+        entry->first_stop = 1;
         BSD_TRACE("Added process %d to table (count=%d)", pid, process_count);
         return entry;
     }
@@ -1879,6 +1883,7 @@ static void remove_process(pid_t pid) {
     /* Forget its jail membership too: the PID can be reused later by a
      * process that is not in the jail. */
     jail_forget_process(pid);
+    sig_proc_exit(pid);
 }
 
 /* Count active processes */
@@ -1947,7 +1952,10 @@ int interceptor_wait(interceptor_state_t *state) {
             /* A new child can stop before its parent's fork event is
              * seen; take its jail from the parent now. */
             pid_t parent = parent_of(result);
-            if (parent > 0) jail_inherit_process(parent, result);
+            if (parent > 0) {
+                jail_inherit_process(parent, result);
+                sig_proc_fork(parent, result);
+            }
         }
         
         /* Check if this is a newly forked child needing TLS setup */
@@ -2052,6 +2060,10 @@ int interceptor_wait(interceptor_state_t *state) {
             }
             
             set_in_syscall(state->pid, !get_in_syscall(state->pid));
+            {
+                process_entry_t *fe = find_process(state->pid);
+                if (fe) fe->first_stop = 0;
+            }
             
             if (get_in_syscall(state->pid)) {
                 state->last_event = EVENT_SYSCALL_ENTER;
@@ -2062,9 +2074,24 @@ int interceptor_wait(interceptor_state_t *state) {
                 state->args[3] = regs.r10;
                 state->args[4] = regs.r8;
                 state->args[5] = regs.r9;
+                process_entry_t *pe = find_process(state->pid);
+                if (pe) memcpy(pe->sc_raw_args, state->args, sizeof(pe->sc_raw_args));
             } else {
                 state->last_event = EVENT_SYSCALL_EXIT;
                 state->retval = (int64_t)regs.rax;
+                /*
+                 * FreeBSD reports success with the carry flag clear and
+                 * libc tests it (jb cerror). Linux returns with the flags
+                 * the program had before the syscall, so a stale CF made
+                 * successful syscalls look like failures with errno 0.
+                 * Clear it after a real syscall that succeeded. Emulated
+                 * syscalls (orig_rax == -1) set CF themselves.
+                 */
+                if ((int64_t)regs.orig_rax != -1 && (regs.eflags & 0x1) &&
+                    !((int64_t)regs.rax < 0 && (int64_t)regs.rax > -4096)) {
+                    regs.eflags &= ~0x1ULL;
+                    (void)ptrace(PTRACE_SETREGS, state->pid, NULL, &regs);
+                }
             }
             
             return 0;
@@ -2091,6 +2118,7 @@ int interceptor_wait(interceptor_state_t *state) {
                     /* Add child to process table */
                     add_process((pid_t)child_pid);
                     jail_inherit_process(state->pid, (pid_t)child_pid);
+                    sig_proc_fork(state->pid, (pid_t)child_pid);
                     
                     if (pending_count < 32) { 
                         pending_children[pending_count++] = child_pid; 
@@ -2110,6 +2138,7 @@ int interceptor_wait(interceptor_state_t *state) {
                     /* Add child to process table */
                     add_process((pid_t)child_pid);
                     jail_inherit_process(state->pid, (pid_t)child_pid);
+                    sig_proc_fork(state->pid, (pid_t)child_pid);
                     
                     if (pending_count < 32) { 
                         pending_children[pending_count++] = child_pid; 
@@ -2127,6 +2156,7 @@ int interceptor_wait(interceptor_state_t *state) {
                     /* Add child to process table */
                     add_process((pid_t)clone_child_pid);
                     jail_inherit_process(state->pid, (pid_t)clone_child_pid);
+                    sig_proc_fork(state->pid, (pid_t)clone_child_pid);
                     
                     if (pending_count < 32) { 
                         pending_children[pending_count++] = clone_child_pid; 
@@ -2141,6 +2171,7 @@ int interceptor_wait(interceptor_state_t *state) {
                     BSD_INFO("Exec event for PID %d - setting up FreeBSD environment", state->pid);
                     set_in_syscall(state->pid, 0);
                     set_skip_post_exec(state->pid, 1);  /* Per-process flag! */
+                    sig_proc_exec(state->pid);
                     
                     /*
                      * CRITICAL: Skip all FreeBSD environment setup for jailed processes!
@@ -2202,13 +2233,31 @@ int interceptor_wait(interceptor_state_t *state) {
         /* Regular signal */
         state->last_event = EVENT_SIGNAL;
         state->signal = sig;
-        
+
+        process_entry_t *se = find_process(state->pid);
+        int first = se && se->first_stop;
+        if (se) se->first_stop = 0;
+        if (first && sig == SIGSTOP) {
+            /* A new child's initial stop under PTRACE_O_TRACEFORK */
+            state->last_event = EVENT_NONE;
+            return 0;
+        }
+        siginfo_t gsi;
+        memset(&gsi, 0, sizeof(gsi));
+        if (ptrace(PTRACE_GETSIGINFO, state->pid, NULL, &gsi) < 0 && errno == EINVAL) {
+            /* Group-stop (job control), not a signal to deliver */
+            state->last_event = EVENT_NONE;
+            return 0;
+        }
+
         struct user_regs_struct regs;
-        if (ptrace(PTRACE_GETREGS, state->pid, NULL, &regs) == 0) {
-            BSD_TRACE("Signal %d at RIP=0x%llx RSP=0x%llx", 
-                    sig, (unsigned long long)regs.rip, 
+        if (ptrace(PTRACE_GETREGS, state->pid, NULL, &regs) == 0 &&
+            regs.rip != SIG_RETURN_MAGIC) {
+            BSD_TRACE("Signal %d at RIP=0x%llx RSP=0x%llx",
+                    sig, (unsigned long long)regs.rip,
                     (unsigned long long)regs.rsp);
-            if (sig == SIGSEGV || sig == SIGBUS) {
+            /* Only real faults (si_code > 0), not a kill(SIGSEGV) */
+            if ((sig == SIGSEGV || sig == SIGBUS) && gsi.si_code > 0) {
                 BSD_ERROR("CRASH: Signal %d at RIP=0x%llx",
                         sig, (unsigned long long)regs.rip);
                 BSD_ERROR("  RAX=0x%llx RBX=0x%llx RCX=0x%llx RDX=0x%llx",
@@ -2369,6 +2418,11 @@ int interceptor_run(interceptor_state_t *state) {
     
     main_pid = state->pid;  /* Set global main_pid */
     add_process(main_pid);  /* Add main process to table */
+    {
+        process_entry_t *me = find_process(main_pid);
+        if (me) me->first_stop = 0;  /* its initial stop was consumed at spawn */
+    }
+    sig_proc_start(main_pid);
     
     BSD_INFO("Starting syscall interception for PID %d", (int)state->pid);
     
@@ -2402,7 +2456,14 @@ int interceptor_run(interceptor_state_t *state) {
                 
             case EVENT_SYSCALL_ENTER: {
                 state->syscall_count++;
-                
+
+                if (sig_on_syscall_entry(state->pid, state->syscall_nr)) {
+                    /* The kernel resuming an interrupted sleep
+                     * (restart_syscall): a Linux syscall, run it as is. */
+                    save_syscall_state(state);
+                    break;
+                }
+
                 int linux_nr;
                 syscall_result_t result = syscall_translate((int)state->syscall_nr, &linux_nr);
                 
@@ -2539,6 +2600,12 @@ int interceptor_run(interceptor_state_t *state) {
                                 case FBSD_SYS_setsockopt: actual_linux_nr = 54; break;  /* SYS_setsockopt */
                                 case FBSD_SYS_getsockopt: actual_linux_nr = 55; break;  /* SYS_getsockopt */
                                 case FBSD_SYS_jail_attach: actual_linux_nr = 161; break;  /* SYS_chroot - jail_attach rewrites to chroot */
+                                case FBSD_SYS_sigsuspend:  actual_linux_nr = SYS_rt_sigsuspend; break;
+                                case FBSD_SYS_procctl:     actual_linux_nr = SYS_prctl; break;
+                                case FBSD_SYS_wait6:       actual_linux_nr = SYS_wait4; break;
+                                case FBSD_SYS_sigwait:
+                                case FBSD_SYS_sigtimedwait:
+                                case FBSD_SYS_sigwaitinfo: actual_linux_nr = SYS_rt_sigtimedwait; break;
                                 default:
                                     BSD_ERROR("No Linux syscall mapping for emulated FreeBSD syscall %d",
                                               (int)state->syscall_nr);
@@ -2548,7 +2615,13 @@ int interceptor_run(interceptor_state_t *state) {
                             /* For setsockopt/getsockopt/socket, also update the args (translated) */
                             if ((int)state->syscall_nr == FBSD_SYS_setsockopt ||
                                 (int)state->syscall_nr == FBSD_SYS_getsockopt ||
-                                (int)state->syscall_nr == FBSD_SYS_socket) {
+                                (int)state->syscall_nr == FBSD_SYS_socket ||
+                                (int)state->syscall_nr == FBSD_SYS_procctl ||
+                                (int)state->syscall_nr == FBSD_SYS_wait6 ||
+                                (int)state->syscall_nr == FBSD_SYS_sigsuspend ||
+                                (int)state->syscall_nr == FBSD_SYS_sigwait ||
+                                (int)state->syscall_nr == FBSD_SYS_sigtimedwait ||
+                                (int)state->syscall_nr == FBSD_SYS_sigwaitinfo) {
                                 if (interceptor_set_args(state->pid, state->args) < 0) {
                                     BSD_ERROR("Failed to update args for sockopt syscall");
                                 }
@@ -2936,13 +3009,30 @@ int interceptor_run(interceptor_state_t *state) {
                 if (state->retval == -512 /* ERESTARTSYS */ ||
                     state->retval == -513 /* ERESTARTNOINTR */ ||
                     state->retval == -514 /* ERESTARTNOHAND */) {
-                    interceptor_set_syscall(state->pid, state->syscall_nr);
+                    /* Restart with the FreeBSD number and the arguments
+                     * the program passed (emulation may have changed them) */
+                    struct user_regs_struct rr;
+                    process_entry_t *pe = find_process(state->pid);
+                    if (ptrace(PTRACE_GETREGS, state->pid, NULL, &rr) == 0) {
+                        rr.orig_rax = state->syscall_nr;
+                        if (pe) {
+                            rr.rdi = pe->sc_raw_args[0];
+                            rr.rsi = pe->sc_raw_args[1];
+                            rr.rdx = pe->sc_raw_args[2];
+                            rr.r10 = pe->sc_raw_args[3];
+                            rr.r8  = pe->sc_raw_args[4];
+                            rr.r9  = pe->sc_raw_args[5];
+                        }
+                        (void)ptrace(PTRACE_SETREGS, state->pid, NULL, &rr);
+                    }
                     break;
                 }
                 if (state->retval == -516 /* ERESTART_RESTARTBLOCK */) {
-                    /* Would restart as Linux restart_syscall; report EINTR
-                     * (same number on FreeBSD), which callers retry. */
-                    interceptor_set_return(state->pid, -EINTR);
+                    /* An interrupted sleep. With no handler the kernel
+                     * resumes it through Linux restart_syscall, which the
+                     * next syscall entry lets through; a handler makes
+                     * it EINTR (see signal_emul.c). */
+                    sig_note_restart_block(state->pid);
                     break;
                 }
 
@@ -2950,29 +3040,29 @@ int interceptor_run(interceptor_state_t *state) {
                 if (new_ret != state->retval || (state->retval < 0 && state->retval > -4096)) {
                     interceptor_set_return(state->pid, new_ret);
                 }
+
+                /* sigreturn/setcontext, wait4 status, and signals the
+                 * syscall unblocked */
+                sig_after_syscall(state->pid, state->syscall_nr, state->args);
                 break;
             }
             
             case EVENT_SIGNAL:
                 BSD_TRACE("Signal %d received", state->signal);
                 
-                if (state->signal == SIGSEGV || state->signal == SIGBUS ||
-                    state->signal == SIGILL || state->signal == SIGFPE) {
-                    BSD_ERROR("Fatal signal %d - process will be terminated", state->signal);
-                    interceptor_continue_signal(state, state->signal);
-                    continue;
-                }
                 
                 /*
-                 * Re-inject the signal unchanged. The kernel delivers it
-                 * with Linux numbering, so passing the FreeBSD number here
-                 * turned SIGCHLD (Linux 17) into Linux 20, SIGTSTP.
-                 * FreeBSD handlers are not installed in the traced process
-                 * yet (sigaction is emulated in the tracer), so this gives
-                 * the default action, which matches FreeBSD for the
-                 * common signals.
+                 * FreeBSD semantics: the signal module runs the
+                 * program's handler (building a FreeBSD signal frame),
+                 * defers it if blocked, or returns the Linux signal to
+                 * inject for the default action.
                  */
-                interceptor_continue_signal(state, state->signal);
+                {
+                    int inj = sig_on_signal(state->pid, state->signal);
+                    if (inj == SIGSEGV || inj == SIGBUS || inj == SIGILL || inj == SIGFPE)
+                        BSD_INFO("Fatal signal %d - process will be terminated", inj);
+                    interceptor_continue_signal(state, inj);
+                }
                 continue;
                 
             case EVENT_FORK:

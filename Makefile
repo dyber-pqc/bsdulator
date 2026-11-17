@@ -20,7 +20,8 @@ SRCS = $(SRCDIR)/main.c \
        $(SRCDIR)/loader/elf_loader.c \
        $(SRCDIR)/abi/abi_translate.c \
        $(SRCDIR)/runtime/freebsd_runtime.c \
-       $(SRCDIR)/jail/jail.c
+       $(SRCDIR)/jail/jail.c \
+       $(SRCDIR)/signal/signal_emul.c
 
 # BSDulator object files
 OBJS = $(SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
@@ -89,6 +90,8 @@ $(OBJDIR)/loader/elf_loader.o: $(SRCDIR)/loader/elf_loader.c $(INCDIR)/bsdulator
 $(OBJDIR)/abi/abi_translate.o: $(SRCDIR)/abi/abi_translate.c $(INCDIR)/bsdulator.h $(INCDIR)/bsdulator/abi.h
 $(OBJDIR)/runtime/freebsd_runtime.o: $(SRCDIR)/runtime/freebsd_runtime.c $(SRCDIR)/runtime/freebsd_runtime.h $(INCDIR)/bsdulator.h
 $(OBJDIR)/jail/jail.o: $(SRCDIR)/jail/jail.c $(INCDIR)/bsdulator.h $(INCDIR)/bsdulator/jail.h
+$(OBJDIR)/signal/signal_emul.o: $(SRCDIR)/signal/signal_emul.c $(INCDIR)/bsdulator.h $(INCDIR)/bsdulator/signal_emul.h $(INCDIR)/bsdulator/interceptor.h
+$(OBJS): $(INCDIR)/bsdulator/signal_emul.h
 
 # Dependencies - Lochs CLI
 $(OBJDIR)/lochs/lochs_main.o: $(SRCDIR)/lochs/lochs_main.c $(INCDIR)/bsdulator/lochs.h
@@ -119,10 +122,19 @@ $(TEST_EXEC): tests/test_lochs_exec.c $(OBJDIR)/lochs/lochs_exec.o
 test-exec: $(TEST_EXEC)
 	@./$(TEST_EXEC)
 
+# Unit tests for signal number and wait4 option translation
+TEST_SIGNAL = $(BINDIR)/tests/test_signal_map
+$(TEST_SIGNAL): tests/test_signal_map.c $(OBJDIR)/signal/signal_emul.o
+	@echo "  LINK    $@"
+	@$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+test-signal: $(TEST_SIGNAL)
+	@./$(TEST_SIGNAL)
+
 # Clean
 clean:
 	@echo "  CLEAN"
-	@rm -rf $(OBJDIR) $(TARGET) $(LOCHS_TARGET) $(TEST_EXEC)
+	@rm -rf $(OBJDIR) $(TARGET) $(LOCHS_TARGET) $(TEST_EXEC) $(TEST_SIGNAL)
 
 # Install
 install: $(TARGET) $(LOCHS_TARGET)
@@ -181,7 +193,8 @@ help:
 	@echo "  package-rpm     - Build .rpm package"
 	@echo "  test          - Run test suite"
 	@echo "  test-exec     - Run unit tests for the no-shell exec helpers"
+	@echo "  test-signal   - Run unit tests for signal number translation"
 	@echo "  setup-freebsd - Download FreeBSD base system"
 	@echo "  help          - Show this help"
 
-.PHONY: all debug verbose clean install install-service uninstall test test-exec setup-freebsd help package package-deb package-rpm
+.PHONY: all debug verbose clean install install-service uninstall test test-exec test-signal setup-freebsd help package package-deb package-rpm

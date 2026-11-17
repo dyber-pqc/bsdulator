@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <errno.h>
 #include "bsdulator.h"
+#include "bsdulator/signal_emul.h"
 
 /*
  * Track pending mmap alignment requirement
@@ -192,92 +193,17 @@ int abi_translate_mmap_prot(int freebsd_prot) {
 }
 
 /*
- * Signal number translation
- * FreeBSD and Linux signal numbers differ slightly
+ * Signal number translation (see src/signal/signal_emul.c for the table,
+ * which also covers real-time signals). Unknown signals pass through.
  */
-static const int freebsd_to_linux_sig[] = {
-    [0] = 0,
-    [FBSD_SIGHUP] = SIGHUP,
-    [FBSD_SIGINT] = SIGINT,
-    [FBSD_SIGQUIT] = SIGQUIT,
-    [FBSD_SIGILL] = SIGILL,
-    [FBSD_SIGTRAP] = SIGTRAP,
-    [FBSD_SIGABRT] = SIGABRT,
-    [FBSD_SIGEMT] = 0,          /* No Linux equivalent */
-    [FBSD_SIGFPE] = SIGFPE,
-    [FBSD_SIGKILL] = SIGKILL,
-    [FBSD_SIGBUS] = SIGBUS,
-    [FBSD_SIGSEGV] = SIGSEGV,
-    [FBSD_SIGSYS] = SIGSYS,
-    [FBSD_SIGPIPE] = SIGPIPE,
-    [FBSD_SIGALRM] = SIGALRM,
-    [FBSD_SIGTERM] = SIGTERM,
-    [FBSD_SIGURG] = SIGURG,
-    [FBSD_SIGSTOP] = SIGSTOP,
-    [FBSD_SIGTSTP] = SIGTSTP,
-    [FBSD_SIGCONT] = SIGCONT,
-    [FBSD_SIGCHLD] = SIGCHLD,
-    [FBSD_SIGTTIN] = SIGTTIN,
-    [FBSD_SIGTTOU] = SIGTTOU,
-    [FBSD_SIGIO] = SIGIO,
-    [FBSD_SIGXCPU] = SIGXCPU,
-    [FBSD_SIGXFSZ] = SIGXFSZ,
-    [FBSD_SIGVTALRM] = SIGVTALRM,
-    [FBSD_SIGPROF] = SIGPROF,
-    [FBSD_SIGWINCH] = SIGWINCH,
-    [FBSD_SIGINFO] = SIGPWR,    /* Map to SIGPWR (Linux 30) */
-    [FBSD_SIGUSR1] = SIGUSR1,
-    [FBSD_SIGUSR2] = SIGUSR2,
-    [FBSD_SIGTHR] = 35,  /* SIGRTMIN+1 (Linux SIGRTMIN=34) for threading */
-};
-
-static const int linux_to_freebsd_sig[] = {
-    [0] = 0,
-    [SIGHUP] = FBSD_SIGHUP,
-    [SIGINT] = FBSD_SIGINT,
-    [SIGQUIT] = FBSD_SIGQUIT,
-    [SIGILL] = FBSD_SIGILL,
-    [SIGTRAP] = FBSD_SIGTRAP,
-    [SIGABRT] = FBSD_SIGABRT,
-    [SIGBUS] = FBSD_SIGBUS,
-    [SIGFPE] = FBSD_SIGFPE,
-    [SIGKILL] = FBSD_SIGKILL,
-    [SIGUSR1] = FBSD_SIGUSR1,
-    [SIGSEGV] = FBSD_SIGSEGV,
-    [SIGUSR2] = FBSD_SIGUSR2,
-    [SIGPIPE] = FBSD_SIGPIPE,
-    [SIGALRM] = FBSD_SIGALRM,
-    [SIGTERM] = FBSD_SIGTERM,
-    [SIGCHLD] = FBSD_SIGCHLD,
-    [SIGCONT] = FBSD_SIGCONT,
-    [SIGSTOP] = FBSD_SIGSTOP,
-    [SIGTSTP] = FBSD_SIGTSTP,
-    [SIGTTIN] = FBSD_SIGTTIN,
-    [SIGTTOU] = FBSD_SIGTTOU,
-    [SIGURG] = FBSD_SIGURG,
-    [SIGXCPU] = FBSD_SIGXCPU,
-    [SIGXFSZ] = FBSD_SIGXFSZ,
-    [SIGVTALRM] = FBSD_SIGVTALRM,
-    [SIGPROF] = FBSD_SIGPROF,
-    [SIGWINCH] = FBSD_SIGWINCH,
-    [SIGIO] = FBSD_SIGIO,
-    [SIGSYS] = FBSD_SIGSYS,
-};
-
 int abi_translate_signal(int freebsd_sig) {
-    if (freebsd_sig < 0 || freebsd_sig >= (int)(sizeof(freebsd_to_linux_sig)/sizeof(freebsd_to_linux_sig[0]))) {
-        return freebsd_sig;  /* Pass through unknown signals */
-    }
-    int linux_sig = freebsd_to_linux_sig[freebsd_sig];
-    return linux_sig ? linux_sig : freebsd_sig;
+    int l = sig_fbsd_to_linux(freebsd_sig);
+    return l ? l : freebsd_sig;
 }
 
 int abi_translate_signal_to_freebsd(int linux_sig) {
-    if (linux_sig < 0 || linux_sig >= (int)(sizeof(linux_to_freebsd_sig)/sizeof(linux_to_freebsd_sig[0]))) {
-        return linux_sig;
-    }
-    int freebsd_sig = linux_to_freebsd_sig[linux_sig];
-    return freebsd_sig ? freebsd_sig : linux_sig;
+    int f = sig_linux_to_fbsd(linux_sig);
+    return f ? f : linux_sig;
 }
 
 /*
