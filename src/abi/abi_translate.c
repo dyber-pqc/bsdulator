@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <errno.h>
 #include "bsdulator.h"
+#include "bsdulator/syscall.h"
 #include "bsdulator/signal_emul.h"
 
 /*
@@ -507,8 +508,40 @@ int abi_translate_at_flags(int freebsd_flags) {
     
     if (freebsd_flags & 0x4000) /* FreeBSD AT_EMPTY_PATH */
         linux_flags |= 0x1000;  /* Linux AT_EMPTY_PATH */
-    
+
     return linux_flags;
+}
+
+/*
+ * The flag argument's position differs between *at syscalls:
+ *   fstatat(fd, path, sb, flag)          faccessat(fd, path, mode, flag)
+ *   fchmodat(fd, path, mode, flag)       utimensat(fd, path, times, flag)
+ *   fchownat(fd, path, uid, gid, flag)   linkat(fd1, p1, fd2, p2, flag)
+ *   unlinkat(fd, path, flag)
+ */
+/* tv_nsec markers in utimensat/futimens times: FreeBSD UTIME_NOW -1,
+ * UTIME_OMIT -2; Linux ((1 << 30) - 1) and ((1 << 30) - 2) */
+long abi_utime_nsec_to_linux(long nsec) {
+    if (nsec == -1) return (1L << 30) - 1;
+    if (nsec == -2) return (1L << 30) - 2;
+    return nsec;
+}
+
+int abi_at_flags_arg(int freebsd_nr) {
+    switch (freebsd_nr) {
+        case FBSD_SYS_unlinkat:
+            return 2;
+        case FBSD_SYS_fstatat:
+        case FBSD_SYS_faccessat:
+        case FBSD_SYS_fchmodat:
+        case FBSD_SYS_utimensat:
+            return 3;
+        case FBSD_SYS_fchownat:
+        case FBSD_SYS_linkat:
+            return 4;
+        default:
+            return -1;
+    }
 }
 
 /*

@@ -2839,6 +2839,9 @@ int interceptor_run(interceptor_state_t *state) {
                                 case FBSD_SYS_fcntl:       actual_linux_nr = SYS_fcntl; break;
                                 case FBSD_SYS_sendmsg:     actual_linux_nr = SYS_sendmsg; break;
                                 case FBSD_SYS_recvmsg:     actual_linux_nr = SYS_recvmsg; break;
+                                case FBSD_SYS_utimensat:
+                                case FBSD_SYS_futimens:    actual_linux_nr = SYS_utimensat; break;
+                                case FBSD_SYS_futimes:     actual_linux_nr = SYS_futimesat; break;
                                 case 0:                    /* indirect syscall: handler set it */
                                 case FBSD_SYS_kqueue:
                                 case FBSD_SYS_kqueuex:
@@ -2875,7 +2878,10 @@ int interceptor_run(interceptor_state_t *state) {
                                 (int)state->syscall_nr == FBSD_SYS_sigsuspend ||
                                 (int)state->syscall_nr == FBSD_SYS_sigwait ||
                                 (int)state->syscall_nr == FBSD_SYS_sigtimedwait ||
-                                (int)state->syscall_nr == FBSD_SYS_sigwaitinfo) {
+                                (int)state->syscall_nr == FBSD_SYS_sigwaitinfo ||
+                                (int)state->syscall_nr == FBSD_SYS_utimensat ||
+                                (int)state->syscall_nr == FBSD_SYS_futimens ||
+                                (int)state->syscall_nr == FBSD_SYS_futimes) {
                                 if (interceptor_set_args(state->pid, state->args) < 0) {
                                     BSD_ERROR("Failed to update args for sockopt syscall");
                                 }

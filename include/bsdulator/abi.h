@@ -227,6 +227,13 @@ int abi_translate_dirents_to_freebsd(const void *linux_buf, size_t linux_len,
 /* AT_ flags for *at syscalls */
 int abi_translate_at_flags(int freebsd_flags);
 
+/* Which argument of a FreeBSD *at syscall holds its AT_ flags (0-based),
+ * or -1 if it has none */
+int abi_at_flags_arg(int freebsd_nr);
+
+/* utimensat/futimens tv_nsec: FreeBSD UTIME_NOW/UTIME_OMIT to Linux's */
+long abi_utime_nsec_to_linux(long nsec);
+
 /* errno */
 int abi_translate_errno(int linux_errno);
 int abi_translate_errno_to_linux(int freebsd_errno);

@@ -14,6 +14,11 @@
 #include "bsdulator.h"
 #include "bsdulator/signal_emul.h"
 #include "bsdulator/msg_emul.h"
+#include "bsdulator/syscall.h"
+
+int abi_translate_at_flags(int freebsd_flags);
+int abi_at_flags_arg(int freebsd_nr);
+long abi_utime_nsec_to_linux(long nsec);
 
 int abi_translate_errno(int linux_errno);
 int abi_translate_errno_to_linux(int freebsd_errno);
@@ -97,6 +102,20 @@ int main(void) {
     CHECK(msg_flags_to_linux(0x80) == 0x40, "MSG_DONTWAIT 0x80 -> 0x40");
     CHECK(msg_flags_to_linux(0x20000) == 0x4000, "MSG_NOSIGNAL 0x20000 -> 0x4000");
     CHECK(msg_flags_to_linux(0x2) == 0x2, "MSG_PEEK unchanged");
+
+    printf("*at syscall flags\n");
+    CHECK(abi_at_flags_arg(FBSD_SYS_fchownat) == 4, "fchownat flag is arg 4, not the gid");
+    CHECK(abi_at_flags_arg(FBSD_SYS_linkat) == 4, "linkat flag is arg 4");
+    CHECK(abi_at_flags_arg(FBSD_SYS_unlinkat) == 2, "unlinkat flag is arg 2");
+    CHECK(abi_at_flags_arg(FBSD_SYS_fstatat) == 3, "fstatat flag is arg 3");
+    CHECK(abi_at_flags_arg(FBSD_SYS_utimensat) == 3, "utimensat flag is arg 3");
+    CHECK(abi_at_flags_arg(FBSD_SYS_openat) == -1, "openat has no AT_ flag");
+    CHECK(abi_translate_at_flags(0x0200) == 0x0100, "AT_SYMLINK_NOFOLLOW 0x200 -> 0x100");
+    CHECK(abi_translate_at_flags(0x0800) == 0x0200, "AT_REMOVEDIR 0x800 -> 0x200");
+    CHECK(abi_translate_at_flags(0) == 0, "no flags stay none");
+    CHECK(abi_utime_nsec_to_linux(-1) == (1L << 30) - 1, "UTIME_NOW -1 -> Linux");
+    CHECK(abi_utime_nsec_to_linux(-2) == (1L << 30) - 2, "UTIME_OMIT -2 -> Linux");
+    CHECK(abi_utime_nsec_to_linux(123456789) == 123456789, "real nanoseconds unchanged");
 
     if (failures) {
         printf("%d test(s) FAILED\n", failures);

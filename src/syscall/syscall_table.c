@@ -54,6 +54,9 @@ static long emul_syscall(pid_t pid, uint64_t args[6]);
 static long emul_sysctlbyname(pid_t pid, uint64_t args[6]);
 static long emul_connect(pid_t pid, uint64_t args[6]);
 static long emul_bind(pid_t pid, uint64_t args[6]);
+static long emul_utimensat(pid_t pid, uint64_t args[6]);
+static long emul_futimens(pid_t pid, uint64_t args[6]);
+static long emul_futimes(pid_t pid, uint64_t args[6]);
 static long emul_sendto(pid_t pid, uint64_t args[6]);
 static long emul_socket(pid_t pid, uint64_t args[6]);
 static long emul_setsockopt(pid_t pid, uint64_t args[6]);
@@ -217,7 +220,7 @@ int syscall_init(void) {
     TRANS(FBSD_SYS_symlinkat, SYS_symlinkat, "symlinkat");
     TRANS(FBSD_SYS_unlinkat, SYS_unlinkat, "unlinkat");
     TRANS(FBSD_SYS_futimesat, SYS_futimesat, "futimesat");
-    TRANS(FBSD_SYS_utimensat, SYS_utimensat, "utimensat");
+    EMUL(FBSD_SYS_utimensat, "utimensat", emul_utimensat);  /* UTIME_* values */
     
     /* stat family */
     TRANS(FBSD_SYS_fstat, SYS_fstat, "fstat");
@@ -300,8 +303,10 @@ int syscall_init(void) {
     TRANS(FBSD_SYS_getitimer, SYS_getitimer, "getitimer");
     TRANS(FBSD_SYS_setitimer, SYS_setitimer, "setitimer");
     TRANS(FBSD_SYS_utimes, SYS_utimes, "utimes");
-    TRANS(FBSD_SYS_futimes, SYS_futimesat, "futimes");
-    TRANS(FBSD_SYS_futimens, SYS_utimensat, "futimens");
+    /* futimes(fd, tv) and futimens(fd, ts) are Linux futimesat/utimensat
+     * with a NULL path; UTIME_NOW/UTIME_OMIT differ */
+    EMUL(FBSD_SYS_futimes, "futimes", emul_futimes);
+    EMUL(FBSD_SYS_futimens, "futimens", emul_futimens);
     
     /* Timer syscalls */
     TRANS(FBSD_SYS_ktimer_create, SYS_timer_create, "timer_create");
@@ -566,9 +571,13 @@ int syscall_translate_args(int freebsd_nr, uint64_t *args) {
         case FBSD_SYS_fchmodat:
         case FBSD_SYS_fchownat:
         case FBSD_SYS_unlinkat:
-            /* Translate AT_ flags (arg[3] for most *at syscalls) */
-            args[3] = abi_translate_at_flags(args[3]);
+        case FBSD_SYS_linkat: {
+            /* AT_ flags: their argument differs per syscall (fchownat's
+             * is the 5th; translating the 4th lost the group) */
+            int a = abi_at_flags_arg(freebsd_nr);
+            args[a] = (uint64_t)(unsigned int)abi_translate_at_flags((int)args[a]);
             return 1;
+        }
         default:
             return 0;
     }
@@ -1877,6 +1886,59 @@ static long emul_connect(pid_t pid, uint64_t args[6]) {
 
 static long emul_bind(pid_t pid, uint64_t args[6]) {
     return emul_connect(pid, args);
+}
+
+/*
+ * A Linux copy of a FreeBSD timespec[2] (utimensat/futimens): the layout
+ * matches, the UTIME_NOW and UTIME_OMIT markers in tv_nsec do not.
+ * Written below the program's red zone; returns its address, 0 on fault.
+ */
+static uint64_t utimes_to_linux(pid_t pid, uint64_t addr) {
+    int64_t ts[4];
+    struct iovec local = { ts, sizeof(ts) };
+    struct iovec remote = { (void *)addr, sizeof(ts) };
+    if (process_vm_readv(pid, &local, 1, &remote, 1, 0) != (ssize_t)sizeof(ts)) return 0;
+    ts[1] = abi_utime_nsec_to_linux(ts[1]);
+    ts[3] = abi_utime_nsec_to_linux(ts[3]);
+    struct user_regs_struct r;
+    if (ptrace(PTRACE_GETREGS, pid, NULL, &r) < 0) return 0;
+    uint64_t dst = (r.rsp - 1536 - 64) & ~15ULL;  /* below the red zone */
+    struct iovec lw = { ts, sizeof(ts) };
+    struct iovec rw = { (void *)dst, sizeof(ts) };
+    if (process_vm_writev(pid, &lw, 1, &rw, 1, 0) != (ssize_t)sizeof(ts)) return 0;
+    return dst;
+}
+
+/* utimensat(fd, path, times, flag) */
+static long emul_utimensat(pid_t pid, uint64_t args[6]) {
+    args[3] = (uint64_t)(unsigned int)abi_translate_at_flags((int)args[3]);
+    if (args[2]) {
+        uint64_t t = utimes_to_linux(pid, args[2]);
+        if (!t) return -EFAULT;
+        args[2] = t;
+    }
+    return -EAGAIN;
+}
+
+/* futimens(fd, times) -> utimensat(fd, NULL, times, 0) */
+static long emul_futimens(pid_t pid, uint64_t args[6]) {
+    uint64_t times = args[1];
+    args[1] = 0;
+    args[2] = 0;
+    args[3] = 0;
+    if (times) {
+        args[2] = utimes_to_linux(pid, times);
+        if (!args[2]) return -EFAULT;
+    }
+    return -EAGAIN;
+}
+
+/* futimes(fd, tv) -> futimesat(fd, NULL, tv) */
+static long emul_futimes(pid_t pid, uint64_t args[6]) {
+    (void)pid;
+    args[2] = args[1];
+    args[1] = 0;
+    return -EAGAIN;
 }
 
 static long emul_sendto(pid_t pid, uint64_t args[6]) {
