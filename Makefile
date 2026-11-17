@@ -26,7 +26,8 @@ SRCS = $(SRCDIR)/main.c \
        $(SRCDIR)/net/msg_emul.c \
        $(SRCDIR)/thread/chain.c \
        $(SRCDIR)/thread/thread_emul.c \
-       $(SRCDIR)/jail/pidmap.c
+       $(SRCDIR)/jail/pidmap.c \
+       $(SRCDIR)/jail/seccomp.c
 
 # BSDulator object files
 OBJS = $(SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
@@ -137,10 +138,19 @@ $(TEST_SIGNAL): tests/test_signal_map.c $(OBJDIR)/signal/signal_emul.o $(OBJDIR)
 test-signal: $(TEST_SIGNAL)
 	@./$(TEST_SIGNAL)
 
+# Unit tests for the container seccomp filter
+TEST_SECCOMP = $(BINDIR)/tests/test_seccomp
+$(TEST_SECCOMP): tests/test_seccomp.c $(OBJDIR)/jail/seccomp.o
+	@echo "  LINK    $@"
+	@$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+test-seccomp: $(TEST_SECCOMP)
+	@./$(TEST_SECCOMP)
+
 # Clean
 clean:
 	@echo "  CLEAN"
-	@rm -rf $(OBJDIR) $(TARGET) $(LOCHS_TARGET) $(TEST_EXEC) $(TEST_SIGNAL)
+	@rm -rf $(OBJDIR) $(TARGET) $(LOCHS_TARGET) $(TEST_EXEC) $(TEST_SIGNAL) $(TEST_SECCOMP)
 
 # Install
 install: $(TARGET) $(LOCHS_TARGET)
@@ -203,4 +213,4 @@ help:
 	@echo "  setup-freebsd - Download FreeBSD base system"
 	@echo "  help          - Show this help"
 
-.PHONY: all debug verbose clean install install-service uninstall test test-exec test-signal setup-freebsd help package package-deb package-rpm
+.PHONY: all debug verbose clean install install-service uninstall test test-exec test-signal test-seccomp setup-freebsd help package package-deb package-rpm

@@ -91,7 +91,7 @@ jobs:
         run: make
 
       - name: Unit tests
-        run: make test-exec test-signal
+        run: make test-exec test-signal test-seccomp
 
       - name: Run compatibility checker
         run: ./scripts/check_compat.sh

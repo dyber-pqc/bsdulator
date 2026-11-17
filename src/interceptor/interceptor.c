@@ -36,6 +36,7 @@
 #include "bsdulator/msg_emul.h"
 #include "bsdulator/chain.h"
 #include "bsdulator/thread_emul.h"
+#include "bsdulator/seccomp.h"
 
 #ifndef __NR_process_vm_readv
 #define __NR_process_vm_readv 310
@@ -937,6 +938,11 @@ pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp
             }
             if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
                 fprintf(stderr, "Failed to set no_new_privs: %s\n", strerror(errno));
+                _exit(127);
+            }
+            /* Syscalls that act on the whole host are refused */
+            if (container_seccomp_install() < 0) {
+                fprintf(stderr, "Failed to install the seccomp filter: %s\n", strerror(errno));
                 _exit(127);
             }
         }
