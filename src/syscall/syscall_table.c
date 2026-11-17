@@ -1753,7 +1753,7 @@ static long emul_realpathat(pid_t pid, uint64_t args[6]) {
     /* Outside a jail, FreeBSD paths mean the FreeBSD root when it has them */
     const char *froot = bsdulator_get_freebsd_root();
     char fabs[4096] = "";
-    if (jail_get_process_jid(pid) <= 0 && froot && froot[0] && realpath(froot, fabs)) {
+    if (!jail_proc_own_root(pid) && froot && froot[0] && realpath(froot, fabs)) {
         char cand[8192];
         snprintf(cand, sizeof(cand), "%s%s", fabs, absp);
         if (access(cand, F_OK) == 0) {
@@ -1764,11 +1764,11 @@ static long emul_realpathat(pid_t pid, uint64_t args[6]) {
 
     char rl[64];
     snprintf(rl, sizeof(rl), "/proc/%d/root", (int)pid);
-    int rfd = open(strcmp(rootdir, "/") && jail_get_process_jid(pid) <= 0 ? rootdir : rl,
+    int rfd = open(strcmp(rootdir, "/") && !jail_proc_own_root(pid) ? rootdir : rl,
                    O_PATH | O_DIRECTORY | O_CLOEXEC);
     if (rfd < 0) return -errno;
     const char *rel = absp;
-    if (jail_get_process_jid(pid) <= 0 && strcmp(rootdir, "/")) {
+    if (!jail_proc_own_root(pid) && strcmp(rootdir, "/")) {
         const char *u = under_root(absp, rootdir);
         if (u) rel = u;
     }

@@ -776,7 +776,6 @@ static int lochs_devfs_setup(lochs_jail_t *jail) {
     {
         const char *argv[] = { "mkdir", "-p",
             jail_subpath(p1, sizeof(p1), jail, "/dev/pts"),
-            jail_subpath(p2, sizeof(p2), jail, "/dev/fd"),
             jail_subpath(p3, sizeof(p3), jail, "/dev/shm"), NULL };
         if (lochs_run(argv, 0) != 0) {
             fprintf(stderr, "Warning: failed to create /dev directories\n");
@@ -820,19 +819,28 @@ static int lochs_devfs_setup(lochs_jail_t *jail) {
         { "/proc/self/fd/1",  "/dev/stdout" },
         { "/proc/self/fd/2",  "/dev/stderr" },
     };
+    /* Older lochs made /dev/fd a directory, and the link went inside it */
+    {
+        struct stat st;
+        jail_subpath(p1, sizeof(p1), jail, "/dev/fd");
+        if (lstat(p1, &st) == 0 && S_ISDIR(st.st_mode)) {
+            jail_subpath(p2, sizeof(p2), jail, "/dev/fd/fd");
+            unlink(p2);
+            rmdir(p1);
+        }
+    }
     for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); i++) {
         const char *argv[] = { "ln", "-sf", links[i][0],
             jail_subpath(p1, sizeof(p1), jail, links[i][1]), NULL };
         lochs_run(argv, LOCHS_RUN_QUIET);
     }
 
-    /* Mount /proc if not already present */
+    /* /proc is mounted by the container's PID 1 (lochs_ns.c), so it
+     * shows the container's processes and not the host's */
     {
         const char *mk_argv[] = { "mkdir", "-p",
             jail_subpath(p1, sizeof(p1), jail, "/proc"), NULL };
         lochs_run(mk_argv, 0);
-        const char *mnt_argv[] = { "mount", "-t", "proc", "proc", p1, NULL };
-        lochs_run(mnt_argv, LOCHS_RUN_QUIET);
     }
 
     printf("  Devices: /dev mounted\n");
@@ -1032,7 +1040,7 @@ int lochs_cmd_start(int argc, char **argv) {
 
     /* The container's own user, PID, mount, UTS and IPC namespaces: every
      * bsdulator run below joins them */
-    if (lochs_ns_start(jail->name) < 0)
+    if (lochs_ns_start(jail->name, jail->path) < 0)
         fprintf(stderr, "Warning: could not create namespaces for '%s'; running without them\n", name);
     char ns_arg[16];
 

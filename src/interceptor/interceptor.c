@@ -818,6 +818,9 @@ pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp
     int ns_pid = bsdulator_get_ns_pid();
     int ns_fd[3] = { -1, -1, -1 };
     int user_fd = -1;
+    int cap_last = 40;
+    const char *run_binary = binary;
+    char *const *run_argv = argv;
     static const char *ns_name[3] = { "mnt", "uts", "ipc" };
     static const int ns_type[3] = { CLONE_NEWNS, CLONE_NEWUTS, CLONE_NEWIPC };
     if (ns_pid > 0) {
@@ -847,6 +850,47 @@ pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp
                 BSD_ERROR("cannot open %s: %s", p, strerror(errno));
                 return -1;
             }
+        }
+        /* Read now: /proc is not mounted in the container */
+        FILE *cf = fopen("/proc/sys/kernel/cap_last_cap", "r");
+        if (cf) {
+            if (fscanf(cf, "%d", &cap_last) != 1) cap_last = 40;
+            fclose(cf);
+        }
+        /*
+         * A container whose holder did pivot_root has the FreeBSD root as
+         * its "/" and nothing of the host's filesystem. Its processes then
+         * use FreeBSD paths unchanged, and the host paths lochs passes on
+         * the command line are shortened to container paths.
+         */
+        const char *froot = bsdulator_get_freebsd_root();
+        struct stat hs, rs, me;
+        snprintf(p, sizeof(p), "/proc/%d/root/", ns_pid);
+        if (froot && froot[0] && stat(p, &hs) == 0 && stat(froot, &rs) == 0 &&
+            stat("/", &me) == 0 && hs.st_dev == rs.st_dev && hs.st_ino == rs.st_ino &&
+            !(me.st_dev == rs.st_dev && me.st_ino == rs.st_ino)) {
+            bsdulator_set_rooted(1);
+            run_binary = jail_visible_path(binary);
+            size_t n = 0;
+            while (argv[n]) n++;
+            char **na = calloc(n + 1, sizeof(char *));
+            if (!na) return -1;
+            for (size_t i = 0; i < n; i++) {
+                const char *v = jail_visible_path(argv[i]);
+                if (v == argv[i] && strncmp(argv[i], "path=", 5) == 0) {
+                    const char *pv = jail_visible_path(argv[i] + 5);
+                    if (pv != argv[i] + 5) {
+                        char *t = malloc(strlen(pv) + 6);
+                        if (t) {
+                            sprintf(t, "path=%s", pv);
+                            v = t;
+                        }
+                    }
+                }
+                na[i] = (char *)v;
+            }
+            run_argv = na;
+            BSD_INFO("container root is pivoted: running %s", run_binary);
         }
     }
     
@@ -921,12 +965,7 @@ pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp
                 10 /* NET_BIND_SERVICE */, 13 /* NET_RAW */, 18 /* SYS_CHROOT */,
                 27 /* MKNOD */, 29 /* AUDIT_WRITE */, 31 /* SETFCAP */,
             };
-            int last = 40;
-            FILE *cf = fopen("/proc/sys/kernel/cap_last_cap", "r");
-            if (cf) {
-                if (fscanf(cf, "%d", &last) != 1) last = 40;
-                fclose(cf);
-            }
+            int last = cap_last;
             for (int c = 0; c <= last; c++) {
                 int kept = 0;
                 for (size_t k = 0; k < sizeof(keep) / sizeof(keep[0]); k++)
@@ -948,7 +987,7 @@ pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp
         }
         
         raise(SIGSTOP);
-        execve(binary, argv, envp);
+        execve(run_binary, run_argv, envp);
         perror("execve");
         _exit(127);
     }
@@ -1254,7 +1293,7 @@ static int fix_argv0_after_exec(pid_t pid) {
      * root filesystem. Translating argv[0] would create an invalid path.
      */
     int jid = jail_get_process_jid(pid);
-    if (jid > 0) {
+    if (jail_proc_own_root(pid)) {
         BSD_TRACE("fix_argv0: skipping for jailed process (jid=%d)", jid);
         return 0;
     }
@@ -1531,10 +1570,10 @@ static long scratch_add(char *scratch, size_t *used, const char *s) {
 static int rewrite_freebsd_execve(pid_t pid, uint64_t *args) {
     int jid = jail_get_process_jid(pid);
 
-    /* The FreeBSD root as this process sees it: "" in a jail (chrooted),
-     * else the -r root on the host. */
+    /* The FreeBSD root as this process sees it: "" in a jail (chrooted) or
+     * a pivoted container, else the -r root on the host. */
     char root[1024] = "";
-    if (jid <= 0) {
+    if (!jail_proc_own_root(pid)) {
         const char *r = bsdulator_get_freebsd_root();
         if (!r || !r[0]) return 0;
         /* Absolute, so it still works after the program changes directory */
@@ -1739,7 +1778,7 @@ static int translate_freebsd_path(pid_t pid, int syscall_nr, uint64_t *args) {
      * resulting in paths like ./freebsd-root/bin/sh when /bin/sh is correct.
      */
     int jid = jail_get_process_jid(pid);
-    if (jid > 0) {
+    if (jail_proc_own_root(pid)) {
         BSD_TRACE("translate_freebsd_path: skipping for jailed process (jid=%d)", jid);
         return -1;
     }

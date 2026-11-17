@@ -183,6 +183,16 @@ int bsdulator_get_ns_pid(void) {
     return ns_holder_pid;
 }
 
+static int rooted_mode;
+
+void bsdulator_set_rooted(int on) {
+    rooted_mode = on;
+}
+
+int bsdulator_is_rooted(void) {
+    return rooted_mode;
+}
+
 /* Run a FreeBSD binary */
 int bsdulator_run(const char *binary, char *const argv[], char *const envp[]) {
     binary_info_t info;

@@ -63,5 +63,9 @@ void bsdulator_set_netns(const char *netns_name);
 const char *bsdulator_get_netns(void);
 void bsdulator_set_ns_pid(int pid);
 int bsdulator_get_ns_pid(void);
+/* Set when the container's mount namespace has the FreeBSD root as its own
+ * "/" (pivot_root): paths need no FreeBSD-root prefix */
+void bsdulator_set_rooted(int on);
+int bsdulator_is_rooted(void);
 
 #endif /* BSDULATOR_H */

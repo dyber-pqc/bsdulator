@@ -24,6 +24,7 @@
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <dirent.h>
@@ -79,7 +80,56 @@ pid_t lochs_ns_pid(const char *name) {
     return (v > 0 && is_holder((pid_t)v)) ? (pid_t)v : 0;
 }
 
-pid_t lochs_ns_start(const char *name) {
+/*
+ * A /proc of the container's own: it lists only the container's processes
+ * (the caller is PID 1 of its PID namespace). Like Docker, the parts that
+ * reach the kernel as a whole are read-only and a few files are hidden.
+ * Needed by /dev/fd, /dev/stdin and friends, which point into /proc/self.
+ */
+static void private_proc(const char *root) {
+    char p[4096], q[4200];
+    snprintf(p, sizeof(p), "%s/proc", root);
+    mkdir(p, 0555);
+    if (mount("proc", p, "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0) {
+        fprintf(stderr, "Warning: no private /proc (%s)\n", strerror(errno));
+        return;
+    }
+    static const char *ro[] = { "sys", "sysrq-trigger", "irq", "bus", "fs" };
+    for (size_t i = 0; i < sizeof(ro) / sizeof(ro[0]); i++) {
+        snprintf(q, sizeof(q), "%s/%s", p, ro[i]);
+        if (access(q, F_OK) == 0 && mount(q, q, NULL, MS_BIND | MS_REC, NULL) == 0)
+            mount(NULL, q, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL);
+    }
+    static const char *hide[] = { "kcore", "keys", "timer_list", "sched_debug", "latency_stats" };
+    for (size_t i = 0; i < sizeof(hide) / sizeof(hide[0]); i++) {
+        snprintf(q, sizeof(q), "%s/%s", p, hide[i]);
+        if (access(q, F_OK) == 0) mount("/dev/null", q, NULL, MS_BIND, NULL);
+    }
+}
+
+/*
+ * Make root the mount namespace's "/" and detach the host's filesystem
+ * from the namespace, so nothing outside the container exists there (with
+ * chroot alone it stays reachable). Returns 0 on success,
+ * 1 when pivot_root is unavailable and the namespace is unchanged, -1 when
+ * it failed half-way and the namespace must not be used.
+ */
+static int pivot_into(const char *root) {
+    if (!root || !root[0]) return 1;
+    /* pivot_root needs a mount point this namespace created itself */
+    if (mount(root, root, NULL, MS_BIND | MS_REC, NULL) < 0) return 1;
+    if (chdir(root) < 0) return 1;
+    /* Old root is stacked on "." and then detached: no directory needed */
+    if (syscall(SYS_pivot_root, ".", ".") < 0) {
+        if (chdir("/") < 0) return -1;
+        return 1;
+    }
+    if (umount2(".", MNT_DETACH) < 0) return -1;
+    if (chdir("/") < 0) return -1;
+    return 0;
+}
+
+pid_t lochs_ns_start(const char *name, const char *root) {
     pid_t existing = lochs_ns_pid(name);
     if (existing > 0) return existing;
 
@@ -116,8 +166,33 @@ pid_t lochs_ns_start(const char *name) {
              * nothing mounted inside leaks back to the host */
             mount(NULL, "/", NULL, MS_REC | MS_SLAVE, NULL);
             sethostname(name, strlen(name));
-            init = fork();
-            if (init == 0) holder_loop();
+            /* PID 1 sets up the filesystem: /proc must be mounted from
+             * inside the PID namespace to show only its processes */
+            int rp[2];
+            if (pipe(rp) == 0) {
+                init = fork();
+                if (init == 0) {
+                    close(rp[0]);
+                    if (root && root[0]) private_proc(root);
+                    int pv = pivot_into(root);
+                    if (pv > 0 && root && root[0])
+                        fprintf(stderr, "Warning: pivot_root failed for '%s' (%s); the host filesystem stays in its mount namespace\n",
+                                name, strerror(errno));
+                    char st = pv < 0 ? 0 : 1;
+                    ssize_t rw = write(rp[1], &st, 1);
+                    (void)rw;
+                    if (pv < 0) _exit(1);
+                    holder_loop();
+                }
+                close(rp[1]);
+                char st = 0;
+                if (init > 0 && (read(rp[0], &st, 1) != 1 || !st)) {
+                    fprintf(stderr, "Error: could not set up the root of '%s'\n", name);
+                    kill(init, SIGKILL);
+                    init = -1;
+                }
+                close(rp[0]);
+            }
         }
         w = write(pfd[1], &init, sizeof(init));
         (void)w;

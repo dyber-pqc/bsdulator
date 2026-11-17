@@ -179,6 +179,12 @@ int jail_get_next_jid(void);
 /* Get jail for a process (returns 0 if not jailed) */
 int jail_get_process_jid(pid_t pid);
 
+/* Does pid see the FreeBSD root as "/"? (jailed, or in a pivoted container) */
+int jail_proc_own_root(pid_t pid);
+
+/* A jail path as the process sees it (host prefix removed when pivoted) */
+const char *jail_visible_path(const char *path);
+
 /*
  * A process created by fork, vfork or clone is in the same jail as its
  * parent. Call when the tracer sees the new child. No-op if the parent is

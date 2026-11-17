@@ -624,6 +624,27 @@ int jail_get_process_jid(pid_t pid) {
     return 0;  /* Not in a jail */
 }
 
+int jail_proc_own_root(pid_t pid) {
+    return bsdulator_is_rooted() || jail_get_process_jid(pid) > 0;
+}
+
+/*
+ * In a pivoted container the FreeBSD root is the process's "/", so a jail
+ * path recorded as the host path of that root (older lochs, or a path= the
+ * tracer saw before stripping) is shortened to what the process sees.
+ */
+const char *jail_visible_path(const char *path) {
+    if (!path || !bsdulator_is_rooted()) return path;
+    const char *r = bsdulator_get_freebsd_root();
+    if (!r) return path;
+    size_t rl = strlen(r);
+    while (rl > 1 && r[rl - 1] == '/') rl--;
+    if (rl <= 1 || strncmp(path, r, rl) != 0) return path;
+    if (path[rl] == 0) return "/";
+    if (path[rl] == '/') return path + rl;
+    return path;
+}
+
 void jail_inherit_process(pid_t parent, pid_t child) {
     int jid = jail_get_process_jid(parent);
     if (jid <= 0 || child <= 0) return;
@@ -1210,7 +1231,7 @@ long emul_jail_attach(pid_t pid, uint64_t args[6]) {
      * but tracing shows jexec does jail_attach FIRST, then chdir("/").
      * So we must chroot to the actual jail path, not ".".
      */
-    const char *chroot_path = jail->path;
+    const char *chroot_path = jail_visible_path(jail->path);
     size_t path_len = strlen(chroot_path) + 1;
     uint64_t path_addr = (regs.rsp - path_len - 128) & ~0xFULL;  /* Align to 16 bytes */
     

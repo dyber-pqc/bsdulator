@@ -10,7 +10,7 @@
 
 /* Create the container's namespaces (holder process); returns its host
  * pid, the existing one if already running, or -1 */
-pid_t lochs_ns_start(const char *name);
+pid_t lochs_ns_start(const char *name, const char *root);
 
 /* Holder pid of a running container, or 0 */
 pid_t lochs_ns_pid(const char *name);
