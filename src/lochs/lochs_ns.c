@@ -31,6 +31,7 @@
 #include <dirent.h>
 #include <ftw.h>
 
+#include "bsdulator/lochs.h"
 #include "bsdulator/lochs_exec.h"
 
 #include "bsdulator/lochs_ns.h"
@@ -172,6 +173,10 @@ pid_t lochs_ns_start(const char *name, const char *root) {
         close(up[0]);
         close(go[1]);
         setsid();
+        /* Into the container's cgroup (lochs_cgroup_apply_limits), while
+         * still host root: everything in the container descends from
+         * here, and bsdulator -N joins the same cgroup */
+        if (lochs_cgroup_join(name) != 0) _exit(1);
         /* Into the root while still host root: unsharing the mount
          * namespace moves the working directory onto its copy there, and
          * the root is then set up from "." */
@@ -182,7 +187,10 @@ pid_t lochs_ns_start(const char *name, const char *root) {
         if (read(go[0], &ok, 1) != 1) ok = 0;
         pid_t init = -1;
         if (userns && !ok) _exit(1);
-        if (unshare(CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWPID) == 0) {
+        /* A cgroup namespace too: the container sees its cgroup as "/" */
+        int nsflags = CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWPID;
+        int made = unshare(nsflags | CLONE_NEWCGROUP) == 0 || unshare(nsflags) == 0;
+        if (made) {
             /* Host mounts made later (volumes) still reach the container;
              * nothing mounted inside leaks back to the host */
             mount(NULL, "/", NULL, MS_REC | MS_SLAVE, NULL);

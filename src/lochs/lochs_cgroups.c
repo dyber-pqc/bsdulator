@@ -8,6 +8,19 @@
  *   /sys/fs/cgroup/lochs/              (parent for all containers)
  *   /sys/fs/cgroup/lochs/<name>/       (per-container cgroup)
  *
+ * Limits are on by default, so no container (or all of them together)
+ * can exhaust the host:
+ *   lochs/         memory 3/4 of RAM, swap 1/2 of swap, 3/4 of the
+ *                  kernel's thread limit, 90% of all CPUs (set only where
+ *                  unset, so an administrator's values stay)
+ *   lochs/<name>/  memory 1/2 of RAM and 4096 processes unless set with
+ *                  --memory / --pids-limit; CPU shared by weight unless
+ *                  --cpus is given
+ * The container's holder is put in its cgroup, and every bsdulator run
+ * that joins the container (-N) joins it too, so everything running in
+ * the container is counted: the tracer, lochs exec, CMD, health checks
+ * and build steps.
+ *
  * Controllers used:
  *   cpu.max        - CPU bandwidth limit (quota/period microseconds)
  *   cpu.weight     - CPU scheduling weight (1-10000, default 100)
@@ -32,11 +45,13 @@
 #include <errno.h>
 #include <signal.h>
 #include <limits.h>
+#include <fcntl.h>
 #include "bsdulator/lochs.h"
 
 #define CGROUP_BASE     "/sys/fs/cgroup"
 #define CGROUP_LOCHS    "/sys/fs/cgroup/lochs"
 #define CPU_PERIOD_US   100000  /* 100ms default period */
+#define DEFAULT_PIDS    4096
 
 /* Helper to safely copy strings */
 static void safe_strcpy(char *dst, const char *src, size_t dst_size) {
@@ -90,6 +105,55 @@ static int cgroup_read(const char *path, char *buf, size_t buf_size) {
     return (int)len;
 }
 
+/* Write without complaint (optional controllers, best effort) */
+static int cgroup_write_quiet(const char *path, const char *value) {
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    ssize_t n = write(fd, value, strlen(value));
+    close(fd);
+    return n == (ssize_t)strlen(value) ? 0 : -1;
+}
+
+/* A /proc/meminfo field in bytes, or 0 */
+static int64_t meminfo_bytes(const char *key) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    size_t kl = strlen(key);
+    int64_t v = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, key, kl) == 0 && line[kl] == ':') {
+            v = (int64_t)atoll(line + kl + 1) * 1024;
+            break;
+        }
+    }
+    fclose(f);
+    return v;
+}
+
+static long read_long(const char *path) {
+    char buf[64];
+    if (cgroup_read(path, buf, sizeof(buf)) <= 0) return 0;
+    return atol(buf);
+}
+
+/* The default memory limit of one container: half the host's RAM */
+int64_t lochs_cgroup_default_memory(void) {
+    return meminfo_bytes("MemTotal") / 2;
+}
+
+int lochs_cgroup_default_pids(void) {
+    return DEFAULT_PIDS;
+}
+
+/* Set an aggregate limit on lochs/ unless one is set already */
+static void parent_limit(const char *file, const char *value) {
+    char path[256], cur[64];
+    snprintf(path, sizeof(path), "%s/%s", CGROUP_LOCHS, file);
+    if (cgroup_read(path, cur, sizeof(cur)) > 0 && strncmp(cur, "max", 3) == 0)
+        cgroup_write_quiet(path, value);
+}
+
 /*
  * Check if cgroups v2 (unified hierarchy) is available
  */
@@ -118,8 +182,8 @@ int lochs_cgroup_is_v2(void) {
 }
 
 /*
- * Initialize the lochs cgroup parent directory.
- * Enables cpu, memory, pids controllers for child cgroups.
+ * Initialize the lochs cgroup parent directory: cpu, memory and pids for
+ * its children, and the aggregate limits for all containers together.
  */
 int lochs_cgroup_init(void) {
     if (!lochs_cgroup_is_v2()) {
@@ -134,33 +198,36 @@ int lochs_cgroup_init(void) {
         return -1;
     }
 
-    /*
-     * Enable controllers in the parent so children can use them.
-     * We need to enable them at the root level first, then in our parent.
-     *
-     * Write to /sys/fs/cgroup/cgroup.subtree_control
-     */
-    char subtree_path[256];
-    snprintf(subtree_path, sizeof(subtree_path),
-             "%s/cgroup.subtree_control", CGROUP_BASE);
-
-    /* Try to enable each controller (may already be enabled) */
-    /* Ignore errors - controller might already be active or not available */
-    FILE *f = fopen(subtree_path, "w");
-    if (f) {
-        fputs("+cpu +memory +pids", f);
-        fclose(f);
+    /* Controllers one at a time: one the kernel lacks must not stop the
+     * others (each may already be on) */
+    static const char *ctl[] = { "+cpu", "+memory", "+pids", NULL };
+    for (int i = 0; ctl[i]; i++) {
+        cgroup_write_quiet(CGROUP_BASE "/cgroup.subtree_control", ctl[i]);
+        cgroup_write_quiet(CGROUP_LOCHS "/cgroup.subtree_control", ctl[i]);
     }
 
-    /* Also enable in the lochs parent for child containers */
-    snprintf(subtree_path, sizeof(subtree_path),
-             "%s/cgroup.subtree_control", CGROUP_LOCHS);
-    f = fopen(subtree_path, "w");
-    if (f) {
-        fputs("+cpu +memory +pids", f);
-        fclose(f);
+    /* All containers together */
+    char v[64];
+    int64_t mem = meminfo_bytes("MemTotal");
+    if (mem > 0) {
+        snprintf(v, sizeof(v), "%lld", (long long)(mem / 4 * 3));
+        parent_limit("memory.max", v);
     }
-
+    int64_t swap = meminfo_bytes("SwapTotal");
+    snprintf(v, sizeof(v), "%lld", (long long)(swap / 2));
+    parent_limit("memory.swap.max", v);
+    long threads = read_long("/proc/sys/kernel/threads-max");
+    long pid_max = read_long("/proc/sys/kernel/pid_max");
+    if (pid_max > 0 && (threads <= 0 || pid_max < threads)) threads = pid_max;
+    if (threads > 0) {
+        snprintf(v, sizeof(v), "%ld", threads / 4 * 3);
+        parent_limit("pids.max", v);
+    }
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu > 0) {
+        snprintf(v, sizeof(v), "%ld %d", ncpu * CPU_PERIOD_US / 10 * 9, CPU_PERIOD_US);
+        parent_limit("cpu.max", v);
+    }
     return 0;
 }
 
@@ -168,8 +235,7 @@ int lochs_cgroup_init(void) {
  * Create a cgroup for a container
  */
 int lochs_cgroup_create(const char *container_name) {
-    /* Initialize parent if needed */
-    lochs_cgroup_init();
+    if (lochs_cgroup_init() != 0) return -1;
 
     char cgroup_dir[512];
     snprintf(cgroup_dir, sizeof(cgroup_dir), "%s/%s", CGROUP_LOCHS, container_name);
@@ -181,6 +247,48 @@ int lochs_cgroup_create(const char *container_name) {
     }
 
     return 0;
+}
+
+/*
+ * A container's cgroup with its limits; 0 means the default for each
+ * (memory: half the RAM; pids: 4096; CPU: no cap, weight 100). swap as
+ * for lochs_cgroup_set_memory when memory is given, else no own limit
+ * (the aggregate one applies).
+ */
+int lochs_cgroup_setup(const char *name, int millicores, int weight,
+                       int64_t memory, int64_t swap, int pids) {
+    if (lochs_cgroup_create(name) != 0) return -1;
+    char path[512], v[64];
+
+    int rc = 0;
+    if (lochs_cgroup_set_cpu(name, millicores, weight > 0 ? weight : 100) != 0) rc = -1;
+
+    if (memory > 0) {
+        if (lochs_cgroup_set_memory(name, memory, swap) != 0) rc = -1;
+    } else {
+        snprintf(path, sizeof(path), "%s/%s/memory.max", CGROUP_LOCHS, name);
+        snprintf(v, sizeof(v), "%lld", (long long)lochs_cgroup_default_memory());
+        if (lochs_cgroup_default_memory() <= 0 || cgroup_write(path, v) != 0) rc = -1;
+        snprintf(path, sizeof(path), "%s/%s/memory.swap.max", CGROUP_LOCHS, name);
+        cgroup_write_quiet(path, "max");
+    }
+
+    if (lochs_cgroup_set_pids(name, pids > 0 ? pids : DEFAULT_PIDS) != 0) rc = -1;
+    return rc;
+}
+
+/*
+ * Put the calling process in a container's cgroup (its children follow).
+ * 0 if it has none (cgroups unavailable).
+ */
+int lochs_cgroup_join(const char *name) {
+    char path[512], v[32];
+    struct stat st;
+    snprintf(path, sizeof(path), "%s/%s", CGROUP_LOCHS, name);
+    if (stat(path, &st) != 0) return 0;
+    snprintf(path, sizeof(path), "%s/%s/cgroup.procs", CGROUP_LOCHS, name);
+    snprintf(v, sizeof(v), "%d", (int)getpid());
+    return cgroup_write_quiet(path, v);
 }
 
 /*
@@ -305,125 +413,74 @@ int lochs_cgroup_add_pid(const char *container_name, pid_t pid) {
 }
 
 /*
- * Destroy a container's cgroup
- * All processes must have exited first.
+ * Destroy a container's cgroup, ending anything left in it.
  */
 int lochs_cgroup_destroy(const char *container_name) {
     char cgroup_dir[256];
     snprintf(cgroup_dir, sizeof(cgroup_dir), "%s/%s", CGROUP_LOCHS, container_name);
+    struct stat st;
+    if (stat(cgroup_dir, &st) != 0) return 0;
 
-    /* First, try to kill any remaining processes in the cgroup */
-    char procs_path[512];
-    snprintf(procs_path, sizeof(procs_path), "%s/%s/cgroup.procs", CGROUP_LOCHS, container_name);
-
-    FILE *f = fopen(procs_path, "r");
-    if (f) {
-        char line[32];
-        while (fgets(line, sizeof(line), f)) {
-            pid_t pid = (pid_t)atoi(line);
-            if (pid > 0) {
-                kill(pid, 9);  /* SIGKILL remaining processes */
+    /* cgroup.kill (5.14+) ends every process in it at once; else one by one */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/cgroup.kill", cgroup_dir);
+    if (cgroup_write_quiet(path, "1") != 0) {
+        snprintf(path, sizeof(path), "%s/cgroup.procs", cgroup_dir);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            char line[32];
+            while (fgets(line, sizeof(line), f)) {
+                pid_t pid = (pid_t)atoi(line);
+                if (pid > 0) kill(pid, SIGKILL);
             }
-        }
-        fclose(f);
-    }
-
-    /* Wait a moment for processes to exit */
-    usleep(100000);  /* 100ms */
-
-    /* Remove the cgroup directory (must be empty of processes) */
-    if (rmdir(cgroup_dir) != 0 && errno != ENOENT) {
-        /* Try again after a short delay */
-        usleep(500000);  /* 500ms */
-        if (rmdir(cgroup_dir) != 0 && errno != ENOENT) {
-            fprintf(stderr, "Warning: could not remove cgroup '%s': %s\n",
-                    cgroup_dir, strerror(errno));
-            return -1;
+            fclose(f);
         }
     }
 
-    return 0;
+    /* Removable once the last process is gone */
+    for (int i = 0; i < 100; i++) {
+        if (rmdir(cgroup_dir) == 0 || errno == ENOENT) return 0;
+        usleep(20000);
+    }
+    fprintf(stderr, "Warning: could not remove cgroup '%s': %s\n",
+            cgroup_dir, strerror(errno));
+    return -1;
 }
 
 /*
- * Apply all configured resource limits for a container.
- * Called during lochs start after cgroup creation.
- * Returns 0 on success, -1 on error.
+ * Apply the container's resource limits: the ones it was created with,
+ * defaults for the rest. Called during lochs start, before its namespaces
+ * are made (the holder joins the cgroup). Returns 0 on success, -1 on
+ * error.
  */
 int lochs_cgroup_apply_limits(lochs_jail_t *jail) {
-    int has_limits = (jail->cpus_millicores > 0 ||
-                      jail->memory_limit > 0 ||
-                      jail->pids_limit > 0 ||
-                      jail->cpu_weight > 0);
-
-    if (!has_limits) return 0;
-
     if (!lochs_cgroup_is_v2()) {
-        fprintf(stderr, "Warning: cgroups v2 not available, skipping resource limits\n");
+        fprintf(stderr, "Warning: cgroups v2 not available, no resource limits for '%s'\n",
+                jail->name);
         return -1;
     }
 
-    /* Create the cgroup */
-    if (lochs_cgroup_create(jail->name) != 0) {
-        fprintf(stderr, "Error: failed to create cgroup for '%s'\n", jail->name);
-        return -1;
+    if (lochs_cgroup_setup(jail->name, jail->cpus_millicores, jail->cpu_weight,
+                           jail->memory_limit, jail->memory_swap_limit,
+                           jail->pids_limit) != 0) {
+        fprintf(stderr, "Warning: resource limits for '%s' are incomplete\n", jail->name);
     }
 
-    printf("  Resource limits:\n");
-
-    /* Apply CPU limits */
-    if (jail->cpus_millicores > 0 || jail->cpu_weight > 0) {
-        if (lochs_cgroup_set_cpu(jail->name, jail->cpus_millicores, jail->cpu_weight) == 0) {
-            if (jail->cpus_millicores > 0) {
-                int whole = jail->cpus_millicores / 1000;
-                int frac = (jail->cpus_millicores % 1000) / 100;
-                if (frac > 0) {
-                    printf("    CPU:     %d.%d cores\n", whole, frac);
-                } else {
-                    printf("    CPU:     %d core%s\n", whole, whole == 1 ? "" : "s");
-                }
-            }
-            if (jail->cpu_weight > 0) {
-                printf("    CPU wt:  %d\n", jail->cpu_weight);
-            }
-        } else {
-            fprintf(stderr, "    Warning: failed to set CPU limits\n");
-        }
-    }
-
-    /* Apply memory limits */
-    if (jail->memory_limit > 0) {
-        if (lochs_cgroup_set_memory(jail->name, jail->memory_limit,
-                                     jail->memory_swap_limit) == 0) {
-            /* Human-readable memory display */
-            char mem_str[32];
-            if (jail->memory_limit >= (int64_t)1024 * 1024 * 1024) {
-                snprintf(mem_str, sizeof(mem_str), "%.1fG",
-                         (double)jail->memory_limit / (1024.0 * 1024.0 * 1024.0));
-            } else if (jail->memory_limit >= 1024 * 1024) {
-                snprintf(mem_str, sizeof(mem_str), "%lldM",
-                         (long long)(jail->memory_limit / (1024 * 1024)));
-            } else if (jail->memory_limit >= 1024) {
-                snprintf(mem_str, sizeof(mem_str), "%lldK",
-                         (long long)(jail->memory_limit / 1024));
-            } else {
-                snprintf(mem_str, sizeof(mem_str), "%lldB",
-                         (long long)jail->memory_limit);
-            }
-            printf("    Memory:  %s\n", mem_str);
-        } else {
-            fprintf(stderr, "    Warning: failed to set memory limits\n");
-        }
-    }
-
-    /* Apply PID limits */
-    if (jail->pids_limit > 0) {
-        if (lochs_cgroup_set_pids(jail->name, jail->pids_limit) == 0) {
-            printf("    PIDs:    %d max\n", jail->pids_limit);
-        } else {
-            fprintf(stderr, "    Warning: failed to set PID limit\n");
-        }
-    }
+    char mem_str[32];
+    int64_t mem = jail->memory_limit > 0 ? jail->memory_limit : lochs_cgroup_default_memory();
+    if (mem >= (int64_t)1024 * 1024 * 1024)
+        snprintf(mem_str, sizeof(mem_str), "%.1fG", (double)mem / (1024.0 * 1024.0 * 1024.0));
+    else
+        snprintf(mem_str, sizeof(mem_str), "%lldM", (long long)(mem / (1024 * 1024)));
+    printf("Resource limits: memory %s%s, %d processes%s",
+           mem_str, jail->memory_limit > 0 ? "" : " (default)",
+           jail->pids_limit > 0 ? jail->pids_limit : DEFAULT_PIDS,
+           jail->pids_limit > 0 ? "" : " (default)");
+    if (jail->cpus_millicores > 0)
+        printf(", CPU %d.%d", jail->cpus_millicores / 1000, (jail->cpus_millicores % 1000) / 100);
+    if (jail->cpu_weight > 0)
+        printf(", CPU weight %d", jail->cpu_weight);
+    printf("\n");
 
     jail->cgroup_applied = 1;
     return 0;
@@ -434,9 +491,6 @@ int lochs_cgroup_apply_limits(lochs_jail_t *jail) {
  * Called during lochs stop.
  */
 int lochs_cgroup_cleanup(lochs_jail_t *jail) {
-    if (!jail->cgroup_applied) return 0;
-
-    printf("  Cgroup: cleaning up\n");
     lochs_cgroup_destroy(jail->name);
     jail->cgroup_applied = 0;
 
@@ -472,7 +526,7 @@ int lochs_cgroup_get_stats(const char *container_name) {
     snprintf(path, sizeof(path), "%s/%s", CGROUP_LOCHS, container_name);
     struct stat st;
     if (stat(path, &st) != 0) {
-        printf("  No cgroup active (no resource limits configured)\n");
+        printf("  No cgroup (cgroups v2 unavailable)\n");
         return 0;
     }
 
@@ -764,15 +818,13 @@ int lochs_cmd_stats(int argc, char **argv) {
     }
 
     if (!has_limits) {
-        printf("    (none)\n");
+        printf("    (none set: defaults apply)\n");
     }
 
     /* Show live stats if container is running and has a cgroup */
-    if (jail->state == JAIL_STATE_RUNNING && jail->cgroup_applied) {
+    if (jail->state == JAIL_STATE_RUNNING) {
         printf("\n  Live Statistics:\n");
         lochs_cgroup_get_stats(jail->name);
-    } else if (jail->state == JAIL_STATE_RUNNING) {
-        printf("\n  No cgroup active (resource limits not configured)\n");
     } else {
         printf("\n  Container is not running. Start it to see live statistics.\n");
     }

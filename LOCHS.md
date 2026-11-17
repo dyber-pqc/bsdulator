@@ -69,7 +69,7 @@ FreeBSD jails were the original container technology (introduced in 2000, 13 yea
 
 ### Developer Experience  
 - **⚡ Fast Startup** — Jails start in milliseconds, not seconds
-- **📊 Resource Limits** — CPU, memory, and I/O constraints via rctl
+- **📊 Resource Limits** — memory, process and CPU limits via cgroups v2, on by default
 - **🔍 Introspection** — `lochs ps`, `lochs logs`, `lochs exec`
 - **🎯 GPU Passthrough** — NVIDIA/AMD GPU access for ML workloads (Zernel)
 
@@ -842,18 +842,23 @@ lochs create app --image freebsd:15 --read-only --tmpfs /tmp
 
 ### Resource Limits
 
+Every container runs in its own cgroup (v2) with limits on by default: memory up to half the host's RAM and 4096 processes, with CPU shared by weight. All containers together are held to 3/4 of RAM, half the swap, 3/4 of the kernel's thread limit and 90% of the CPUs (`/sys/fs/cgroup/lochs`; values an administrator has set there are kept). The tracer, `lochs exec`, `CMD`, health checks and `lochs build` RUN steps all count against the container's limits.
+
 ```bash
-# Memory limit
+# Memory limit (no swap unless --memory-swap is given)
 lochs create app --image freebsd:15 -m 512M
 
 # CPU limit (number of cores)
 lochs create app --image freebsd:15 --cpus 2
 
-# CPU shares (relative weight)
-lochs create app --image freebsd:15 --cpu-shares 512
+# CPU weight (relative share, 1-10000, default 100)
+lochs create app --image freebsd:15 --cpu-weight 512
 
 # Combined limits
 lochs create app --image freebsd:15 -m 1G --cpus 4 --pids-limit 100
+
+# Usage against the limits
+lochs stats app
 ```
 
 ### Capabilities
@@ -1288,7 +1293,7 @@ make lint
 - [x] Clean `/etc/hosts` per container (no duplication)
 - [ ] DNS hostname resolution (getaddrinfo syscall emulation)
 - [ ] Health checks
-- [ ] Resource limits (memory, CPU via cgroups)
+- [x] Resource limits (memory, processes, CPU via cgroups v2; on by default)
 - [ ] Restart policies
 - [ ] ifconfig inside jail (netlink emulation)
 

@@ -312,6 +312,13 @@ int lochs_cgroup_destroy(const char *container_name);
 int lochs_cgroup_get_stats(const char *container_name);
 int lochs_cgroup_apply_limits(lochs_jail_t *jail);
 int lochs_cgroup_cleanup(lochs_jail_t *jail);
+/* A cgroup with these limits (0: the default for each) */
+int lochs_cgroup_setup(const char *name, int millicores, int weight,
+                       int64_t memory, int64_t swap, int pids);
+/* Put the caller in a container's cgroup, if it has one */
+int lochs_cgroup_join(const char *name);
+int64_t lochs_cgroup_default_memory(void);
+int lochs_cgroup_default_pids(void);
 int64_t lochs_parse_memory_size(const char *str);
 int lochs_parse_cpus(const char *str);
 

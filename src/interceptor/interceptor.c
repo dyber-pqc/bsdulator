@@ -829,12 +829,12 @@ static int fixup_freebsd_entry(pid_t pid) {
 
 static struct {
     int active;
-    int net_fd, user_fd, ns_fd[3];
+    int net_fd, user_fd, ns_fd[4];
     int cap_last;
     uid_t host_uid;
     const char *binary;
     char *const *argv;
-} ct = { 0, -1, -1, { -1, -1, -1 }, 40, 0, NULL, NULL };
+} ct = { 0, -1, -1, { -1, -1, -1, -1 }, 40, 0, NULL, NULL };
 
 /* Docker's default capabilities: the bounding set of container processes */
 static const int keep[] = {
@@ -880,10 +880,56 @@ static char *const *strip_argv(char *const argv[]) {
     return na;
 }
 
+/*
+ * Into the cgroup of the container's holder (lochs puts it in one with the
+ * container's resource limits): the front, the tracer and every program
+ * it runs are then counted against them. 0 if the holder has none.
+ */
+static int join_holder_cgroup(int ns_pid) {
+    char p[64], line[512];
+    snprintf(p, sizeof(p), "/proc/%d/cgroup", ns_pid);
+    FILE *f = fopen(p, "r");
+    if (!f) return -1;
+    char cg[512] = "";
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "0::", 3) == 0) {
+            size_t n = strcspn(line + 3, "\n");
+            if (n < sizeof(cg)) {
+                memcpy(cg, line + 3, n);
+                cg[n] = '\0';
+            }
+            break;
+        }
+    }
+    fclose(f);
+    /* Only lochs' own cgroups; nothing else is joined */
+    if (strncmp(cg, "/lochs/", 7) != 0) return 0;
+    for (const char *c = cg + 7; *c; c++) {
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+              (*c >= '0' && *c <= '9') || *c == '-' || *c == '_' || *c == '.'))
+            return -1;
+    }
+    if (strstr(cg, "..")) return -1;
+    char procs[600], pid[16];
+    snprintf(procs, sizeof(procs), "/sys/fs/cgroup%s/cgroup.procs", cg);
+    int n = snprintf(pid, sizeof(pid), "%d", (int)getpid());
+    int fd = open(procs, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    int ok = write(fd, pid, (size_t)n) == n;
+    close(fd);
+    return ok ? 0 : -1;
+}
+
 int interceptor_container_prepare(const char *binary, char *const argv[]) {
     int ns_pid = bsdulator_get_ns_pid();
     if (ns_pid <= 0) return 0;
     char p[128];
+
+    /* Resource limits apply to everything that enters the container */
+    if (join_holder_cgroup(ns_pid) < 0) {
+        BSD_ERROR("cannot join the cgroup of %d: %s", ns_pid, strerror(errno));
+        return -1;
+    }
 
     /* Only a pivoted root with its own user namespace; else the tracer
      * stays outside (interceptor_spawn) */
@@ -930,11 +976,12 @@ int interceptor_container_prepare(const char *binary, char *const argv[]) {
     }
     snprintf(p, sizeof(p), "/proc/%d/ns/user", ns_pid);
     ct.user_fd = open(p, O_RDONLY | O_CLOEXEC);
-    static const char *names[3] = { "mnt", "uts", "ipc" };
-    for (int i = 0; i < 3; i++) {
+    static const char *names[4] = { "mnt", "uts", "ipc", "cgroup" };
+    for (int i = 0; i < 4; i++) {
         snprintf(p, sizeof(p), "/proc/%d/ns/%s", ns_pid, names[i]);
         ct.ns_fd[i] = open(p, O_RDONLY | O_CLOEXEC);
-        if (ct.ns_fd[i] < 0) {
+        /* The cgroup namespace is optional (older kernels) */
+        if (ct.ns_fd[i] < 0 && i < 3) {
             BSD_ERROR("cannot open %s: %s", p, strerror(errno));
             return -1;
         }
@@ -962,8 +1009,8 @@ int interceptor_container_prepare(const char *binary, char *const argv[]) {
 static void ct_close(void) {
     if (ct.net_fd >= 0) close(ct.net_fd);
     if (ct.user_fd >= 0) close(ct.user_fd);
-    for (int i = 0; i < 3; i++) if (ct.ns_fd[i] >= 0) close(ct.ns_fd[i]);
-    ct.net_fd = ct.user_fd = ct.ns_fd[0] = ct.ns_fd[1] = ct.ns_fd[2] = -1;
+    for (int i = 0; i < 4; i++) if (ct.ns_fd[i] >= 0) close(ct.ns_fd[i]);
+    ct.net_fd = ct.user_fd = ct.ns_fd[0] = ct.ns_fd[1] = ct.ns_fd[2] = ct.ns_fd[3] = -1;
 }
 
 void interceptor_container_front(void) {
@@ -977,7 +1024,7 @@ void interceptor_container_front(void) {
 }
 
 int interceptor_container_enter(void) {
-    static const int types[3] = { CLONE_NEWNS, CLONE_NEWUTS, CLONE_NEWIPC };
+    static const int types[4] = { CLONE_NEWNS, CLONE_NEWUTS, CLONE_NEWIPC, CLONE_NEWCGROUP };
     /* The network namespace belongs to the host: joined while host root */
     if (ct.net_fd >= 0 && setns(ct.net_fd, CLONE_NEWNET) < 0) {
         fprintf(stderr, "Failed to enter the network namespace: %s\n", strerror(errno));
@@ -987,7 +1034,8 @@ int interceptor_container_enter(void) {
         fprintf(stderr, "Failed to enter the user namespace: %s\n", strerror(errno));
         return -1;
     }
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
+        if (ct.ns_fd[i] < 0) continue;
         if (setns(ct.ns_fd[i], types[i]) < 0) {
             fprintf(stderr, "Failed to enter a container namespace: %s\n", strerror(errno));
             return -1;

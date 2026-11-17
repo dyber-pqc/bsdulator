@@ -427,6 +427,7 @@ static const char *box_devices[] = { "null", "zero", "random", "urandom", NULL }
 
 static void box_down(build_box_t *b) {
     if (b->holder) lochs_ns_stop(b->name);
+    lochs_cgroup_destroy(b->name);
     if (b->netns[0]) lochs_ns_net_down(b->name);
     for (int i = 0; box_devices[i]; i++) {
         char p[700];
@@ -506,6 +507,10 @@ static int box_up(build_box_t *b, const char *image_id, const char *build_dir, i
         fprintf(stderr, "Warning: no network for the build\n");
         b->netns[0] = '\0';
     }
+
+    /* The default resource limits, as for any container */
+    if (lochs_cgroup_setup(b->name, 0, 0, 0, 0, 0) != 0)
+        fprintf(stderr, "Warning: no resource limits for the build\n");
 
     if (lochs_ns_start(b->name, b->root) < 0) {
         fprintf(stderr, "Error: cannot create the build's namespaces\n");

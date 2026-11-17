@@ -1090,11 +1090,9 @@ int lochs_cmd_start(int argc, char **argv) {
         }
     }
     
-    /* Apply cgroup resource limits before starting the jail */
-    if (jail->cpus_millicores > 0 || jail->memory_limit > 0 ||
-        jail->pids_limit > 0 || jail->cpu_weight > 0) {
-        lochs_cgroup_apply_limits(jail);
-    }
+    /* Resource limits (defaults unless set): before the namespaces, whose
+     * holder joins the cgroup, as does every bsdulator run that joins it */
+    lochs_cgroup_apply_limits(jail);
 
     /* Write environment file for container */
     if (jail->env_count > 0) {
@@ -1373,10 +1371,8 @@ int lochs_cmd_stop(int argc, char **argv) {
         fprintf(stderr, "Warning: jail -r returned error, but marking as stopped\n");
     }
 
-    /* Clean up cgroup resource limits */
-    if (jail->cgroup_applied) {
-        lochs_cgroup_cleanup(jail);
-    }
+    /* The container's cgroup, and anything still in it */
+    lochs_cgroup_cleanup(jail);
 
     /* Unmount overlay filesystem */
     if (jail->overlay_mounted) {
