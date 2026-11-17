@@ -31,6 +31,8 @@
 #include "runtime/freebsd_runtime.h"
 #include "bsdulator/jail.h"
 #include "bsdulator/signal_emul.h"
+#include "bsdulator/kqueue_emul.h"
+#include "bsdulator/msg_emul.h"
 
 #ifndef __NR_process_vm_readv
 #define __NR_process_vm_readv 310
@@ -1884,6 +1886,7 @@ static void remove_process(pid_t pid) {
      * process that is not in the jail. */
     jail_forget_process(pid);
     sig_proc_exit(pid);
+    kq_proc_exit(pid);
 }
 
 /* Count active processes */
@@ -2172,6 +2175,7 @@ int interceptor_wait(interceptor_state_t *state) {
                     set_in_syscall(state->pid, 0);
                     set_skip_post_exec(state->pid, 1);  /* Per-process flag! */
                     sig_proc_exec(state->pid);
+                    kq_proc_exec(state->pid);
                     
                     /*
                      * CRITICAL: Skip all FreeBSD environment setup for jailed processes!
@@ -2410,6 +2414,26 @@ static long fixup_mmap_alignment(pid_t pid __attribute__((unused)),
     return (long)aligned_addr;
 }
 
+/*
+ * Convert a socket address the kernel wrote (Linux layout: 16-bit family)
+ * to FreeBSD's (8-bit sa_len, 8-bit family; AF_INET6 is 28, not 10).
+ */
+static void sockaddr_out_to_freebsd(pid_t pid, uint64_t addr_ptr, uint64_t len_ptr) {
+    if (!addr_ptr || !len_ptr) return;
+    uint32_t len = 0;
+    if (interceptor_read_mem(pid, &len, (const void *)len_ptr, sizeof(len)) != sizeof(len) || len < 2)
+        return;
+    uint8_t a[128];
+    if (len > sizeof(a)) len = sizeof(a);
+    if (interceptor_read_mem(pid, a, (const void *)addr_ptr, len) != (ssize_t)len) return;
+    uint16_t fam;
+    memcpy(&fam, a, 2);
+    uint8_t f = fam == 10 ? 28 : (uint8_t)fam;  /* AF_INET6 */
+    a[0] = (uint8_t)len;
+    a[1] = f;
+    (void)interceptor_write_mem(pid, a, (void *)addr_ptr, len);
+}
+
 /* Main interception loop */
 int interceptor_run(interceptor_state_t *state) {
     /* Initialize process table */
@@ -2457,6 +2481,11 @@ int interceptor_run(interceptor_state_t *state) {
             case EVENT_SYSCALL_ENTER: {
                 state->syscall_count++;
 
+                if (kq_on_syscall_entry(state->pid)) {
+                    /* A step of a kevent/kqueue chain: already Linux */
+                    save_syscall_state(state);
+                    break;
+                }
                 if (sig_on_syscall_entry(state->pid, state->syscall_nr)) {
                     /* The kernel resuming an interrupted sleep
                      * (restart_syscall): a Linux syscall, run it as is. */
@@ -2603,10 +2632,19 @@ int interceptor_run(interceptor_state_t *state) {
                                 case FBSD_SYS_sigsuspend:  actual_linux_nr = SYS_rt_sigsuspend; break;
                                 case FBSD_SYS_procctl:     actual_linux_nr = SYS_prctl; break;
                                 case FBSD_SYS_wait6:       actual_linux_nr = SYS_wait4; break;
+                                case FBSD_SYS_ioctl:       actual_linux_nr = SYS_ioctl; break;
+                                case FBSD_SYS_fcntl:       actual_linux_nr = SYS_fcntl; break;
+                                case FBSD_SYS_sendmsg:     actual_linux_nr = SYS_sendmsg; break;
+                                case FBSD_SYS_recvmsg:     actual_linux_nr = SYS_recvmsg; break;
+                                case 0:                    /* indirect syscall: handler set it */
+                                case FBSD_SYS_kqueue:
+                                case FBSD_SYS_kqueuex:
+                                case FBSD_SYS_kevent:      actual_linux_nr = -2; break;  /* handler set it */
                                 case FBSD_SYS_sigwait:
                                 case FBSD_SYS_sigtimedwait:
                                 case FBSD_SYS_sigwaitinfo: actual_linux_nr = SYS_rt_sigtimedwait; break;
                                 default:
+                                    actual_linux_nr = -1;
                                     BSD_ERROR("No Linux syscall mapping for emulated FreeBSD syscall %d",
                                               (int)state->syscall_nr);
                                     break;
@@ -2616,8 +2654,15 @@ int interceptor_run(interceptor_state_t *state) {
                             if ((int)state->syscall_nr == FBSD_SYS_setsockopt ||
                                 (int)state->syscall_nr == FBSD_SYS_getsockopt ||
                                 (int)state->syscall_nr == FBSD_SYS_socket ||
+                                (int)state->syscall_nr == FBSD_SYS_sendmsg ||
+                                (int)state->syscall_nr == FBSD_SYS_recvmsg ||
+                                (int)state->syscall_nr == FBSD_SYS_bind ||
+                                (int)state->syscall_nr == FBSD_SYS_connect ||
+                                (int)state->syscall_nr == FBSD_SYS_sendto ||
                                 (int)state->syscall_nr == FBSD_SYS_procctl ||
                                 (int)state->syscall_nr == FBSD_SYS_wait6 ||
+                                (int)state->syscall_nr == FBSD_SYS_ioctl ||
+                                (int)state->syscall_nr == FBSD_SYS_fcntl ||
                                 (int)state->syscall_nr == FBSD_SYS_sigsuspend ||
                                 (int)state->syscall_nr == FBSD_SYS_sigwait ||
                                 (int)state->syscall_nr == FBSD_SYS_sigtimedwait ||
@@ -2663,6 +2708,14 @@ int interceptor_run(interceptor_state_t *state) {
                  * one did: handle the exit with this process's own syscall
                  * number, arguments and pending mmap fixup. */
                 restore_syscall_state(state);
+                {
+                    /* kevent/kqueue chains run several Linux syscalls */
+                    int kr = kq_on_syscall_exit(state->pid);
+                    if (kr) {
+                        if (kr == 2) sig_after_syscall(state->pid, FBSD_SYS_kevent, state->args);
+                        break;
+                    }
+                }
                 BSD_TRACE("EXIT syscall %llu = %lld (0x%llx)",
                           (unsigned long long)state->syscall_nr,
                           (long long)state->retval,
@@ -2755,45 +2808,21 @@ int interceptor_run(interceptor_state_t *state) {
                  * FreeBSD sockaddr_in: sin_len (1 byte), sin_family (1 byte), sa_data...
                  * We need to shift bytes to add the length prefix.
                  */
-                if (state->retval >= 0 && (int)state->syscall_nr == FBSD_SYS_recvfrom) {
-                    uint64_t addr_ptr = state->args[4];      /* sockaddr* */
-                    uint64_t addrlen_ptr = state->args[5];   /* socklen_t* */
-                    
-                    if (addr_ptr != 0 && addrlen_ptr != 0) {
-                        /* Read the actual length from addrlen_ptr */
-                        uint32_t actual_len = 0;
-                        struct iovec len_local = { &actual_len, sizeof(actual_len) };
-                        struct iovec len_remote = { (void *)addrlen_ptr, sizeof(actual_len) };
-                        
-                        if (process_vm_readv(state->pid, &len_local, 1, &len_remote, 1, 0) > 0 && actual_len > 0) {
-                            /* Read the Linux sockaddr */
-                            uint8_t linux_addr[128];
-                            if (actual_len > sizeof(linux_addr)) actual_len = sizeof(linux_addr);
-                            
-                            struct iovec addr_local = { linux_addr, actual_len };
-                            struct iovec addr_remote = { (void *)addr_ptr, actual_len };
-                            
-                            if (process_vm_readv(state->pid, &addr_local, 1, &addr_remote, 1, 0) > 0) {
-                                /* Linux sockaddr: family is 2 bytes at offset 0 */
-                                uint16_t linux_family;
-                                memcpy(&linux_family, linux_addr, 2);
-                                
-                                /* Build FreeBSD sockaddr: sin_len (1 byte), sin_family (1 byte), rest */
-                                uint8_t fbsd_addr[128];
-                                fbsd_addr[0] = (uint8_t)actual_len;  /* sin_len */
-                                fbsd_addr[1] = (uint8_t)linux_family; /* sin_family (low byte) */
-                                /* Copy rest of address (skip Linux's 2-byte family) */
-                                memcpy(fbsd_addr + 2, linux_addr + 2, actual_len - 2);
-                                
-                                BSD_TRACE("recvfrom: translating sockaddr family=%u len=%u",
-                                          linux_family, actual_len);
-                                
-                                /* Write FreeBSD sockaddr back */
-                                struct iovec out_local = { fbsd_addr, actual_len };
-                                struct iovec out_remote = { (void *)addr_ptr, actual_len };
-                                process_vm_writev(state->pid, &out_local, 1, &out_remote, 1, 0);
-                            }
-                        }
+                /* Socket addresses the kernel returned: Linux layout to
+                 * FreeBSD (sa_len byte, family numbers) */
+                if (state->retval >= 0) {
+                    switch ((int)state->syscall_nr) {
+                        case FBSD_SYS_recvfrom:
+                            sockaddr_out_to_freebsd(state->pid, state->args[4], state->args[5]);
+                            break;
+                        case FBSD_SYS_accept:
+                        case FBSD_SYS_accept4:
+                        case FBSD_SYS_getsockname:
+                        case FBSD_SYS_getpeername:
+                            sockaddr_out_to_freebsd(state->pid, state->args[1], state->args[2]);
+                            break;
+                        default:
+                            break;
                     }
                 }
 
@@ -3036,14 +3065,18 @@ int interceptor_run(interceptor_state_t *state) {
                     break;
                 }
 
-                long new_ret = syscall_translate_return((int)state->syscall_nr, state->retval);
-                if (new_ret != state->retval || (state->retval < 0 && state->retval > -4096)) {
-                    interceptor_set_return(state->pid, new_ret);
+                /* interceptor_set_return() translates the errno itself
+                 * (Linux -> FreeBSD) and sets CF; translating it here too
+                 * converted it twice (EAGAIN 11 -> 35 -> 11 = EDEADLK). */
+                if (state->retval < 0 && state->retval > -4096) {
+                    interceptor_set_return(state->pid, state->retval);
                 }
 
                 /* sigreturn/setcontext, wait4 status, and signals the
                  * syscall unblocked */
                 sig_after_syscall(state->pid, state->syscall_nr, state->args);
+                kq_after_syscall(state->pid, state->syscall_nr, state->args);
+                msg_after_syscall(state->pid, state->syscall_nr);
                 break;
             }
             

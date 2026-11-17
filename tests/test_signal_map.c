@@ -13,6 +13,10 @@
 
 #include "bsdulator.h"
 #include "bsdulator/signal_emul.h"
+#include "bsdulator/msg_emul.h"
+
+int abi_translate_errno(int linux_errno);
+int abi_translate_errno_to_linux(int freebsd_errno);
 
 /* The module reads and writes traced processes; these tests do not. */
 int bsd_debug_level = 0;
@@ -66,10 +70,38 @@ int main(void) {
     CHECK(sig_wait_options_to_linux(4) == WCONTINUED, "WCONTINUED 4 -> 8");
     CHECK(sig_wait_options_to_linux(16) == 0, "WEXITED dropped (implied by wait4)");
 
+    printf("errno translation\n");
+    CHECK(abi_translate_errno(11) == 35, "EAGAIN 11 -> 35");
+    CHECK(abi_translate_errno(35) == 11, "EDEADLK 35 -> 11");
+    CHECK(abi_translate_errno(2) == 2, "ENOENT unchanged");
+    CHECK(abi_translate_errno(38) == 78, "ENOSYS 38 -> 78");
+    CHECK(abi_translate_errno(88) == 38, "ENOTSOCK 88 -> 38");
+    CHECK(abi_translate_errno(90) == 40, "EMSGSIZE 90 -> 40");
+    CHECK(abi_translate_errno(111) == 61, "ECONNREFUSED 111 -> 61");
+    CHECK(abi_translate_errno(115) == 36, "EINPROGRESS 115 -> 36");
+    /* Codes that exist on both systems map back to themselves */
+    static const int both[] = {
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+        20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
+        37, 38, 39, 40, 42, 43, 66, 67, 71, 72, 74, 75, 84, 87, 88, 89, 90,
+        91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105,
+        106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 122, 125,
+        130, 131,
+    };
+    int eround = 1;
+    for (size_t i = 0; i < sizeof(both) / sizeof(both[0]); i++)
+        if (abi_translate_errno_to_linux(abi_translate_errno(both[i])) != both[i]) eround = 0;
+    CHECK(eround, "errno Linux -> FreeBSD -> Linux round trip");
+
+    printf("MSG_* flags\n");
+    CHECK(msg_flags_to_linux(0x80) == 0x40, "MSG_DONTWAIT 0x80 -> 0x40");
+    CHECK(msg_flags_to_linux(0x20000) == 0x4000, "MSG_NOSIGNAL 0x20000 -> 0x4000");
+    CHECK(msg_flags_to_linux(0x2) == 0x2, "MSG_PEEK unchanged");
+
     if (failures) {
         printf("%d test(s) FAILED\n", failures);
         return 1;
     }
-    printf("all signal tests PASSED\n");
+    printf("all translation tests PASSED\n");
     return 0;
 }

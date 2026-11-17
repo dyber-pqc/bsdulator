@@ -243,46 +243,45 @@ int abi_translate_fcntl_cmd(int freebsd_cmd) {
 }
 
 /*
- * errno translation
- * FreeBSD and Linux share most errno values 1-34, but network errnos differ significantly!
- * 
- * CRITICAL: Linux errno 97 = EAFNOSUPPORT, but FreeBSD errno 97 = EINTEGRITY!
- * This was causing "Integrity check failed" errors when connect() failed.
+ * errno translation (Linux <-> FreeBSD)
  *
- * Key differences (Linux -> FreeBSD):
- *   Linux 97 (EAFNOSUPPORT)   -> FreeBSD 47 (EAFNOSUPPORT)
- *   Linux 98-111 network errnos -> FreeBSD 48-61
+ * Values 1-34 are the same on both systems except 11: Linux EAGAIN is 11
+ * and EDEADLK 35, FreeBSD the other way round. From 35 up nearly all
+ * differ. Values are from Linux asm-generic/errno*.h and FreeBSD
+ * sys/sys/errno.h. Unknown values pass through.
  */
 int abi_translate_errno(int linux_errno) {
-    /* Errnos 1-34 are the same on both systems */
-    if (linux_errno >= 1 && linux_errno <= 34) {
-        return linux_errno;
-    }
-    
-    /* EAGAIN/EWOULDBLOCK = 35 on both */
-    if (linux_errno == 35) {
-        return 35;
-    }
-    
-    /* Handle the network and other errnos that differ */
     switch (linux_errno) {
-        /* ENOSYS - different location */
-        case 38:  return 78;  /* Linux ENOSYS -> FreeBSD ENOSYS */
-        
-        /* Network protocol errors (Linux 91-96 -> FreeBSD 41-46) */
-        case 91:  return 41;  /* EPROTOTYPE */
-        case 92:  return 42;  /* ENOPROTOOPT */
-        case 93:  return 43;  /* EPROTONOSUPPORT */
-        case 94:  return 44;  /* ESOCKTNOSUPPORT */
-        case 95:  return 45;  /* EOPNOTSUPP */
-        case 96:  return 46;  /* EPFNOSUPPORT */
-        
-        /* Network address errors (Linux 97-99 -> FreeBSD 47-49) */
-        case 97:  return 47;  /* EAFNOSUPPORT - THIS WAS CAUSING "Integrity check failed"! */
-        case 98:  return 48;  /* EADDRINUSE */
-        case 99:  return 49;  /* EADDRNOTAVAIL */
-        
-        /* Network state errors (Linux 100-111 -> FreeBSD 50-61) */
+        case 11: return 35;   /* EAGAIN / EWOULDBLOCK */
+        case 35: return 11;   /* EDEADLK */
+        case 36: return 63;   /* ENAMETOOLONG */
+        case 37: return 77;   /* ENOLCK */
+        case 38: return 78;   /* ENOSYS */
+        case 39: return 66;   /* ENOTEMPTY */
+        case 40: return 62;   /* ELOOP */
+        case 42: return 83;   /* ENOMSG */
+        case 43: return 82;   /* EIDRM */
+        case 61: return 87;   /* ENODATA -> ENOATTR */
+        case 66: return 71;   /* EREMOTE */
+        case 67: return 91;   /* ENOLINK */
+        case 71: return 92;   /* EPROTO */
+        case 72: return 90;   /* EMULTIHOP */
+        case 74: return 89;   /* EBADMSG */
+        case 75: return 84;   /* EOVERFLOW */
+        case 84: return 86;   /* EILSEQ */
+        case 87: return 68;   /* EUSERS */
+        case 88: return 38;   /* ENOTSOCK */
+        case 89: return 39;   /* EDESTADDRREQ */
+        case 90: return 40;   /* EMSGSIZE */
+        case 91: return 41;   /* EPROTOTYPE */
+        case 92: return 42;   /* ENOPROTOOPT */
+        case 93: return 43;   /* EPROTONOSUPPORT */
+        case 94: return 44;   /* ESOCKTNOSUPPORT */
+        case 95: return 45;   /* EOPNOTSUPP / ENOTSUP */
+        case 96: return 46;   /* EPFNOSUPPORT */
+        case 97: return 47;   /* EAFNOSUPPORT */
+        case 98: return 48;   /* EADDRINUSE */
+        case 99: return 49;   /* EADDRNOTAVAIL */
         case 100: return 50;  /* ENETDOWN */
         case 101: return 51;  /* ENETUNREACH */
         case 102: return 52;  /* ENETRESET */
@@ -295,71 +294,72 @@ int abi_translate_errno(int linux_errno) {
         case 109: return 59;  /* ETOOMANYREFS */
         case 110: return 60;  /* ETIMEDOUT */
         case 111: return 61;  /* ECONNREFUSED */
-        
-        /* Host errors */
         case 112: return 64;  /* EHOSTDOWN */
         case 113: return 65;  /* EHOSTUNREACH */
-        
-        /* In-progress errors (different location on FreeBSD) */
         case 114: return 37;  /* EALREADY */
         case 115: return 36;  /* EINPROGRESS */
-        
-        default:
-            return linux_errno;
+        case 116: return 70;  /* ESTALE */
+        case 122: return 69;  /* EDQUOT */
+        case 125: return 85;  /* ECANCELED */
+        case 130: return 96;  /* EOWNERDEAD */
+        case 131: return 95;  /* ENOTRECOVERABLE */
+        default: return linux_errno;
     }
 }
 
 int abi_translate_errno_to_linux(int freebsd_errno) {
-    /* Errnos 1-34 are the same */
-    if (freebsd_errno >= 1 && freebsd_errno <= 34) {
-        return freebsd_errno;
-    }
-    
-    if (freebsd_errno == 35) {
-        return 35;
-    }
-    
     switch (freebsd_errno) {
-        /* In-progress errors */
-        case 36:  return 115; /* EINPROGRESS */
-        case 37:  return 114; /* EALREADY */
-        
-        /* Network protocol errors (FreeBSD 41-46 -> Linux 91-96) */
-        case 41:  return 91;  /* EPROTOTYPE */
-        case 42:  return 92;  /* ENOPROTOOPT */
-        case 43:  return 93;  /* EPROTONOSUPPORT */
-        case 44:  return 94;  /* ESOCKTNOSUPPORT */
-        case 45:  return 95;  /* EOPNOTSUPP */
-        case 46:  return 96;  /* EPFNOSUPPORT */
-        
-        /* Network address errors (FreeBSD 47-49 -> Linux 97-99) */
-        case 47:  return 97;  /* EAFNOSUPPORT */
-        case 48:  return 98;  /* EADDRINUSE */
-        case 49:  return 99;  /* EADDRNOTAVAIL */
-        
-        /* Network state errors (FreeBSD 50-61 -> Linux 100-111) */
-        case 50:  return 100; /* ENETDOWN */
-        case 51:  return 101; /* ENETUNREACH */
-        case 52:  return 102; /* ENETRESET */
-        case 53:  return 103; /* ECONNABORTED */
-        case 54:  return 104; /* ECONNRESET */
-        case 55:  return 105; /* ENOBUFS */
-        case 56:  return 106; /* EISCONN */
-        case 57:  return 107; /* ENOTCONN */
-        case 58:  return 108; /* ESHUTDOWN */
-        case 59:  return 109; /* ETOOMANYREFS */
-        case 60:  return 110; /* ETIMEDOUT */
-        case 61:  return 111; /* ECONNREFUSED */
-        
-        /* Host errors */
-        case 64:  return 112; /* EHOSTDOWN */
-        case 65:  return 113; /* EHOSTUNREACH */
-        
-        /* ENOSYS */
-        case 78:  return 38;  /* FreeBSD ENOSYS -> Linux ENOSYS */
-        
-        default:
-            return freebsd_errno;
+        case 11: return 35;   /* EDEADLK */
+        case 35: return 11;   /* EAGAIN / EWOULDBLOCK */
+        case 36: return 115;  /* EINPROGRESS */
+        case 37: return 114;  /* EALREADY */
+        case 38: return 88;   /* ENOTSOCK */
+        case 39: return 89;   /* EDESTADDRREQ */
+        case 40: return 90;   /* EMSGSIZE */
+        case 41: return 91;   /* EPROTOTYPE */
+        case 42: return 92;   /* ENOPROTOOPT */
+        case 43: return 93;   /* EPROTONOSUPPORT */
+        case 44: return 94;   /* ESOCKTNOSUPPORT */
+        case 45: return 95;   /* EOPNOTSUPP / ENOTSUP */
+        case 46: return 96;   /* EPFNOSUPPORT */
+        case 47: return 97;   /* EAFNOSUPPORT */
+        case 48: return 98;   /* EADDRINUSE */
+        case 49: return 99;   /* EADDRNOTAVAIL */
+        case 50: return 100;  /* ENETDOWN */
+        case 51: return 101;  /* ENETUNREACH */
+        case 52: return 102;  /* ENETRESET */
+        case 53: return 103;  /* ECONNABORTED */
+        case 54: return 104;  /* ECONNRESET */
+        case 55: return 105;  /* ENOBUFS */
+        case 56: return 106;  /* EISCONN */
+        case 57: return 107;  /* ENOTCONN */
+        case 58: return 108;  /* ESHUTDOWN */
+        case 59: return 109;  /* ETOOMANYREFS */
+        case 60: return 110;  /* ETIMEDOUT */
+        case 61: return 111;  /* ECONNREFUSED */
+        case 62: return 40;   /* ELOOP */
+        case 63: return 36;   /* ENAMETOOLONG */
+        case 64: return 112;  /* EHOSTDOWN */
+        case 65: return 113;  /* EHOSTUNREACH */
+        case 66: return 39;   /* ENOTEMPTY */
+        case 68: return 87;   /* EUSERS */
+        case 69: return 122;  /* EDQUOT */
+        case 70: return 116;  /* ESTALE */
+        case 71: return 66;   /* EREMOTE */
+        case 77: return 37;   /* ENOLCK */
+        case 78: return 38;   /* ENOSYS */
+        case 82: return 43;   /* EIDRM */
+        case 83: return 42;   /* ENOMSG */
+        case 84: return 75;   /* EOVERFLOW */
+        case 85: return 125;  /* ECANCELED */
+        case 86: return 84;   /* EILSEQ */
+        case 89: return 74;   /* EBADMSG */
+        case 90: return 72;   /* EMULTIHOP */
+        case 91: return 67;   /* ENOLINK */
+        case 92: return 71;   /* EPROTO */
+        case 95: return 131;  /* ENOTRECOVERABLE */
+        case 96: return 130;  /* EOWNERDEAD */
+        default: return freebsd_errno;
     }
 }
 

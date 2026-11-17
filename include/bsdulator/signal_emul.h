@@ -78,5 +78,6 @@ long sig_emul_setcontext(pid_t pid, uint64_t args[6]);
 long sig_emul_swapcontext(pid_t pid, uint64_t args[6]);
 long sig_emul_procctl(pid_t pid, uint64_t args[6]);   /* -EAGAIN: run prctl */
 long sig_emul_wait6(pid_t pid, uint64_t args[6]);     /* -EAGAIN: run wait4 */
+long sig_emul_fcntl(pid_t pid, uint64_t args[6]);     /* -EAGAIN: run fcntl */
 
 #endif /* BSDULATOR_SIGNAL_EMUL_H */

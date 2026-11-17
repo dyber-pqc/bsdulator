@@ -21,7 +21,9 @@ SRCS = $(SRCDIR)/main.c \
        $(SRCDIR)/abi/abi_translate.c \
        $(SRCDIR)/runtime/freebsd_runtime.c \
        $(SRCDIR)/jail/jail.c \
-       $(SRCDIR)/signal/signal_emul.c
+       $(SRCDIR)/signal/signal_emul.c \
+       $(SRCDIR)/kqueue/kqueue_emul.c \
+       $(SRCDIR)/net/msg_emul.c
 
 # BSDulator object files
 OBJS = $(SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
@@ -91,7 +93,7 @@ $(OBJDIR)/abi/abi_translate.o: $(SRCDIR)/abi/abi_translate.c $(INCDIR)/bsdulator
 $(OBJDIR)/runtime/freebsd_runtime.o: $(SRCDIR)/runtime/freebsd_runtime.c $(SRCDIR)/runtime/freebsd_runtime.h $(INCDIR)/bsdulator.h
 $(OBJDIR)/jail/jail.o: $(SRCDIR)/jail/jail.c $(INCDIR)/bsdulator.h $(INCDIR)/bsdulator/jail.h
 $(OBJDIR)/signal/signal_emul.o: $(SRCDIR)/signal/signal_emul.c $(INCDIR)/bsdulator.h $(INCDIR)/bsdulator/signal_emul.h $(INCDIR)/bsdulator/interceptor.h
-$(OBJS): $(INCDIR)/bsdulator/signal_emul.h
+$(OBJS): $(INCDIR)/bsdulator/signal_emul.h $(INCDIR)/bsdulator/kqueue_emul.h $(INCDIR)/bsdulator/msg_emul.h
 
 # Dependencies - Lochs CLI
 $(OBJDIR)/lochs/lochs_main.o: $(SRCDIR)/lochs/lochs_main.c $(INCDIR)/bsdulator/lochs.h
@@ -122,9 +124,9 @@ $(TEST_EXEC): tests/test_lochs_exec.c $(OBJDIR)/lochs/lochs_exec.o
 test-exec: $(TEST_EXEC)
 	@./$(TEST_EXEC)
 
-# Unit tests for signal number and wait4 option translation
+# Unit tests for signal, errno, wait4 and MSG_* translation
 TEST_SIGNAL = $(BINDIR)/tests/test_signal_map
-$(TEST_SIGNAL): tests/test_signal_map.c $(OBJDIR)/signal/signal_emul.o
+$(TEST_SIGNAL): tests/test_signal_map.c $(OBJDIR)/signal/signal_emul.o $(OBJDIR)/kqueue/kqueue_emul.o $(OBJDIR)/net/msg_emul.o $(OBJDIR)/abi/abi_translate.o
 	@echo "  LINK    $@"
 	@$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 

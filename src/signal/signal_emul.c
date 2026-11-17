@@ -34,6 +34,7 @@
 #include "bsdulator/interceptor.h"
 #include "bsdulator/syscall.h"
 #include "bsdulator/signal_emul.h"
+#include "bsdulator/kqueue_emul.h"
 
 /* ---------------------------------------------------------------------
  * FreeBSD constants and structures
@@ -644,7 +645,7 @@ static int next_ready(sig_proc_t *p) {
 /* Deliver one pending signal that is no longer blocked. */
 static void deliver_pending(pid_t pid, sig_proc_t *p) {
     int s = next_ready(p);
-    if (s < 1 || s > FBSD_NSIG || fastblocked(pid, p)) return;
+    if (s < 1 || s > FBSD_NSIG || fastblocked(pid, p) || kq_busy(pid)) return;
     fs_del(&p->pending, s);
     if (p->handler[s] == FBSD_SIG_DFL) {
         /* Default action (terminate, stop): let the kernel do it. */
@@ -725,7 +726,9 @@ int sig_on_signal(pid_t pid, int lsig) {
         return 0;
     }
     if (h == FBSD_SIG_DFL) return default_ignored(fsig) ? 0 : lsig;
-    if (fastblocked(pid, p)) {
+    if (fastblocked(pid, p) || kq_busy(pid)) {
+        /* Deferred: delivered when the process leaves the critical
+         * section, or when its kevent() chain returns. */
         pend(p, fsig, &si);
         return 0;
     }
@@ -773,6 +776,7 @@ uint64_t sig_wait_options_to_linux(uint64_t o) {
 }
 
 static void finish_wait6(pid_t pid, const uint64_t args[6]);
+static void finish_fcntl(pid_t pid, const uint64_t args[6]);
 
 void sig_after_syscall(pid_t pid, uint64_t nr, const uint64_t args[6]) {
     if ((nr == FBSD_SYS_wait4 || nr == FBSD_SYS_wait6) && args[1]) {
@@ -787,6 +791,7 @@ void sig_after_syscall(pid_t pid, uint64_t nr, const uint64_t args[6]) {
         }
     }
     if (nr == FBSD_SYS_wait6) finish_wait6(pid, args);
+    if (nr == FBSD_SYS_fcntl) finish_fcntl(pid, args);
     if (nr == FBSD_SYS_sigwait) {
         /* sigwait(2) returns an error number as its value, not -1/errno */
         struct user_regs_struct r;
@@ -1305,4 +1310,160 @@ static void finish_wait6(pid_t pid, const uint64_t args[6]) {
         si.fs_status = st & 0x7f;
     }
     (void)wr(pid, &si, info, sizeof(si));
+}
+
+/* ---------------------------------------------------------------------
+ * fcntl(2): command numbers, F_GETFL/F_SETFL flags and struct flock
+ * differ from Linux. (Kept here because it needs the after-syscall hook.)
+ * ------------------------------------------------------------------- */
+
+#define FBSD_F_GETFL     3
+#define FBSD_F_SETFL     4
+#define FBSD_F_GETOWN    5
+#define FBSD_F_SETOWN    6
+#define FBSD_F_OGETLK    7
+#define FBSD_F_OSETLK    8
+#define FBSD_F_OSETLKW   9
+#define FBSD_F_GETLK     11
+#define FBSD_F_SETLK     12
+#define FBSD_F_SETLKW    13
+#define FBSD_F_READAHEAD 15
+#define FBSD_F_RDAHEAD   16
+#define FBSD_F_DUPFD_CLOEXEC 17
+#define FBSD_F_ADD_SEALS 19
+#define FBSD_F_GET_SEALS 20
+
+#define L_F_GETFL   3
+#define L_F_GETLK   5
+#define L_F_SETLK   6
+#define L_F_SETLKW  7
+
+struct fbsd_flock {           /* struct flock; __oflock is the first 24 bytes */
+    int64_t l_start;
+    int64_t l_len;
+    int32_t l_pid;
+    int16_t l_type;
+    int16_t l_whence;
+    int32_t l_sysid;
+    int32_t pad;
+};
+_Static_assert(sizeof(struct fbsd_flock) == 32, "FreeBSD struct flock");
+
+struct linux_flock {
+    int16_t l_type;
+    int16_t l_whence;
+    int32_t pad0;
+    int64_t l_start;
+    int64_t l_len;
+    int32_t l_pid;
+    int32_t pad1;
+};
+_Static_assert(sizeof(struct linux_flock) == 32, "Linux struct flock");
+
+/* A lock buffer converted to Linux layout for a call in progress */
+#define MAX_FLOCK 64
+static struct { pid_t pid; uint64_t addr; int old; int32_t sysid; } flock_conv[MAX_FLOCK];
+
+static int find_flock(pid_t pid) {
+    for (int i = 0; i < MAX_FLOCK; i++) if (flock_conv[i].pid == pid) return i;
+    return -1;
+}
+
+int abi_translate_open_flags(int freebsd_flags);
+int abi_translate_open_flags_to_freebsd(int linux_flags);
+
+long sig_emul_fcntl(pid_t pid, uint64_t args[6]) {
+    int cmd = (int)args[1];
+    int lcmd;
+    switch (cmd) {
+        case 0: case 1: case 2: case 3: lcmd = cmd; break;  /* DUPFD GETFD SETFD GETFL */
+        case FBSD_F_SETFL:
+            args[2] = (uint64_t)(uint32_t)abi_translate_open_flags((int)args[2]);
+            lcmd = 4;
+            break;
+        case FBSD_F_GETOWN: lcmd = 9; break;
+        case FBSD_F_SETOWN: lcmd = 8; break;
+        case FBSD_F_DUPFD_CLOEXEC: lcmd = 1030; break;
+        case FBSD_F_ADD_SEALS: lcmd = 1033; break;
+        case FBSD_F_GET_SEALS: lcmd = 1034; break;
+        case FBSD_F_READAHEAD: case FBSD_F_RDAHEAD:
+            return 0;  /* advisory; nothing to do */
+        case FBSD_F_GETLK: case FBSD_F_OGETLK: lcmd = L_F_GETLK; break;
+        case FBSD_F_SETLK: case FBSD_F_OSETLK: lcmd = L_F_SETLK; break;
+        case FBSD_F_SETLKW: case FBSD_F_OSETLKW: lcmd = L_F_SETLKW; break;
+        default:
+            return -EINVAL;
+    }
+
+    if (lcmd == L_F_GETLK || lcmd == L_F_SETLK || lcmd == L_F_SETLKW) {
+        int old = cmd == FBSD_F_OGETLK || cmd == FBSD_F_OSETLK || cmd == FBSD_F_OSETLKW;
+        int i = find_flock(pid);
+        /* A restarted call finds the buffer already converted */
+        if (i < 0 || flock_conv[i].addr != args[2]) {
+            struct fbsd_flock f;
+            memset(&f, 0, sizeof(f));
+            if (rd(pid, &f, args[2], old ? 24 : 32) < 0) return -EFAULT;
+            struct linux_flock l;
+            memset(&l, 0, sizeof(l));
+            switch (f.l_type) {
+                case 1: l.l_type = 0; break;  /* F_RDLCK */
+                case 2: l.l_type = 2; break;  /* F_UNLCK */
+                case 3: l.l_type = 1; break;  /* F_WRLCK */
+                default: return -EINVAL;
+            }
+            l.l_whence = f.l_whence;
+            l.l_start = f.l_start;
+            l.l_len = f.l_len;
+            l.l_pid = f.l_pid;
+            if (old) {
+                /* The old struct is only 24 bytes: the converted copy
+                 * would overflow it, so it goes below the stack. */
+                return -EINVAL;
+            }
+            if (wr(pid, &l, args[2], sizeof(l)) < 0) return -EFAULT;
+            if (i < 0) {
+                for (i = 0; i < MAX_FLOCK && flock_conv[i].pid; i++) {}
+                if (i == MAX_FLOCK) i = 0;
+            }
+            flock_conv[i].pid = pid;
+            flock_conv[i].addr = args[2];
+            flock_conv[i].old = old;
+            flock_conv[i].sysid = f.l_sysid;
+        }
+    }
+    args[1] = (uint64_t)lcmd;
+    return -EAGAIN;  /* run Linux fcntl */
+}
+
+static void finish_fcntl(pid_t pid, const uint64_t args[6]) {
+    int lcmd = (int)args[1];
+    struct user_regs_struct r;
+    if (lcmd == L_F_GETFL) {
+        if (ptrace(PTRACE_GETREGS, pid, NULL, &r) == 0 && !(r.eflags & RFLAGS_CF)) {
+            r.rax = (uint64_t)(uint32_t)abi_translate_open_flags_to_freebsd((int)r.rax);
+            (void)ptrace(PTRACE_SETREGS, pid, NULL, &r);
+        }
+        return;
+    }
+    if (lcmd != L_F_GETLK && lcmd != L_F_SETLK && lcmd != L_F_SETLKW) return;
+    int i = find_flock(pid);
+    if (i < 0) return;
+    uint64_t addr = flock_conv[i].addr;
+    int32_t sysid = flock_conv[i].sysid;
+    flock_conv[i].pid = 0;
+    struct linux_flock l;
+    if (rd(pid, &l, addr, sizeof(l)) < 0) return;
+    struct fbsd_flock f;
+    memset(&f, 0, sizeof(f));
+    switch (l.l_type) {
+        case 0: f.l_type = 1; break;
+        case 1: f.l_type = 3; break;
+        default: f.l_type = 2; break;
+    }
+    f.l_whence = l.l_whence;
+    f.l_start = l.l_start;
+    f.l_len = l.l_len;
+    f.l_pid = l.l_pid;
+    f.l_sysid = sysid;
+    (void)wr(pid, &f, addr, sizeof(f));
 }

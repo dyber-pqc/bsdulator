@@ -40,6 +40,8 @@
 #include <asm/prctl.h>  /* For ARCH_SET_FS, etc. */
 #include "bsdulator.h"
 #include "bsdulator/signal_emul.h"
+#include "bsdulator/kqueue_emul.h"
+#include "bsdulator/msg_emul.h"
 #include "../runtime/freebsd_runtime.h"
 
 /* Forward declarations for emulation handlers */
@@ -56,8 +58,6 @@ static long emul_getsockopt(pid_t pid, uint64_t args[6]);
 /* Jail syscalls are now implemented in src/jail/jail.c
  * Declarations are in include/bsdulator/jail.h
  */
-static long emul_kqueue(pid_t pid, uint64_t args[6]);
-static long emul_kevent(pid_t pid, uint64_t args[6]);
 static long emul_issetugid(pid_t pid, uint64_t args[6]);
 static long emul_yield(pid_t pid, uint64_t args[6]);
 static long emul_rfork(pid_t pid, uint64_t args[6]);
@@ -185,7 +185,7 @@ int syscall_init(void) {
     EMUL(FBSD_SYS_mkfifo, "mkfifo", emul_mkfifo);
     TRANS(FBSD_SYS_dup, SYS_dup, "dup");
     TRANS(FBSD_SYS_dup2, SYS_dup2, "dup2");
-    TRANS(FBSD_SYS_fcntl, SYS_fcntl, "fcntl");
+    EMUL(FBSD_SYS_fcntl, "fcntl", sig_emul_fcntl);
     TRANS(FBSD_SYS_flock, SYS_flock, "flock");
     TRANS(FBSD_SYS_fsync, SYS_fsync, "fsync");
     TRANS(FBSD_SYS_fdatasync, SYS_fdatasync, "fdatasync");
@@ -280,8 +280,8 @@ int syscall_init(void) {
     TRANS(FBSD_SYS_socketpair, SYS_socketpair, "socketpair");
     EMUL(FBSD_SYS_sendto, "sendto", emul_sendto);  /* sockaddr translation */
     TRANS(FBSD_SYS_recvfrom, SYS_recvfrom, "recvfrom");
-    TRANS(FBSD_SYS_sendmsg, SYS_sendmsg, "sendmsg");
-    TRANS(FBSD_SYS_recvmsg, SYS_recvmsg, "recvmsg");
+    EMUL(FBSD_SYS_sendmsg, "sendmsg", msg_emul_sendmsg);  /* msghdr/cmsg layout */
+    EMUL(FBSD_SYS_recvmsg, "recvmsg", msg_emul_recvmsg);
     EMUL(FBSD_SYS_getsockopt, "getsockopt", emul_getsockopt);  /* sockopt translation */
     EMUL(FBSD_SYS_setsockopt, "setsockopt", emul_setsockopt);  /* sockopt translation */
     TRANS(FBSD_SYS_getsockname, SYS_getsockname, "getsockname");
@@ -442,8 +442,9 @@ int syscall_init(void) {
     EMUL(FBSD_SYS_jail_remove, "jail_remove", emul_jail_remove);
     
     /* kqueue - needs epoll translation */
-    EMUL(FBSD_SYS_kqueue, "kqueue", emul_kqueue);
-    EMUL(FBSD_SYS_kevent, "kevent", emul_kevent);
+    EMUL(FBSD_SYS_kqueue, "kqueue", kq_emul_kqueue);
+    EMUL(FBSD_SYS_kqueuex, "kqueuex", kq_emul_kqueue);
+    EMUL(FBSD_SYS_kevent, "kevent", kq_emul_kevent);
     
     /* Capsicum */
     EMUL(FBSD_SYS_cap_enter, "cap_enter", emul_cap_enter);
@@ -535,6 +536,20 @@ int syscall_translate_args(int freebsd_nr, uint64_t *args) {
                 args[1] = (uint64_t)sig_fbsd_to_linux((int)args[1]);
             return 1;
 
+        case FBSD_SYS_accept4: {
+            /* accept4(s, addr, addrlen, flags): SOCK_CLOEXEC/SOCK_NONBLOCK */
+            uint64_t f = args[3], l = 0;
+            if (f & 0x10000000) l |= 0x80000;  /* SOCK_CLOEXEC */
+            if (f & 0x20000000) l |= 0x800;    /* SOCK_NONBLOCK */
+            args[3] = l;
+            return 1;
+        }
+
+        case FBSD_SYS_recvfrom:
+            /* recvfrom(s, buf, len, flags, from, fromlen) */
+            args[3] = msg_flags_to_linux((uint32_t)args[3]);
+            return 1;
+
         case FBSD_SYS_pipe2:
             /* pipe2(fds, flags): O_CLOEXEC and O_NONBLOCK differ */
             args[1] = abi_translate_open_flags(args[1]);
@@ -543,12 +558,6 @@ int syscall_translate_args(int freebsd_nr, uint64_t *args) {
         case FBSD_SYS_wait4:
             /* wait4(pid, status, options, rusage) */
             args[2] = sig_wait_options_to_linux(args[2]);
-            return 1;
-            
-        case FBSD_SYS_fcntl:
-            /* Translate fcntl command */
-            BSD_WARN("fcntl: fd=%d cmd=%lu (0x%lx)", (int)args[0], args[1], args[1]);
-            args[1] = abi_translate_fcntl_cmd(args[1]);
             return 1;
             
         case FBSD_SYS_fstatat:
@@ -954,355 +963,7 @@ static long emul_umtx_op(pid_t pid, uint64_t args[6]) {
  * These are critical for the Jailhouse.io project!
  */
 
-/*
- * kqueue emulation using epoll
- * 
- * kqueue() creates an event notification queue, similar to Linux epoll.
- * We create an epoll instance and return its fd.
- */
 
-static long emul_kqueue(pid_t pid, uint64_t args[6]) {
-    (void)pid;
-    (void)args;
-    
-    /*
-     * Create an epoll instance to back the kqueue.
-     * epoll_create1(0) is equivalent to kqueue() for basic usage.
-     */
-    int epfd = epoll_create1(0);
-    if (epfd < 0) {
-        BSD_WARN("kqueue(): epoll_create1 failed: %s", strerror(errno));
-        return -errno;
-    }
-    
-    BSD_INFO("kqueue(): created epoll fd %d as kqueue", epfd);
-    return epfd;
-}
-
-/*
- * FreeBSD kevent filter and flag constants
- */
-#define FBSD_EVFILT_READ     (-1)
-#define FBSD_EVFILT_WRITE    (-2)
-#define FBSD_EVFILT_AIO      (-3)
-#define FBSD_EVFILT_VNODE    (-4)
-#define FBSD_EVFILT_PROC     (-5)
-#define FBSD_EVFILT_SIGNAL   (-6)
-#define FBSD_EVFILT_TIMER    (-7)
-#define FBSD_EVFILT_USER     (-11)
-
-#define FBSD_EV_ADD          0x0001
-#define FBSD_EV_DELETE       0x0002
-#define FBSD_EV_ENABLE       0x0004
-#define FBSD_EV_DISABLE      0x0008
-#define FBSD_EV_ONESHOT      0x0010
-#define FBSD_EV_CLEAR        0x0020
-#define FBSD_EV_EOF          0x8000
-#define FBSD_EV_ERROR        0x4000
-
-/* FreeBSD struct kevent layout (amd64): 64 bytes */
-struct fbsd_kevent {
-    uint64_t ident;     /* identifier (fd, signal, timer id) */
-    int16_t  filter;    /* filter type (EVFILT_*) */
-    uint16_t flags;     /* action flags (EV_*) */
-    uint32_t fflags;    /* filter-specific flags */
-    int64_t  data;      /* filter-specific data */
-    uint64_t udata;     /* opaque user data */
-    uint64_t ext[4];    /* extensions (FreeBSD 11+) */
-};
-
-/*
- * Tracking table for kqueue entries.
- * Maps kqueue (ident, filter) pairs to backing Linux fds (for timers, signals).
- */
-#define KQ_MAX_ENTRIES 256
-typedef struct {
-    int      kq_fd;       /* Which epoll fd this belongs to */
-    int16_t  filter;      /* EVFILT_* */
-    uint64_t ident;       /* Original ident */
-    int      backing_fd;  /* timerfd/signalfd/-1 for direct fds */
-    uint64_t udata;       /* Preserved user data */
-    int      active;      /* Entry in use */
-} kq_entry_t;
-
-static kq_entry_t kq_entries[KQ_MAX_ENTRIES];
-static int kq_entry_count = 0;
-
-static kq_entry_t *kq_find_entry(int kq, int16_t filter, uint64_t ident) {
-    for (int i = 0; i < kq_entry_count; i++) {
-        if (kq_entries[i].active && kq_entries[i].kq_fd == kq &&
-            kq_entries[i].filter == filter && kq_entries[i].ident == ident)
-            return &kq_entries[i];
-    }
-    return NULL;
-}
-
-static kq_entry_t *kq_alloc_entry(void) {
-    /* Reuse inactive slot */
-    for (int i = 0; i < kq_entry_count; i++) {
-        if (!kq_entries[i].active) return &kq_entries[i];
-    }
-    if (kq_entry_count < KQ_MAX_ENTRIES)
-        return &kq_entries[kq_entry_count++];
-    return NULL;
-}
-
-/*
- * kevent emulation using epoll + timerfd + signalfd
- *
- * Process changelist (register/deregister events), then optionally wait
- * for events via epoll_wait and translate back to kevent format.
- */
-static long emul_kevent(pid_t pid, uint64_t args[6]) {
-    int kq = (int)args[0];
-    uint64_t changelist_addr = args[1];
-    int nchanges = (int)args[2];
-    uint64_t eventlist_addr = args[3];
-    int nevents = (int)args[4];
-    uint64_t timeout_addr = args[5];
-
-    BSD_TRACE("kevent(): kq=%d nchanges=%d nevents=%d", kq, nchanges, nevents);
-
-    /* Process changelist — register/deregister events */
-    for (int i = 0; i < nchanges && i < 64; i++) {
-        struct fbsd_kevent kev;
-        struct iovec local = { &kev, sizeof(kev) };
-        struct iovec remote = { (void *)(changelist_addr + (uint64_t)i * sizeof(kev)),
-                                sizeof(kev) };
-        if (process_vm_readv(pid, &local, 1, &remote, 1, 0) < 0) {
-            BSD_WARN("kevent: failed to read changelist[%d]", i);
-            continue;
-        }
-
-        BSD_TRACE("kevent change[%d]: ident=%lu filter=%d flags=0x%x",
-            i, kev.ident, kev.filter, kev.flags);
-
-        if (kev.flags & FBSD_EV_ADD) {
-            struct epoll_event ev;
-            memset(&ev, 0, sizeof(ev));
-            int target_fd = (int)kev.ident;
-
-            switch (kev.filter) {
-            case FBSD_EVFILT_READ:
-                ev.events = EPOLLIN;
-                if (kev.flags & FBSD_EV_ONESHOT) ev.events |= EPOLLONESHOT;
-                if (kev.flags & FBSD_EV_CLEAR) ev.events |= EPOLLET;
-                ev.data.u64 = kev.ident;
-                epoll_ctl(kq, EPOLL_CTL_ADD, target_fd, &ev);
-                break;
-
-            case FBSD_EVFILT_WRITE:
-                ev.events = EPOLLOUT;
-                if (kev.flags & FBSD_EV_ONESHOT) ev.events |= EPOLLONESHOT;
-                if (kev.flags & FBSD_EV_CLEAR) ev.events |= EPOLLET;
-                ev.data.u64 = kev.ident;
-                epoll_ctl(kq, EPOLL_CTL_ADD, target_fd, &ev);
-                break;
-
-            case FBSD_EVFILT_TIMER: {
-                /* Create a timerfd and add it to epoll */
-                int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-                if (tfd >= 0) {
-                    /* data is in milliseconds */
-                    long ms = kev.data > 0 ? kev.data : 1;
-                    struct itimerspec its;
-                    its.it_value.tv_sec = ms / 1000;
-                    its.it_value.tv_nsec = (ms % 1000) * 1000000;
-                    if (kev.flags & FBSD_EV_ONESHOT) {
-                        its.it_interval.tv_sec = 0;
-                        its.it_interval.tv_nsec = 0;
-                    } else {
-                        its.it_interval = its.it_value;
-                    }
-                    timerfd_settime(tfd, 0, &its, NULL);
-                    ev.events = EPOLLIN;
-                    ev.data.u64 = kev.ident;
-                    epoll_ctl(kq, EPOLL_CTL_ADD, tfd, &ev);
-
-                    kq_entry_t *ent = kq_alloc_entry();
-                    if (ent) {
-                        ent->kq_fd = kq;
-                        ent->filter = kev.filter;
-                        ent->ident = kev.ident;
-                        ent->backing_fd = tfd;
-                        ent->udata = kev.udata;
-                        ent->active = 1;
-                    }
-                }
-                break;
-            }
-
-            case FBSD_EVFILT_SIGNAL: {
-                /* Create a signalfd for this signal using raw sigset */
-                uint8_t mask[128];
-                memset(mask, 0, sizeof(mask));
-                int linux_sig = abi_translate_signal((int)kev.ident);
-                if (linux_sig > 0 && linux_sig < 1024) {
-                    mask[(linux_sig - 1) / 8] |= (uint8_t)(1 << ((linux_sig - 1) % 8));
-                }
-                int sfd = (int)syscall(SYS_signalfd4, -1, mask, (size_t)8, SFD_NONBLOCK | SFD_CLOEXEC);
-                if (sfd >= 0) {
-                    ev.events = EPOLLIN;
-                    ev.data.u64 = kev.ident;
-                    epoll_ctl(kq, EPOLL_CTL_ADD, sfd, &ev);
-
-                    kq_entry_t *ent = kq_alloc_entry();
-                    if (ent) {
-                        ent->kq_fd = kq;
-                        ent->filter = kev.filter;
-                        ent->ident = kev.ident;
-                        ent->backing_fd = sfd;
-                        ent->udata = kev.udata;
-                        ent->active = 1;
-                    }
-                }
-                break;
-            }
-
-            case FBSD_EVFILT_VNODE: {
-                /* Use inotify for vnode events */
-                int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-                if (ifd >= 0) {
-                    /* ident is the fd; we watch with generic mask */
-                    uint32_t imask = IN_MODIFY | IN_ATTRIB | IN_DELETE_SELF |
-                                     IN_MOVE_SELF;
-                    char fdpath[64];
-                    char realpath_buf[512];
-                    snprintf(fdpath, sizeof(fdpath), "/proc/%d/fd/%lu", pid, kev.ident);
-                    ssize_t rl = readlink(fdpath, realpath_buf, sizeof(realpath_buf) - 1);
-                    if (rl > 0) {
-                        realpath_buf[rl] = '\0';
-                        inotify_add_watch(ifd, realpath_buf, imask);
-                    }
-                    ev.events = EPOLLIN;
-                    ev.data.u64 = kev.ident;
-                    epoll_ctl(kq, EPOLL_CTL_ADD, ifd, &ev);
-
-                    kq_entry_t *ent = kq_alloc_entry();
-                    if (ent) {
-                        ent->kq_fd = kq;
-                        ent->filter = kev.filter;
-                        ent->ident = kev.ident;
-                        ent->backing_fd = ifd;
-                        ent->udata = kev.udata;
-                        ent->active = 1;
-                    }
-                }
-                break;
-            }
-
-            case FBSD_EVFILT_PROC:
-                /* Process events (fork/exec/exit) — hard to emulate, skip */
-                BSD_TRACE("kevent: EVFILT_PROC not supported, ignoring");
-                break;
-
-            case FBSD_EVFILT_USER:
-                /* User-triggered events — return success for registration */
-                BSD_TRACE("kevent: EVFILT_USER registered (stub)");
-                break;
-
-            default:
-                BSD_WARN("kevent: unknown filter %d", kev.filter);
-                break;
-            }
-        }
-
-        if (kev.flags & FBSD_EV_DELETE) {
-            kq_entry_t *ent = kq_find_entry(kq, kev.filter, kev.ident);
-            if (ent) {
-                if (ent->backing_fd >= 0) {
-                    epoll_ctl(kq, EPOLL_CTL_DEL, ent->backing_fd, NULL);
-                    close(ent->backing_fd);
-                } else {
-                    epoll_ctl(kq, EPOLL_CTL_DEL, (int)kev.ident, NULL);
-                }
-                ent->active = 0;
-            } else {
-                /* Direct fd — try removing from epoll */
-                epoll_ctl(kq, EPOLL_CTL_DEL, (int)kev.ident, NULL);
-            }
-        }
-    }
-
-    /* If no event retrieval requested, we're done */
-    if (nevents <= 0) return 0;
-
-    /* Calculate timeout in milliseconds */
-    int timeout_ms = -1;  /* Default: block forever */
-    if (timeout_addr) {
-        struct timespec ts;
-        struct iovec local = { &ts, sizeof(ts) };
-        struct iovec remote = { (void *)timeout_addr, sizeof(ts) };
-        if (process_vm_readv(pid, &local, 1, &remote, 1, 0) >= 0) {
-            timeout_ms = (int)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
-            if (timeout_ms == 0 && ts.tv_sec == 0 && ts.tv_nsec == 0)
-                timeout_ms = 0;  /* Non-blocking poll */
-        }
-    }
-
-    /* Wait for events via epoll */
-    int max_events = nevents < 32 ? nevents : 32;
-    struct epoll_event epevents[32];
-    int nready = epoll_wait(kq, epevents, max_events, timeout_ms);
-
-    if (nready < 0) {
-        if (errno == EINTR) return 0;
-        return -errno;
-    }
-
-    /* Translate epoll events back to kevent format */
-    for (int i = 0; i < nready; i++) {
-        struct fbsd_kevent kev;
-        memset(&kev, 0, sizeof(kev));
-        kev.ident = epevents[i].data.u64;
-
-        /* Find the entry to determine the filter type */
-        kq_entry_t *ent = NULL;
-        for (int j = 0; j < kq_entry_count; j++) {
-            if (kq_entries[j].active && kq_entries[j].kq_fd == kq &&
-                kq_entries[j].ident == kev.ident) {
-                ent = &kq_entries[j];
-                break;
-            }
-        }
-
-        if (ent) {
-            kev.filter = ent->filter;
-            kev.udata = ent->udata;
-            /* Drain backing fd if needed */
-            if (ent->filter == FBSD_EVFILT_TIMER && ent->backing_fd >= 0) {
-                uint64_t expirations;
-                ssize_t rv = read(ent->backing_fd, &expirations, sizeof(expirations));
-                (void)rv;
-                kev.data = (int64_t)expirations;
-            } else if (ent->filter == FBSD_EVFILT_SIGNAL && ent->backing_fd >= 0) {
-                uint8_t si_buf[128];  /* signalfd_siginfo is 128 bytes */
-                ssize_t rv = read(ent->backing_fd, si_buf, sizeof(si_buf));
-                (void)rv;
-                kev.data = 1;
-            }
-        } else {
-            /* Direct fd — guess filter from epoll events */
-            if (epevents[i].events & EPOLLIN) kev.filter = FBSD_EVFILT_READ;
-            else if (epevents[i].events & EPOLLOUT) kev.filter = FBSD_EVFILT_WRITE;
-            else kev.filter = FBSD_EVFILT_READ;
-        }
-
-        if (epevents[i].events & (EPOLLHUP | EPOLLRDHUP))
-            kev.flags |= FBSD_EV_EOF;
-        if (epevents[i].events & EPOLLERR)
-            kev.flags |= FBSD_EV_ERROR;
-
-        /* Write kevent to child's eventlist */
-        struct iovec local = { &kev, sizeof(kev) };
-        struct iovec remote = { (void *)(eventlist_addr + (uint64_t)i * sizeof(kev)),
-                                sizeof(kev) };
-        process_vm_writev(pid, &local, 1, &remote, 1, 0);
-    }
-
-    BSD_TRACE("kevent(): returning %d events", nready);
-    return nready;
-}
 
 /*
  * Capsicum emulation (security framework)
@@ -1925,11 +1586,53 @@ struct fbsd_termios {
     uint32_t c_ospeed;     /* output speed */
 };
 
+#define FBSD_FIOCLEX       0x20006601  /* Set close-on-exec */
+#define FBSD_FIONCLEX      0x20006602  /* Clear close-on-exec */
+#define FBSD_FIODTYPE      0x4004667a  /* Get device type (D_TAPE, D_DISK, ...) */
+#define LINUX_FIOCLEX      0x5451
+#define LINUX_FIONCLEX     0x5450
+
 static long emul_ioctl(pid_t pid, uint64_t args[6]) {
     int fd = (int)args[0];
     unsigned long request = args[1];
     uint64_t argp = args[2];
-    
+
+    /*
+     * Requests whose argument has the same layout on both systems run in
+     * the program itself with the Linux request number. Running them on a
+     * descriptor reopened through /proc (below) fails for sockets (ENXIO)
+     * and would change a different open file, not the program's.
+     */
+    unsigned long linux_req = 0;
+    switch (request) {
+        case FBSD_FIONBIO:     linux_req = LINUX_FIONBIO; break;
+        case FBSD_FIONREAD:    linux_req = LINUX_FIONREAD; break;
+        case FBSD_FIOASYNC:    linux_req = LINUX_FIOASYNC; break;
+        case FBSD_FIOCLEX:     linux_req = LINUX_FIOCLEX; break;
+        case FBSD_FIONCLEX:    linux_req = LINUX_FIONCLEX; break;
+        case FBSD_TIOCGWINSZ:  linux_req = LINUX_TIOCGWINSZ; break;
+        case FBSD_TIOCSWINSZ:  linux_req = LINUX_TIOCSWINSZ; break;
+        case FBSD_TIOCGPGRP:   linux_req = LINUX_TIOCGPGRP; break;
+        case FBSD_TIOCSPGRP:   linux_req = LINUX_TIOCSPGRP; break;
+        case FBSD_TIOCNOTTY:   linux_req = LINUX_TIOCNOTTY; break;
+        case FBSD_TIOCSCTTY:   linux_req = LINUX_TIOCSCTTY; break;
+        default: break;
+    }
+    if (linux_req) {
+        args[1] = linux_req;
+        return -EAGAIN;  /* run Linux ioctl in the program */
+    }
+
+    if (request == FBSD_FIODTYPE) {
+        /* No Linux equivalent: report a plain character device (dd(1)
+         * uses this to detect tapes and disks). */
+        int32_t type = 0;
+        struct iovec local = { &type, sizeof(type) };
+        struct iovec remote = { (void *)argp, sizeof(type) };
+        if (!argp || process_vm_writev(pid, &local, 1, &remote, 1, 0) < 0) return -EFAULT;
+        return 0;
+    }
+
     /* Access child's fd via /proc */
     char proc_path[64];
     snprintf(proc_path, sizeof(proc_path), "/proc/%d/fd/%d", pid, fd);
@@ -2175,181 +1878,58 @@ static long emul_credsync(pid_t pid, uint64_t args[6]) {
  */
 
 /*
- * connect - translate FreeBSD sockaddr to Linux format
- * int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
- * 
- * IMPORTANT: We can't call connect() from BSDulator - the fd belongs to the child!
- * Instead, we translate the sockaddr in the child's memory and let the syscall proceed.
+ * Copy the FreeBSD sockaddr at addr to a Linux one below the process's
+ * stack and return its address (0 on error). The program's own structure
+ * is left untouched: programs keep it (nginx compares its listening
+ * addresses on reload), so converting it in place corrupted it.
+ */
+static uint64_t sockaddr_in_to_linux(pid_t pid, uint64_t addr, socklen_t addrlen) {
+    uint8_t f[128], l[128];
+    if (addrlen > sizeof(f)) addrlen = sizeof(f);
+    struct iovec local = { f, addrlen };
+    struct iovec remote = { (void *)addr, addrlen };
+    if (addrlen < 2 || process_vm_readv(pid, &local, 1, &remote, 1, 0) < 0) return 0;
+
+    memset(l, 0, sizeof(l));
+    uint16_t fam = f[1] == 28 ? 10 : f[1];  /* AF_INET6: FreeBSD 28, Linux 10 */
+    memcpy(l, &fam, 2);
+    memcpy(l + 2, f + 2, addrlen - 2);
+
+    struct user_regs_struct r;
+    if (ptrace(PTRACE_GETREGS, pid, NULL, &r) < 0) return 0;
+    uint64_t dst = (r.rsp - 1536 - sizeof(l)) & ~15ULL;  /* below the red zone */
+    struct iovec lw = { l, addrlen };
+    struct iovec rw = { (void *)dst, addrlen };
+    if (process_vm_writev(pid, &lw, 1, &rw, 1, 0) < 0) return 0;
+    return dst;
+}
+
+/*
+ * connect(s, addr, addrlen), bind(s, addr, addrlen),
+ * sendto(s, buf, len, flags, addr, addrlen): pass a Linux copy of addr,
+ * then run the syscall in the program (-EAGAIN).
  */
 static long emul_connect(pid_t pid, uint64_t args[6]) {
-    int sockfd = (int)args[0];
-    uint64_t addr = args[1];
-    socklen_t addrlen = (socklen_t)args[2];
-    
-    BSD_TRACE("connect: fd=%d addr=0x%lx addrlen=%d", sockfd, addr, addrlen);
-    
-    if (addr == 0 || addrlen == 0) {
-        /* No address - execute syscall directly in child */
-        return -EAGAIN;  /* Special: tell interceptor to execute syscall normally */
+    if (args[1] && args[2]) {
+        uint64_t a = sockaddr_in_to_linux(pid, args[1], (socklen_t)args[2]);
+        if (!a) return -EFAULT;
+        args[1] = a;
     }
-    
-    /* Read FreeBSD sockaddr from child's memory */
-    uint8_t fbsd_buf[128];
-    if (addrlen > sizeof(fbsd_buf)) addrlen = sizeof(fbsd_buf);
-    
-    struct iovec local = { fbsd_buf, addrlen };
-    struct iovec remote = { (void *)addr, addrlen };
-    
-    if (process_vm_readv(pid, &local, 1, &remote, 1, 0) < 0) {
-        BSD_WARN("connect: failed to read sockaddr from child");
-        return -EFAULT;
-    }
-    
-    /* FreeBSD sockaddr: byte 0 = len, byte 1 = family */
-    uint8_t fbsd_len = fbsd_buf[0];
-    uint8_t fbsd_family = fbsd_buf[1];
-    
-    BSD_TRACE("connect: fbsd_len=%d fbsd_family=%d", fbsd_len, fbsd_family);
-    
-    /* Convert to Linux format in-place:
-     * Linux sa_family is 16-bit at offset 0, so we need to shift things
-     * 
-     * FreeBSD: [len][family][port_hi][port_lo][addr...]  
-     * Linux:   [family_lo][family_hi][port_hi][port_lo][addr...]
-     * 
-     * Since family fits in 8 bits and Linux is little-endian:
-     * Linux: [family][0][port_hi][port_lo][addr...]
-     */
-    uint8_t linux_buf[128];
-    memset(linux_buf, 0, addrlen);
-    
-    /* Set Linux sa_family (16-bit, little-endian) */
-    linux_buf[0] = fbsd_family;  /* Low byte = family */
-    linux_buf[1] = 0;            /* High byte = 0 */
-    
-    /* Copy port and address data (starting at offset 2 in both) */
-    if (addrlen > 2) {
-        memcpy(linux_buf + 2, fbsd_buf + 2, addrlen - 2);
-    }
-    
-    /* Write translated sockaddr back to child's memory */
-    struct iovec local_w = { linux_buf, addrlen };
-    struct iovec remote_w = { (void *)addr, addrlen };
-    
-    if (process_vm_writev(pid, &local_w, 1, &remote_w, 1, 0) < 0) {
-        BSD_WARN("connect: failed to write translated sockaddr");
-        return -EFAULT;
-    }
-    
-    BSD_TRACE("connect: translated sockaddr, family=%d", fbsd_family);
-    
-    /* Return -EAGAIN to tell interceptor to execute the syscall normally.
-     * The child's sockaddr has been translated in-place. */
     return -EAGAIN;
 }
 
-/*
- * bind - translate FreeBSD sockaddr to Linux format
- * int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
- * 
- * Same approach as connect: translate sockaddr in child's memory, then let syscall proceed.
- */
 static long emul_bind(pid_t pid, uint64_t args[6]) {
-    int sockfd = (int)args[0];
-    uint64_t addr = args[1];
-    socklen_t addrlen = (socklen_t)args[2];
-    
-    BSD_TRACE("bind: fd=%d addr=0x%lx addrlen=%d", sockfd, addr, addrlen);
-    
-    if (addr == 0 || addrlen == 0) {
-        return -EAGAIN;  /* Execute syscall normally */
-    }
-    
-    /* Read FreeBSD sockaddr from child's memory */
-    uint8_t fbsd_buf[128];
-    if (addrlen > sizeof(fbsd_buf)) addrlen = sizeof(fbsd_buf);
-    
-    struct iovec local = { fbsd_buf, addrlen };
-    struct iovec remote = { (void *)addr, addrlen };
-    
-    if (process_vm_readv(pid, &local, 1, &remote, 1, 0) < 0) {
-        return -EFAULT;
-    }
-    
-    uint8_t fbsd_family = fbsd_buf[1];
-    
-    /* Convert to Linux format */
-    uint8_t linux_buf[128];
-    memset(linux_buf, 0, addrlen);
-    linux_buf[0] = fbsd_family;
-    linux_buf[1] = 0;
-    if (addrlen > 2) {
-        memcpy(linux_buf + 2, fbsd_buf + 2, addrlen - 2);
-    }
-    
-    /* Write back to child's memory */
-    struct iovec local_w = { linux_buf, addrlen };
-    struct iovec remote_w = { (void *)addr, addrlen };
-    
-    if (process_vm_writev(pid, &local_w, 1, &remote_w, 1, 0) < 0) {
-        return -EFAULT;
-    }
-    
-    BSD_TRACE("bind: translated sockaddr, family=%d", fbsd_family);
-    return -EAGAIN;  /* Execute syscall normally */
+    return emul_connect(pid, args);
 }
 
-/*
- * sendto - translate FreeBSD sockaddr to Linux format
- * ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
- *                const struct sockaddr *dest_addr, socklen_t addrlen)
- * 
- * Same approach: translate sockaddr in child's memory, then let syscall proceed.
- */
 static long emul_sendto(pid_t pid, uint64_t args[6]) {
-    int sockfd = (int)args[0];
-    /* buf, len, flags passed through unchanged */
-    uint64_t dest_addr = args[4];
-    socklen_t addrlen = (socklen_t)args[5];
-    
-    BSD_TRACE("sendto: fd=%d dest=0x%lx addrlen=%d", sockfd, dest_addr, addrlen);
-    
-    if (dest_addr == 0 || addrlen == 0) {
-        return -EAGAIN;  /* Execute syscall normally */
+    args[3] = msg_flags_to_linux((uint32_t)args[3]);
+    if (args[4] && args[5]) {
+        uint64_t a = sockaddr_in_to_linux(pid, args[4], (socklen_t)args[5]);
+        if (!a) return -EFAULT;
+        args[4] = a;
     }
-    
-    /* Read FreeBSD sockaddr from child's memory */
-    uint8_t fbsd_buf[128];
-    if (addrlen > sizeof(fbsd_buf)) addrlen = sizeof(fbsd_buf);
-    
-    struct iovec local = { fbsd_buf, addrlen };
-    struct iovec remote = { (void *)dest_addr, addrlen };
-    
-    if (process_vm_readv(pid, &local, 1, &remote, 1, 0) < 0) {
-        return -EFAULT;
-    }
-    
-    uint8_t fbsd_family = fbsd_buf[1];
-    
-    /* Convert to Linux format */
-    uint8_t linux_buf[128];
-    memset(linux_buf, 0, addrlen);
-    linux_buf[0] = fbsd_family;
-    linux_buf[1] = 0;
-    if (addrlen > 2) {
-        memcpy(linux_buf + 2, fbsd_buf + 2, addrlen - 2);
-    }
-    
-    /* Write back to child's memory */
-    struct iovec local_w = { linux_buf, addrlen };
-    struct iovec remote_w = { (void *)dest_addr, addrlen };
-    
-    if (process_vm_writev(pid, &local_w, 1, &remote_w, 1, 0) < 0) {
-        return -EFAULT;
-    }
-    
-    BSD_TRACE("sendto: translated sockaddr, family=%d", fbsd_family);
-    return -EAGAIN;  /* Execute syscall normally */
+    return -EAGAIN;
 }
 
 /*
@@ -2402,6 +1982,7 @@ static long emul_socket(pid_t pid, uint64_t args[6]) {
     
     /* Update args with translated type */
     args[1] = (uint64_t)linux_type;
+    if (domain == 28) args[0] = 10;  /* AF_INET6: FreeBSD 28, Linux 10 */
     
     /* Return -EAGAIN to let syscall proceed with translated args */
     return -EAGAIN;
