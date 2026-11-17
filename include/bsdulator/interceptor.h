@@ -127,6 +127,17 @@ ssize_t interceptor_read_string(pid_t pid, char *local, const void *remote, size
 int interceptor_run(interceptor_state_t *state);
 
 /*
+ * Run the tracer inside a lochs container instead of as host root (see
+ * interceptor.c). prepare: before forking the tracer, as host root;
+ * returns 1 if the tracer will run inside, 0 if not (old behaviour), -1
+ * on error. front: in the parent, drops to container root's host uid.
+ * enter: in the tracer, joins the container and drops all privileges.
+ */
+int interceptor_container_prepare(const char *binary, char *const argv[]);
+void interceptor_container_front(void);
+int interceptor_container_enter(void);
+
+/*
  * Called once when the first traced process exits while processes it
  * started (a daemon, a background job) are still running. Tracing goes on
  * until they have all exited; the final exit code stays the first one's.

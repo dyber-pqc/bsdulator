@@ -1218,6 +1218,27 @@ static long emul_pathconf(pid_t pid, uint64_t args[6]) {
     return ret;
 }
 
+/*
+ * The program's fd as an fd of ours. pidfd_getfd duplicates it (same open
+ * file) and needs only ptrace access to the program; reopening
+ * /proc/<pid>/fd/N checks the file's permissions as the tracer, which,
+ * running unprivileged in a container, cannot open a pipe or terminal
+ * that belongs to host root. Returns the fd or -1 with errno.
+ */
+static int tracee_fd(pid_t pid, int fd, int reopen_flags) {
+    int pfd = (int)syscall(434 /* pidfd_open */, pid, 0);
+    if (pfd >= 0) {
+        int dup_fd = (int)syscall(438 /* pidfd_getfd */, pfd, fd, 0);
+        int e = errno;
+        close(pfd);
+        if (dup_fd >= 0) return dup_fd;
+        if (e == EBADF) { errno = EBADF; return -1; }
+    }
+    char proc_path[64];
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d/fd/%d", pid, fd);
+    return open(proc_path, reopen_flags | O_CLOEXEC);
+}
+
 static long emul_fpathconf(pid_t pid, uint64_t args[6]) {
     int fd = (int)args[0];
     int name = (int)args[1];
@@ -1229,8 +1250,8 @@ static long emul_fpathconf(pid_t pid, uint64_t args[6]) {
     int linux_name = translate_pathconf_name(name);
     BSD_TRACE("fpathconf: fd=%d name=%d->%d", fd, name, linux_name);
     
-    /* Open the child's fd via /proc and call fpathconf on that */
-    int our_fd = open(proc_path, O_RDONLY);
+    /* The child's fd, and fpathconf on that */
+    int our_fd = tracee_fd(pid, fd, O_RDONLY);
     if (our_fd < 0) {
         BSD_WARN("fpathconf: failed to open %s: %s", proc_path, strerror(errno));
         return -errno;
@@ -1526,14 +1547,14 @@ static long emul_ioctl(pid_t pid, uint64_t args[6]) {
     char proc_path[64];
     snprintf(proc_path, sizeof(proc_path), "/proc/%d/fd/%d", pid, fd);
     
-    int our_fd = open(proc_path, O_RDWR | O_NOCTTY);
-    if (our_fd < 0) {
+    int our_fd = tracee_fd(pid, fd, O_RDWR | O_NOCTTY);
+    if (our_fd < 0 && errno != EBADF) {
         /* Try read-only */
-        our_fd = open(proc_path, O_RDONLY);
-        if (our_fd < 0) {
-            BSD_WARN("ioctl: failed to open %s: %s", proc_path, strerror(errno));
-            return -errno;
-        }
+        our_fd = open(proc_path, O_RDONLY | O_CLOEXEC);
+    }
+    if (our_fd < 0) {
+        BSD_WARN("ioctl: failed to get %s: %s", proc_path, strerror(errno));
+        return -errno;
     }
     
     long ret = 0;

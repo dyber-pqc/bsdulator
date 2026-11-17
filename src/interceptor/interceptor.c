@@ -28,6 +28,7 @@
 #include <asm/prctl.h>
 #include <sys/prctl.h>
 #include <grp.h>
+#include <linux/capability.h>
 #include "bsdulator.h"
 #include "runtime/freebsd_runtime.h"
 #include "bsdulator/jail.h"
@@ -807,7 +808,279 @@ static int fixup_freebsd_entry(pid_t pid) {
     return 0;
 }
 
+/* ---------------------------------------------------------------------
+ * The tracer inside the container
+ *
+ * For a lochs container (holder pid given with -N, root pivoted, own user
+ * namespace) the tracer does not stay host root. bsdulator_run() calls:
+ *   interceptor_container_prepare()  host root, before forking the tracer:
+ *       opens the container's namespaces, joins its PID namespace for the
+ *       children (so the tracer is born inside it);
+ *   interceptor_container_front()    in the front: drops to the host uid of
+ *       container root (it only waits and forwards signals);
+ *   interceptor_container_enter()    in the tracer: joins the container's
+ *       network, user, mount, UTS and IPC namespaces and becomes container
+ *       root with no capabilities, no_new_privs, not dumpable (container
+ *       processes cannot read or write its memory) and the container
+ *       seccomp filter less ptrace and process_vm_readv/writev.
+ * The tracer then sees the container's processes, /proc and files exactly
+ * as they do, and a fault in it gives no more than container root.
+ * ------------------------------------------------------------------- */
+
+static struct {
+    int active;
+    int net_fd, user_fd, ns_fd[3];
+    int cap_last;
+    uid_t host_uid;
+    const char *binary;
+    char *const *argv;
+} ct = { 0, -1, -1, { -1, -1, -1 }, 40, 0, NULL, NULL };
+
+/* Docker's default capabilities: the bounding set of container processes */
+static const int keep[] = {
+    0 /* CHOWN */, 1 /* DAC_OVERRIDE */, 3 /* FOWNER */, 4 /* FSETID */,
+    5 /* KILL */, 6 /* SETGID */, 7 /* SETUID */, 8 /* SETPCAP */,
+    10 /* NET_BIND_SERVICE */, 13 /* NET_RAW */, 18 /* SYS_CHROOT */,
+    27 /* MKNOD */, 29 /* AUDIT_WRITE */, 31 /* SETFCAP */,
+};
+
+static int drop_bounding(int last) {
+    for (int c = 0; c <= last; c++) {
+        int kept = 0;
+        for (size_t k = 0; k < sizeof(keep) / sizeof(keep[0]); k++)
+            if (keep[k] == c) kept = 1;
+        if (!kept && prctl(PR_CAPBSET_DROP, c, 0, 0, 0) < 0 && errno != EINVAL) {
+            fprintf(stderr, "Failed to drop capability %d: %s\n", c, strerror(errno));
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* The host paths lochs passes are container paths in a pivoted root */
+static char *const *strip_argv(char *const argv[]) {
+    size_t n = 0;
+    while (argv[n]) n++;
+    char **na = calloc(n + 1, sizeof(char *));
+    if (!na) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        const char *v = jail_visible_path(argv[i]);
+        if (v == argv[i] && strncmp(argv[i], "path=", 5) == 0) {
+            const char *pv = jail_visible_path(argv[i] + 5);
+            if (pv != argv[i] + 5) {
+                char *t = malloc(strlen(pv) + 6);
+                if (t) {
+                    sprintf(t, "path=%s", pv);
+                    v = t;
+                }
+            }
+        }
+        na[i] = (char *)v;
+    }
+    return na;
+}
+
+int interceptor_container_prepare(const char *binary, char *const argv[]) {
+    int ns_pid = bsdulator_get_ns_pid();
+    if (ns_pid <= 0) return 0;
+    char p[128];
+
+    /* Only a pivoted root with its own user namespace; else the tracer
+     * stays outside (interceptor_spawn) */
+    const char *froot = bsdulator_get_freebsd_root();
+    struct stat hs, rs, me;
+    snprintf(p, sizeof(p), "/proc/%d/root/", ns_pid);
+    if (!froot || !froot[0] || stat(p, &hs) != 0 || stat(froot, &rs) != 0 ||
+        stat("/", &me) != 0 || hs.st_dev != rs.st_dev || hs.st_ino != rs.st_ino ||
+        (me.st_dev == rs.st_dev && me.st_ino == rs.st_ino))
+        return 0;
+    char mine[64] = "", theirs[64] = "";
+    snprintf(p, sizeof(p), "/proc/%d/ns/user", ns_pid);
+    ssize_t a1 = readlink("/proc/self/ns/user", mine, sizeof(mine) - 1);
+    ssize_t a2 = readlink(p, theirs, sizeof(theirs) - 1);
+    if (a1 <= 0 || a2 <= 0) return 0;
+    mine[a1] = theirs[a2] = '\0';
+    if (strcmp(mine, theirs) == 0) return 0;
+
+    /* Container root's host uid, for the front */
+    snprintf(p, sizeof(p), "/proc/%d/uid_map", ns_pid);
+    FILE *mf = fopen(p, "r");
+    unsigned long inside = 1, outside = 0;
+    if (mf) {
+        if (fscanf(mf, "%lu %lu", &inside, &outside) != 2) inside = 1;
+        fclose(mf);
+    }
+    if (inside != 0 || outside == 0) return 0;
+    ct.host_uid = (uid_t)outside;
+
+    FILE *cf = fopen("/proc/sys/kernel/cap_last_cap", "r");
+    if (cf) {
+        if (fscanf(cf, "%d", &ct.cap_last) != 1) ct.cap_last = 40;
+        fclose(cf);
+    }
+
+    const char *netns = bsdulator_get_netns();
+    if (netns && netns[0]) {
+        snprintf(p, sizeof(p), "/var/run/netns/%s", netns);
+        ct.net_fd = open(p, O_RDONLY | O_CLOEXEC);
+        if (ct.net_fd < 0) {
+            BSD_ERROR("cannot open %s: %s", p, strerror(errno));
+            return -1;
+        }
+    }
+    snprintf(p, sizeof(p), "/proc/%d/ns/user", ns_pid);
+    ct.user_fd = open(p, O_RDONLY | O_CLOEXEC);
+    static const char *names[3] = { "mnt", "uts", "ipc" };
+    for (int i = 0; i < 3; i++) {
+        snprintf(p, sizeof(p), "/proc/%d/ns/%s", ns_pid, names[i]);
+        ct.ns_fd[i] = open(p, O_RDONLY | O_CLOEXEC);
+        if (ct.ns_fd[i] < 0) {
+            BSD_ERROR("cannot open %s: %s", p, strerror(errno));
+            return -1;
+        }
+    }
+    if (ct.user_fd < 0) return -1;
+
+    bsdulator_set_rooted(1);
+    ct.binary = jail_visible_path(binary);
+    ct.argv = strip_argv(argv);
+    if (!ct.argv) return -1;
+
+    /* Children (the tracer) are born in the container's PID namespace */
+    snprintf(p, sizeof(p), "/proc/%d/ns/pid", ns_pid);
+    int pfd = open(p, O_RDONLY | O_CLOEXEC);
+    if (pfd < 0 || setns(pfd, CLONE_NEWPID) < 0) {
+        BSD_ERROR("cannot join the PID namespace of %d: %s", ns_pid, strerror(errno));
+        if (pfd >= 0) close(pfd);
+        return -1;
+    }
+    close(pfd);
+    BSD_INFO("tracer runs in the container: %s", ct.binary);
+    return 1;
+}
+
+static void ct_close(void) {
+    if (ct.net_fd >= 0) close(ct.net_fd);
+    if (ct.user_fd >= 0) close(ct.user_fd);
+    for (int i = 0; i < 3; i++) if (ct.ns_fd[i] >= 0) close(ct.ns_fd[i]);
+    ct.net_fd = ct.user_fd = ct.ns_fd[0] = ct.ns_fd[1] = ct.ns_fd[2] = -1;
+}
+
+void interceptor_container_front(void) {
+    ct_close();
+    /* Same host uid as the tracer: it can still signal it */
+    if (setgroups(0, NULL) < 0 || setresgid(ct.host_uid, ct.host_uid, ct.host_uid) < 0 ||
+        setresuid(ct.host_uid, ct.host_uid, ct.host_uid) < 0) {
+        fprintf(stderr, "bsdulator: cannot drop privileges: %s\n", strerror(errno));
+        _exit(127);
+    }
+}
+
+int interceptor_container_enter(void) {
+    static const int types[3] = { CLONE_NEWNS, CLONE_NEWUTS, CLONE_NEWIPC };
+    /* The network namespace belongs to the host: joined while host root */
+    if (ct.net_fd >= 0 && setns(ct.net_fd, CLONE_NEWNET) < 0) {
+        fprintf(stderr, "Failed to enter the network namespace: %s\n", strerror(errno));
+        return -1;
+    }
+    if (setns(ct.user_fd, CLONE_NEWUSER) < 0) {
+        fprintf(stderr, "Failed to enter the user namespace: %s\n", strerror(errno));
+        return -1;
+    }
+    for (int i = 0; i < 3; i++) {
+        if (setns(ct.ns_fd[i], types[i]) < 0) {
+            fprintf(stderr, "Failed to enter a container namespace: %s\n", strerror(errno));
+            return -1;
+        }
+    }
+    ct_close();
+    if (setgroups(0, NULL) < 0 || setresgid(0, 0, 0) < 0 || setresuid(0, 0, 0) < 0) {
+        fprintf(stderr, "Failed to become container root: %s\n", strerror(errno));
+        return -1;
+    }
+    /*
+     * Capabilities, all within the container's user namespace. With
+     * no_new_privs an exec cannot give a program more than its parent's
+     * permitted set, so the tracer keeps Docker's set as permitted (what
+     * every container process has), not effective. It also has
+     * CAP_SYS_PTRACE, effective: a program that changes uid (an nginx
+     * worker becoming www) is no longer dumpable, and its memory can then
+     * only be read and written with it. Programs do not get it (it is not
+     * in the bounding set, which an exec applies), and cannot use it on
+     * the tracer (not dumpable).
+     */
+    if (drop_bounding(ct.cap_last) < 0) return -1;
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) return -1;
+    struct __user_cap_header_struct h = { _LINUX_CAPABILITY_VERSION_3, 0 };
+    struct __user_cap_data_struct d[2];
+    memset(d, 0, sizeof(d));
+    for (size_t k = 0; k < sizeof(keep) / sizeof(keep[0]); k++)
+        d[keep[k] / 32].permitted |= 1u << (keep[k] % 32);
+    d[0].permitted |= 1u << 19;   /* CAP_SYS_PTRACE */
+    d[0].effective |= 1u << 19;
+    if (syscall(SYS_capset, &h, d) < 0) {
+        fprintf(stderr, "Failed to drop capabilities: %s\n", strerror(errno));
+        return -1;
+    }
+    if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) < 0) return -1;
+    if (container_seccomp_install_tracer() < 0) {
+        fprintf(stderr, "Failed to install the tracer's seccomp filter: %s\n", strerror(errno));
+        return -1;
+    }
+    if (chdir("/") < 0) return -1;
+    ct.active = 1;
+    return 0;
+}
+
+static pid_t spawn_finish(pid_t pid) {
+    int status;
+    if (waitpid(pid, &status, 0) < 0) {
+        BSD_ERROR("waitpid() failed: %s", strerror(errno));
+        kill(pid, SIGKILL);
+        return -1;
+    }
+    if (!WIFSTOPPED(status)) {
+        BSD_ERROR("Child did not stop as expected (status=0x%x)", status);
+        kill(pid, SIGKILL);
+        return -1;
+    }
+    if (ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_OPTIONS) < 0) {
+        BSD_ERROR("ptrace(SETOPTIONS) failed: %s", strerror(errno));
+        kill(pid, SIGKILL);
+        return -1;
+    }
+    BSD_TRACE("Process spawned and ready, PID=%d", (int)pid);
+    return pid;
+}
+
+/* The program, from a tracer already inside the container */
+static pid_t spawn_in_container(char *const envp[]) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        BSD_ERROR("fork() failed: %s", strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) < 0) {
+            perror("ptrace(TRACEME)");
+            _exit(127);
+        }
+        /* Syscalls that act on the whole host are refused */
+        if (container_seccomp_install() < 0) {
+            fprintf(stderr, "Failed to install the seccomp filter: %s\n", strerror(errno));
+            _exit(127);
+        }
+        raise(SIGSTOP);
+        execve(ct.binary, ct.argv, envp);
+        perror("execve");
+        _exit(127);
+    }
+    return spawn_finish(pid);
+}
+
 pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp[]) {
+    if (ct.active) return spawn_in_container(envp);
+
     BSD_TRACE("Spawning process: %s", binary);
     
     /* Get network namespace name if configured */
@@ -964,22 +1237,7 @@ pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp
          * processes, set the clock, or touch raw I/O on the host.
          */
         if (ns_pid > 0) {
-            static const int keep[] = {
-                0 /* CHOWN */, 1 /* DAC_OVERRIDE */, 3 /* FOWNER */, 4 /* FSETID */,
-                5 /* KILL */, 6 /* SETGID */, 7 /* SETUID */, 8 /* SETPCAP */,
-                10 /* NET_BIND_SERVICE */, 13 /* NET_RAW */, 18 /* SYS_CHROOT */,
-                27 /* MKNOD */, 29 /* AUDIT_WRITE */, 31 /* SETFCAP */,
-            };
-            int last = cap_last;
-            for (int c = 0; c <= last; c++) {
-                int kept = 0;
-                for (size_t k = 0; k < sizeof(keep) / sizeof(keep[0]); k++)
-                    if (keep[k] == c) kept = 1;
-                if (!kept && prctl(PR_CAPBSET_DROP, c, 0, 0, 0) < 0 && errno != EINVAL) {
-                    fprintf(stderr, "Failed to drop capability %d: %s\n", c, strerror(errno));
-                    _exit(127);
-                }
-            }
+            if (drop_bounding(cap_last) < 0) _exit(127);
             if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
                 fprintf(stderr, "Failed to set no_new_privs: %s\n", strerror(errno));
                 _exit(127);
@@ -999,28 +1257,7 @@ pid_t interceptor_spawn(const char *binary, char *const argv[], char *const envp
 
     for (int i = 0; i < 3; i++) if (ns_fd[i] >= 0) close(ns_fd[i]);
     if (user_fd >= 0) close(user_fd);
-    
-    int status;
-    if (waitpid(pid, &status, 0) < 0) {
-        BSD_ERROR("waitpid() failed: %s", strerror(errno));
-        kill(pid, SIGKILL);
-        return -1;
-    }
-    
-    if (!WIFSTOPPED(status)) {
-        BSD_ERROR("Child did not stop as expected (status=0x%x)", status);
-        kill(pid, SIGKILL);
-        return -1;
-    }
-    
-    if (ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_OPTIONS) < 0) {
-        BSD_ERROR("ptrace(SETOPTIONS) failed: %s", strerror(errno));
-        kill(pid, SIGKILL);
-        return -1;
-    }
-    
-    BSD_TRACE("Process spawned and ready, PID=%d", (int)pid);
-    return pid;
+    return spawn_finish(pid);
 }
 
 int interceptor_attach(pid_t pid) {

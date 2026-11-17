@@ -11,4 +11,8 @@
  */
 int container_seccomp_install(void);
 
+/* The same for a tracer running in the container: its tracees can still
+ * be traced and read (ptrace, process_vm_readv/writev) */
+int container_seccomp_install_tracer(void);
+
 #endif /* BSDULATOR_SECCOMP_H */

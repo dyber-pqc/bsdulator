@@ -1742,7 +1742,12 @@ long emul_jail_set(pid_t pid, uint64_t args[6]) {
         }
         
         /* Setup virtual network stack if requested */
-        if (params.has_vnet && params.vnet) {
+        if (params.has_vnet && params.vnet && bsdulator_is_rooted()) {
+            /* A lochs container already has a network namespace of its
+             * own, and its unprivileged tracer cannot make another: the
+             * jail uses the container's */
+            BSD_INFO("jail_set(): vnet in a container: using the container's network");
+        } else if (params.has_vnet && params.vnet) {
             bsd_jail_t *new_jail = jail_find_by_id(jid);
             if (new_jail) {
                 new_jail->vnet = 1;

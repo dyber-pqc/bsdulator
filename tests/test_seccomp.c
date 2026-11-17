@@ -78,6 +78,28 @@ static int t_clone3(void) {
 }
 #endif
 
+/* The tracer's variant: ptrace and process_vm_* reach the kernel, the rest
+ * of the container filter still applies */
+static int in_tracer_child(int (*fn)(void)) {
+    pid_t p = fork();
+    if (p == 0) {
+        if (container_seccomp_install_tracer() < 0) _exit(100);
+        _exit(fn());
+    }
+    int st = 0;
+    waitpid(p, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 200;
+}
+
+static int not_denied(long nr) {
+    errno = 0;
+    long r = syscall(nr, -1, 0, 0, 0, 0, 0);   /* invalid arguments */
+    return (r == -1 && errno == EPERM) ? 1 : 0;
+}
+
+static int t_ptrace_ok(void) { return not_denied(SYS_ptrace); }
+static int t_vm_read_ok(void) { return not_denied(SYS_process_vm_readv); }
+
 int main(void) {
     printf("container seccomp filter\n");
     CHECK(in_child(t_getpid) == 0, "ordinary syscalls allowed");
@@ -93,6 +115,13 @@ int main(void) {
 #ifdef SYS_clone3
     CHECK(in_child(t_clone3) == 0, "clone3 returns ENOSYS");
 #endif
+    printf("tracer variant\n");
+    CHECK(in_tracer_child(t_ptrace_ok) == 0, "ptrace reaches the kernel");
+    CHECK(in_tracer_child(t_vm_read_ok) == 0, "process_vm_readv reaches the kernel");
+    CHECK(in_tracer_child(t_mount) == 0, "mount still refused");
+    CHECK(in_tracer_child(t_unshare) == 0, "unshare still refused");
+    CHECK(in_tracer_child(t_fork) == 0, "fork allowed");
+
     if (failures) {
         printf("%d test(s) FAILED\n", failures);
         return 1;

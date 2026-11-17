@@ -72,7 +72,17 @@ static const int denied[] = {
 
 #define DENIED_COUNT (sizeof(denied) / sizeof(denied[0]))
 
-int container_seccomp_install(void) {
+/* The tracer needs these on its tracees (pidfd_getfd: their fds); nothing
+ * else differs */
+static int tracer_needs(int nr) {
+    return nr == SYS_ptrace || nr == SYS_process_vm_readv || nr == SYS_process_vm_writev
+#ifdef SYS_pidfd_getfd
+        || nr == SYS_pidfd_getfd
+#endif
+        ;
+}
+
+static int install(int tracer) {
     /* 6 header + 2 per denied syscall + 5 for clone + 2 for clone3 + 1 */
     struct sock_filter f[8 + 2 * DENIED_COUNT + 8];
     unsigned n = 0;
@@ -90,6 +100,7 @@ int container_seccomp_install(void) {
     ADD(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)));
 
     for (size_t i = 0; i < DENIED_COUNT; i++) {
+        if (tracer && tracer_needs(denied[i])) continue;
         ADD(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)denied[i], 0, 1));
         ADD(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)));
     }
@@ -114,4 +125,12 @@ int container_seccomp_install(void) {
     struct sock_fprog prog = { .len = (unsigned short)n, .filter = f };
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) return -1;
     return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog);
+}
+
+int container_seccomp_install(void) {
+    return install(0);
+}
+
+int container_seccomp_install_tracer(void) {
+    return install(1);
 }

@@ -63,7 +63,9 @@ static void tracer_main_exited(int code) {
     if (nfd >= 0) {
         dup2(nfd, 0);
         dup2(nfd, 1);
-        dup2(nfd, 2);
+        /* BSDULATOR_KEEP_STDERR=1 keeps the log (debugging) */
+        const char *keep = getenv("BSDULATOR_KEEP_STDERR");
+        if (!keep || keep[0] != '1') dup2(nfd, 2);
         if (nfd > 2) close(nfd);
     }
 }
@@ -76,7 +78,10 @@ static void front_signal(int sig, siginfo_t *si, void *uc) {
     if (front_target > 0) kill((pid_t)front_target, sig);
 }
 
-static void front_wait(pid_t tracer, int fd) {
+/* contained: the tracer runs in the container's PID namespace, so the
+ * program's pid it reports is not ours to signal; signals go to the
+ * tracer, which passes them on */
+static void front_wait(pid_t tracer, int fd, int contained) {
     front_target = tracer;
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -91,7 +96,7 @@ static void front_wait(pid_t tracer, int fd) {
         ssize_t n = read(fd, m, sizeof(m));
         if (n < 0 && errno == EINTR) continue;
         if (n != (ssize_t)sizeof(m)) break;
-        if (m[0] == MSG_PID) front_target = m[1];
+        if (m[0] == MSG_PID && !contained) front_target = m[1];
         else if (m[0] == MSG_EXIT) _exit(m[1]);
     }
     /* The tracer ended without a report: use its own status */
@@ -102,9 +107,16 @@ static void front_wait(pid_t tracer, int fd) {
     _exit(1);
 }
 
-/* Tracer: the program gets terminal signals itself; SIGTERM ends the
- * tracer, and the kernel then kills every traced process (EXITKILL) */
-static void tracer_ignore(int sig) { (void)sig; }
+/* Tracer: signals sent with kill() (by the front) go on to the program;
+ * terminal ones (Ctrl-C) already reach it. SIGKILL ends the tracer, and
+ * the kernel then kills every traced process (EXITKILL). */
+static volatile sig_atomic_t tracer_main = 0;
+
+static void tracer_signal(int sig, siginfo_t *si, void *uc) {
+    (void)uc;
+    if (si && si->si_code > 0) return;
+    if (tracer_main > 0) kill((pid_t)tracer_main, sig);
+}
 
 static void print_version(void) {
     printf("BSDulator v%d.%d.%d\n",
@@ -169,9 +181,15 @@ int bsdulator_init(void) {
     }
     
     /* Handlers, not SIG_IGN: exec resets them for the traced program */
-    signal(SIGINT, tracer_ignore);
-    signal(SIGQUIT, tracer_ignore);
-    signal(SIGHUP, tracer_ignore);
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = tracer_signal;
+        sa.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&sa.sa_mask);
+        static const int fwd[] = { SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2, SIGWINCH };
+        for (size_t i = 0; i < sizeof(fwd) / sizeof(fwd[0]); i++) sigaction(fwd[i], &sa, NULL);
+    }
     
     BSD_INFO("Initialization complete");
     return 0;
@@ -300,6 +318,10 @@ int bsdulator_run(const char *binary, char *const argv[], char *const envp[]) {
         BSD_WARN("Interpreter: %s", info.interp);
     }
     
+    /* A lochs container: the tracer will run inside it, unprivileged */
+    int contained = interceptor_container_prepare(binary, argv);
+    if (contained < 0) return 1;
+
     /* Split into the front (returns the exit code) and the tracer */
     int rp[2];
     if (pipe2(rp, O_CLOEXEC) < 0) {
@@ -315,11 +337,16 @@ int bsdulator_run(const char *binary, char *const argv[], char *const envp[]) {
     }
     if (tracer > 0) {
         close(rp[1]);
-        front_wait(tracer, rp[0]);
+        if (contained) interceptor_container_front();
+        front_wait(tracer, rp[0], contained);
     }
     close(rp[0]);
     report_fd = rp[1];
     interceptor_set_main_exit_hook(tracer_main_exited);
+    if (contained && interceptor_container_enter() < 0) {
+        report(MSG_EXIT, 127);
+        return 127;
+    }
 
     /* Spawn the process under ptrace */
     pid_t pid = interceptor_spawn(binary, argv, (char *const *)envp);
@@ -329,6 +356,7 @@ int bsdulator_run(const char *binary, char *const argv[], char *const envp[]) {
         return 1;
     }
     report(MSG_PID, (int)pid);
+    tracer_main = pid;
     
     BSD_INFO("Spawned process with PID %d", (int)pid);
     

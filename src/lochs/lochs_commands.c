@@ -114,8 +114,13 @@ typedef struct {
  * Read the actual JID from BSDulator's jail state file.
  * Returns the JID if found, -1 if not found.
  */
-static int get_bsdulator_jid(const char *jail_name) {
-    FILE *f = fopen(BSDULATOR_JAIL_STATE, "rb");
+static int get_bsdulator_jid(const char *jail_name, const char *root) {
+    /* Inside a container the engine keeps it in the container's /tmp; that
+     * file belongs to the container, so it is read as untrusted data */
+    char in_root[LOCHS_MAX_PATH + 64];
+    snprintf(in_root, sizeof(in_root), "%s%s", root ? root : "", BSDULATOR_JAIL_STATE);
+    FILE *f = root && root[0] ? fopen(in_root, "rb") : NULL;
+    if (!f) f = fopen(BSDULATOR_JAIL_STATE, "rb");
     if (!f) return -1;
     
     bsd_jail_header_t header;
@@ -130,12 +135,13 @@ static int get_bsdulator_jid(const char *jail_name) {
     }
     
     /* Read each jail entry looking for our name */
-    for (int i = 0; i < header.jail_count; i++) {
+    for (int i = 0; i < header.jail_count && i < 4096; i++) {
         bsd_jail_entry_t entry;
         if (fread(&entry, sizeof(entry), 1, f) != 1) {
             break;
         }
-        
+        entry.name[sizeof(entry.name) - 1] = '\0';
+
         if (entry.active && strcmp(entry.name, jail_name) == 0) {
             fclose(f);
             return entry.jid;
@@ -1118,6 +1124,16 @@ int lochs_cmd_start(int argc, char **argv) {
         fprintf(stderr, "Warning: could not create namespaces for '%s'; running without them\n", name);
     char ns_arg[16];
 
+    /* The engine keeps its jail registry in the container's /tmp (its
+     * tracer runs inside): one left from the last run is stale */
+    {
+        char reg[LOCHS_MAX_PATH + 64];
+        snprintf(reg, sizeof(reg), "%s%s", jail->path, BSDULATOR_JAIL_STATE);
+        lochs_croot_enter();
+        unlink(reg);
+        lochs_croot_leave();
+    }
+
     /*
      * Build the jail command using binaries FROM THE CONTAINER IMAGE.
      *
@@ -1180,7 +1196,7 @@ int lochs_cmd_start(int argc, char **argv) {
     }
     
     /* Get the actual JID from BSDulator's jail state */
-    int actual_jid = get_bsdulator_jid(jail->name);
+    int actual_jid = get_bsdulator_jid(jail->name, jail->path);
     if (actual_jid > 0) {
         jail->jid = actual_jid;
     } else {
@@ -1323,14 +1339,14 @@ int lochs_cmd_stop(int argc, char **argv) {
         lochs_network_teardown_container(name);
     }
 
-    /* Use jail -r from the container image */
-    char ld_path[LOCHS_MAX_PATH + 32], jail_bin[LOCHS_MAX_PATH + 32];
-    jail_subpath(ld_path, sizeof(ld_path), jail, "/libexec/ld-elf.so.1");
-    jail_subpath(jail_bin, sizeof(jail_bin), jail, "/usr/sbin/jail");
-    const char *rargv[] = { lochs_bsdulator_path(), "-r", jail->path,
-                            ld_path, jail_bin, "-r", jail->name, NULL };
-
-    int ret = lochs_run(rargv, 0);
+    /*
+     * No "jail -r" here: it would run the container's own /usr/sbin/jail
+     * (which container root can replace) as host root. The jail exists
+     * only in the engine's registry inside the container, which ending
+     * the container's namespaces and a fresh registry at start take care
+     * of.
+     */
+    int ret = 0;
 
     /* Ends every process still in the container */
     lochs_ns_stop(jail->name);
@@ -1510,7 +1526,7 @@ int lochs_cmd_ps(int argc, char **argv) {
     for (int i = 0; i < jail_count; i++) {
         lochs_jail_t *j = &jails[i];
         if (j->state == JAIL_STATE_RUNNING) {
-            int actual_jid = get_bsdulator_jid(j->name);
+            int actual_jid = get_bsdulator_jid(j->name, j->path);
             if (actual_jid > 0) {
                 if (j->jid != actual_jid) {
                     j->jid = actual_jid;
