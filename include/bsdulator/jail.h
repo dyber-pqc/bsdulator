@@ -180,6 +180,16 @@ int jail_get_next_jid(void);
 int jail_get_process_jid(pid_t pid);
 
 /*
+ * A process created by fork, vfork or clone is in the same jail as its
+ * parent. Call when the tracer sees the new child. No-op if the parent is
+ * not jailed.
+ */
+void jail_inherit_process(pid_t parent, pid_t child);
+
+/* Drop a process's jail membership when it exits. */
+void jail_forget_process(pid_t pid);
+
+/*
  * Syscall handlers
  * These are called from syscall_table.c
  */

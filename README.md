@@ -184,6 +184,9 @@ Environment:
 - **Not a security boundary yet.** A jail is a Linux network namespace plus `chroot`; there are no PID, mount or user namespaces and no seccomp filter, so root inside a jail is root on the host. Only run software you trust.
 - **No real threads.** `thr_new` is not implemented and `_umtx_op` does not block or lock, so multi-threaded FreeBSD programs (Redis, Node.js, Go, Rust) fail or misbehave.
 - **kqueue does not work.** Software that uses it, including nginx's default event method, will not run correctly. For nginx, `use poll;` is a workaround.
+- **Signal handlers are not installed.** `sigaction` and `sigprocmask` run in the tracer, not in the FreeBSD process, so a program's handlers and masks never take effect: signals get their default action. `sh`'s `trap` does nothing, `wait` on a background job returns 128, and daemons that reload or shut down on a signal (nginx `HUP`/`QUIT`) will not.
+- **No Capsicum.** Programs that use casper fail, for example `wc: Unable to initialize casper`.
+- **Outside a jail, some paths are the host's.** Without a jail the FreeBSD root is only reached by translating system paths (`/bin/`, `/lib/`, `/etc/`, ...), so `ls /` lists the host's root. Inside a jail everything is the container's.
 - **Speed.** ptrace adds two context switches per system call.
 - **Dashboard.** `lochs dashboard` listens on 127.0.0.1 by default and requires a bearer token; `--listen 0.0.0.0` exposes it, and anyone with the token can run commands in containers.
 

@@ -892,53 +892,74 @@ int freebsd_setup_stack(pid_t pid, uint64_t entry, uint64_t phdr,
     if (phnum == 0) phnum = linux_phnum;
     
     /*
-     * CRITICAL FIX: Place canary and pagesizes in the INFORMATION BLOCK
-     * (above auxv), NOT below RSP where the stack will overwrite them!
-     * 
-     * Stack layout:
+     * Place the canary (64 bytes) and pagesizes (24 bytes) in the
+     * information block, above auxv, where stack growth never reaches.
+     *
+     * Linux lays out the top of a new stack as:
      *   High addresses:
-     *     Information block (strings, AT_RANDOM data, etc.)  <- PUT DATA HERE
-     *     auxv entries
-     *     envp pointers
-     *     argv pointers
-     *     argc                    <- RSP
-     *   Low addresses (stack grows down):
-     *     function frames...      <- Will overwrite anything below RSP!
-     * 
-     * We reuse the AT_RANDOM location from Linux (16 bytes) and extend it
-     * to hold our canary (64 bytes) + pagesizes (24 bytes).
-     * AT_RANDOM is at a high address in the info block, safe from stack growth.
+     *     strings: execfn, envp strings, argv strings  (argv[0] lowest)
+     *     random gap from arch_align_stack (0..8 KiB)
+     *     AT_PLATFORM string, AT_RANDOM 16 bytes
+     *     auxv, envp pointers, argv pointers, argc   <- RSP
+     *   Low addresses (stack grows down)
+     *
+     * FreeBSD programs do not use Linux's AT_RANDOM or AT_PLATFORM data, so
+     * the free space is everything from the end of auxv up to the lowest
+     * string. It is usually large, but the random gap can be almost zero;
+     * writing 88 bytes at AT_RANDOM then overwrote argv[0] and the next
+     * arguments (about one exec in a hundred). When the space is too
+     * small, move the argc/argv/envp/auxv block down to make room.
      */
-    uint64_t canary_addr = 0;
-    uint64_t pagesizes_addr = 0;
-    
-    if (linux_random != 0) {
-        /* 
-         * Reuse Linux AT_RANDOM location for our canary.
-         * AT_RANDOM points to 16 bytes of random data in the info block.
-         * We'll write 64 bytes of canary there, and pagesizes right after.
-         * This is safe because:
-         *   1. It's in the info block (high addresses, above auxv)
-         *   2. Linux AT_RANDOM data isn't needed by FreeBSD binaries
-         *   3. The info block isn't touched by stack operations
-         *
-         * CRITICAL: Align to 8 bytes! FreeBSD reads canary as uint64_t.
-         */
-        canary_addr = (linux_random + 7) & ~7UL;  /* Round UP to 8-byte boundary */
-        pagesizes_addr = canary_addr + 64;  /* After canary */
-        BSD_TRACE("Using Linux AT_RANDOM location 0x%llx -> aligned 0x%llx for canary",
-                  (unsigned long long)linux_random, (unsigned long long)canary_addr);
-    } else {
-        /*
-         * Fallback: Find space ABOVE auxv end.
-         * Calculate auxv end and place data after it.
-         */
-        uint64_t auxv_end = auxv_start + (auxv_count * 16);
-        canary_addr = (auxv_end + 0x100) & ~0xFUL;  /* 256 bytes above auxv, aligned */
-        pagesizes_addr = canary_addr + 64;
-        BSD_TRACE("Fallback: placing canary at 0x%llx (above auxv)",
-                  (unsigned long long)canary_addr);
+    const uint64_t info_need = 64 + 24;
+    uint64_t auxv_end = auxv_start + (uint64_t)auxv_count * 16;
+    uint64_t lowest_str = linux_execfn;
+    {
+        uint64_t first;
+        if (argc > 0 &&
+            read_process_mem(pid, &first, (void *)(argc_ptr + 8), sizeof(first)) > 0 &&
+            first != 0 && (lowest_str == 0 || first < lowest_str))
+            lowest_str = first;
+        if (envp_count > 0 &&
+            read_process_mem(pid, &first, (void *)envp_start, sizeof(first)) > 0 &&
+            first != 0 && (lowest_str == 0 || first < lowest_str))
+            lowest_str = first;
     }
+    if (lowest_str == 0 || lowest_str < auxv_end) {
+        /* Should not happen; assume the AT_RANDOM area as before */
+        lowest_str = linux_random ? linux_random + 16 : auxv_end + 0x100;
+    }
+
+    if (lowest_str < auxv_end + info_need + 8) {
+        const uint64_t shift = 128;  /* multiple of 16: keeps alignment */
+        size_t block = (size_t)(auxv_end - stack_ptr);
+        uint8_t *buf = malloc(block);
+        if (buf && read_process_mem(pid, buf, (void *)stack_ptr, block) == (ssize_t)block &&
+            write_process_mem(pid, buf, (void *)(stack_ptr - shift), block) == (ssize_t)block) {
+            if (uregs.rdi == argc_ptr) uregs.rdi -= shift;
+            uregs.rsp -= shift;
+            if (ptrace(PTRACE_SETREGS, pid, NULL, &uregs) < 0) {
+                BSD_ERROR("Failed to move the stack block: %s", strerror(errno));
+                free(buf);
+                return -1;
+            }
+            stack_ptr -= shift;
+            argc_ptr -= shift;
+            envp_start -= shift;
+            auxv_start -= shift;
+            auxv_end -= shift;
+            BSD_TRACE("Moved argc/argv/envp/auxv down %llu bytes to make room",
+                      (unsigned long long)shift);
+        } else {
+            BSD_WARN("Could not move the stack block; canary may overlap strings");
+        }
+        free(buf);
+    }
+
+    uint64_t canary_addr = (lowest_str - info_need) & ~7ULL;
+    uint64_t pagesizes_addr = canary_addr + 64;
+    BSD_TRACE("Canary at 0x%llx, pagesizes at 0x%llx (auxv ends 0x%llx, strings start 0x%llx)",
+              (unsigned long long)canary_addr, (unsigned long long)pagesizes_addr,
+              (unsigned long long)auxv_end, (unsigned long long)lowest_str);
     
     /* Write canary to process memory */
     if (write_process_mem(pid, g_freebsd_runtime.canary, (void *)canary_addr, 64) < 0) {
@@ -1088,7 +1109,7 @@ int freebsd_setup_stack(pid_t pid, uint64_t entry, uint64_t phdr,
     
     /* AT_ARGC = 28, AT_ARGV = 29 - CRITICAL for libthr initialization */
     ADD_AUXV(FBSD_AT_ARGC, argc);
-    ADD_AUXV(FBSD_AT_ARGV, stack_ptr + 8);  /* argv starts right after argc */
+    ADD_AUXV(FBSD_AT_ARGV, argc_ptr + 8);  /* argv starts right after argc */
     
     /* AT_ENVC = 30, AT_ENVV = 31 - Environment access */
     ADD_AUXV(FBSD_AT_ENVC, envp_count);

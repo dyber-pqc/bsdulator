@@ -9,6 +9,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -22,6 +23,7 @@
 #include <sys/uio.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <linux/ptrace.h>
 #include <asm/prctl.h>
 #include <sys/prctl.h>
@@ -1235,125 +1237,375 @@ static int fix_argv0_after_exec(pid_t pid) {
     
 
 /*
- * Rewrite execve for jailed processes to use the FreeBSD dynamic linker.
- * 
- * After chroot, when a jailed process tries to exec a FreeBSD binary like
- * /bin/sh, the Linux kernel can't find the FreeBSD interpreter at
- * /libexec/ld-elf.so.1 because it looks at the HOST filesystem, not the
- * chrooted one. The solution is to rewrite:
- *   execve("/bin/sh", argv, envp)
- * to:
- *   execve("/libexec/ld-elf.so.1", ["/libexec/ld-elf.so.1", "/bin/sh", ...], envp)
- * 
- * This way the kernel can find ld-elf.so.1 in the chroot and it will load /bin/sh.
- * 
- * Returns 1 if execve was rewritten, 0 if no rewrite needed, -1 on error.
+ * Rewrite execve of a FreeBSD program to go through the FreeBSD dynamic
+ * linker.
+ *
+ * bsdulator starts the first program as "ld-elf.so.1 <program>" and sets up
+ * the FreeBSD process environment for that layout. Every FreeBSD program a
+ * traced process starts later must be started the same way. In a jail the
+ * process is chrooted into the container, so the linker is the jail's
+ * /libexec/ld-elf.so.1; outside a jail it is <FreeBSD root>/libexec/
+ * ld-elf.so.1. So, in a jail:
+ *
+ *   execve("/bin/ls", ["ls", "-l"], envp)
+ * becomes
+ *   execve("/libexec/ld-elf.so.1",
+ *          ["/libexec/ld-elf.so.1", "-b", "/bin/ls", "--", "ls", "-l"], envp)
+ *
+ * "-b <exe>" makes rtld load <exe> and pass the next argument through as
+ * argv[0], so the program sees its original argv unchanged.
+ *
+ * What is exec'd decides the rewrite (the file is read through
+ * /proc/<pid>/root, so the path resolves inside the jail):
+ *   - a dynamic ELF program: rewritten as above;
+ *   - a "#!" script whose interpreter is a dynamic ELF program: rewritten
+ *     to run the interpreter, with the kernel's argv rules
+ *     ([interp, optional-arg, script, argv[1..]]);
+ *   - a static ELF program (/rescue), or anything else: left alone, so
+ *     the kernel runs it or fails with ENOEXEC and the shell falls back to
+ *     running the file as a script itself.
+ * Outside a jail only FreeBSD-branded ELF files (EI_OSABI 9) are
+ * rewritten, so host Linux programs still run natively, and a script's
+ * interpreter is looked up under the FreeBSD root.
+ *
+ * Returns 1 if execve was rewritten, 0 if no rewrite is needed, -1 on error
+ * (the original execve then runs unchanged).
  */
-static int rewrite_jailed_execve(pid_t pid, uint64_t *args) {
-    int jid = jail_get_process_jid(pid);
-    if (jid <= 0) {
-        return 0;  /* Not jailed, no rewrite needed */
+
+#define JAILED_LDELF        "/libexec/ld-elf.so.1"
+#define ELFOSABI_FREEBSD_   9
+#define JAILED_MAX_ARGS     65536
+#define JAILED_SCRATCH_MAX  (1024 * 1024)
+
+/* struct open_how for openat2(2), defined here for older headers */
+struct bsd_open_how {
+    uint64_t flags;
+    uint64_t mode;
+    uint64_t resolve;
+};
+#define BSD_RESOLVE_IN_ROOT 0x10
+#ifndef SYS_openat2
+#define SYS_openat2 437
+#endif
+
+/*
+ * Open path as the jailed process would see it: absolute paths (and
+ * absolute symlinks) resolve inside its root, relative ones from its cwd.
+ */
+static int open_in_process(pid_t pid, const char *path) {
+    char dir[64];
+    snprintf(dir, sizeof(dir), "/proc/%d/%s", (int)pid,
+             path[0] == '/' ? "root" : "cwd");
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) return -1;
+
+    int fd = -1;
+    if (path[0] == '/') {
+        struct bsd_open_how how = {
+            .flags = O_RDONLY | O_CLOEXEC,
+            .mode = 0,
+            .resolve = BSD_RESOLVE_IN_ROOT,
+        };
+        fd = (int)syscall(SYS_openat2, dfd, path, &how, sizeof(how));
+        if (fd < 0 && errno == ENOSYS) {
+            /* Kernels before 5.6: absolute symlinks would escape, but
+             * plain paths still resolve correctly. */
+            fd = openat(dfd, path + 1, O_RDONLY | O_CLOEXEC);
+        }
+    } else {
+        fd = openat(dfd, path, O_RDONLY | O_CLOEXEC);
     }
-    
-    /* Read the path being exec'd */
+    close(dfd);
+    return fd;
+}
+
+typedef enum {
+    EXEC_OTHER,        /* not something we rewrite */
+    EXEC_ELF_DYNAMIC,  /* ELF with a PT_INTERP: needs ld-elf */
+    EXEC_ELF_STATIC,   /* ELF without PT_INTERP */
+    EXEC_SCRIPT,       /* "#!" line; interpreter in *interp, arg in *iarg */
+} exec_kind_t;
+
+/* Classify an exec target; for scripts, parse the "#!" line. */
+static exec_kind_t classify_exec(pid_t pid, const char *path,
+                                 char *interp, size_t interp_sz,
+                                 char *iarg, size_t iarg_sz, int *osabi) {
+    *osabi = -1;
+    int fd = open_in_process(pid, path);
+    if (fd < 0) return EXEC_OTHER;
+
+    /* Only rewrite what the kernel would run: a regular file with an
+     * execute bit. Anything else is left to the original execve, which
+     * fails with the right error (EACCES, ENOEXEC). Without this, running
+     * a script through its interpreter would skip the permission check. */
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) ||
+        !(st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))) {
+        close(fd);
+        return EXEC_OTHER;
+    }
+
+    unsigned char buf[256];
+    ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
+    if (n < 4) {
+        close(fd);
+        return EXEC_OTHER;
+    }
+
+    if (n >= 2 && buf[0] == '#' && buf[1] == '!') {
+        close(fd);
+        buf[n] = '\0';
+        char *p = (char *)buf + 2;
+        char *eol = strchr(p, '\n');
+        if (eol) *eol = '\0';
+        while (*p == ' ' || *p == '\t') p++;
+        char *end = p;
+        while (*end && *end != ' ' && *end != '\t') end++;
+        size_t ilen = (size_t)(end - p);
+        if (ilen == 0 || ilen >= interp_sz) return EXEC_OTHER;
+        memcpy(interp, p, ilen);
+        interp[ilen] = '\0';
+        /* Like the kernel: the rest of the line is one optional argument,
+         * with surrounding blanks removed. */
+        p = end;
+        while (*p == ' ' || *p == '\t') p++;
+        size_t alen = strlen(p);
+        while (alen > 0 && (p[alen - 1] == ' ' || p[alen - 1] == '\t' ||
+                            p[alen - 1] == '\r'))
+            alen--;
+        if (alen >= iarg_sz) alen = iarg_sz - 1;
+        memcpy(iarg, p, alen);
+        iarg[alen] = '\0';
+        return EXEC_SCRIPT;
+    }
+
+    if (memcmp(buf, "\177ELF", 4) != 0 || n < 64 || buf[4] != 2 /* 64-bit */) {
+        close(fd);
+        return EXEC_OTHER;
+    }
+
+    *osabi = buf[7];  /* EI_OSABI: 9 = FreeBSD */
+    uint64_t phoff;
+    uint16_t phentsize, phnum;
+    memcpy(&phoff, buf + 32, sizeof(phoff));
+    memcpy(&phentsize, buf + 54, sizeof(phentsize));
+    memcpy(&phnum, buf + 56, sizeof(phnum));
+
+    exec_kind_t kind = EXEC_ELF_STATIC;
+    for (uint16_t i = 0; i < phnum && phentsize >= 4; i++) {
+        uint32_t p_type;
+        if (pread(fd, &p_type, sizeof(p_type),
+                  (off_t)(phoff + (uint64_t)i * phentsize)) != sizeof(p_type))
+            break;
+        if (p_type == 3 /* PT_INTERP */) {
+            kind = EXEC_ELF_DYNAMIC;
+            break;
+        }
+    }
+    close(fd);
+    return kind;
+}
+
+/* Append a string to the scratch buffer; returns its offset or -1. */
+static long scratch_add(char *scratch, size_t *used, const char *s) {
+    size_t len = strlen(s) + 1;
+    if (*used + len > JAILED_SCRATCH_MAX) return -1;
+    memcpy(scratch + *used, s, len);
+    long off = (long)*used;
+    *used += len;
+    return off;
+}
+
+static int rewrite_freebsd_execve(pid_t pid, uint64_t *args) {
+    int jid = jail_get_process_jid(pid);
+
+    /* The FreeBSD root as this process sees it: "" in a jail (chrooted),
+     * else the -r root on the host. */
+    char root[1024] = "";
+    if (jid <= 0) {
+        const char *r = bsdulator_get_freebsd_root();
+        if (!r || !r[0]) return 0;
+        /* Absolute, so it still works after the program changes directory */
+        char abs_root[PATH_MAX];
+        if (realpath(r, abs_root)) r = abs_root;
+        size_t rl = strlen(r);
+        while (rl > 1 && r[rl - 1] == '/') rl--;
+        if (rl >= sizeof(root)) return 0;
+        memcpy(root, r, rl);
+        root[rl] = '\0';
+    }
+    char ldelf[sizeof(root) + sizeof(JAILED_LDELF)];
+    snprintf(ldelf, sizeof(ldelf), "%s%s", root, JAILED_LDELF);
+
     char path_buf[1024];
     ssize_t path_len = interceptor_read_string(pid, path_buf, (const void *)args[0], sizeof(path_buf));
     if (path_len <= 0) {
-        BSD_WARN("rewrite_jailed_execve: failed to read path");
+        BSD_WARN("rewrite_freebsd_execve: failed to read path");
         return -1;
     }
-    
-    BSD_INFO("rewrite_jailed_execve: jailed process (jid=%d) exec'ing '%s'", jid, path_buf);
-    
-    /* Skip if already executing ld-elf.so.1 */
+
+    BSD_INFO("rewrite_freebsd_execve: process %d (jid=%d) exec'ing '%s'", (int)pid, jid, path_buf);
+
     if (strstr(path_buf, "ld-elf.so") != NULL) {
-        BSD_TRACE("rewrite_jailed_execve: already ld-elf, skipping");
+        BSD_TRACE("rewrite_freebsd_execve: already ld-elf, skipping");
         return 0;
     }
-    
-    /* Skip /rescue/ binaries - they are statically linked and don't need ld-elf */
-    if (strncmp(path_buf, "/rescue/", 8) == 0) {
-        BSD_TRACE("rewrite_jailed_execve: /rescue/ binary is static, skipping");
+
+    /*
+     * Outside a jail, an absolute path names a file in the FreeBSD root
+     * when it exists there. Path translation skips paths that also exist
+     * on the host, so without this "/usr/bin/cat" from a FreeBSD shell
+     * would run the host's Linux cat under the FreeBSD syscall layer.
+     */
+    if (root[0] && path_buf[0] == '/' &&
+        strncmp(path_buf, root, strlen(root)) != 0) {
+        char cand[sizeof(root) + sizeof(path_buf)];
+        snprintf(cand, sizeof(cand), "%s%s", root, path_buf);
+        int cfd = open_in_process(pid, cand);
+        if (cfd >= 0) {
+            close(cfd);
+            if (strlen(cand) >= sizeof(path_buf)) return -1;
+            snprintf(path_buf, sizeof(path_buf), "%s", cand);
+            path_len = (ssize_t)strlen(path_buf);
+        }
+    }
+
+    char interp[1280] = "", iarg[256] = "";
+    int osabi = -1;
+    exec_kind_t kind = classify_exec(pid, path_buf, interp, 256,
+                                     iarg, sizeof(iarg), &osabi);
+    if (kind == EXEC_SCRIPT) {
+        /* Outside a jail, "#!/bin/sh" means the FreeBSD root's /bin/sh */
+        if (root[0] && interp[0] == '/' &&
+            strncmp(interp, root, strlen(root)) != 0) {
+            char full[sizeof(interp)];
+            snprintf(full, sizeof(full), "%s%s", root, interp);
+            snprintf(interp, sizeof(interp), "%s", full);
+        }
+        char unused1[8], unused2[8];
+        int iosabi = -1;
+        exec_kind_t ik = classify_exec(pid, interp, unused1, sizeof(unused1),
+                                       unused2, sizeof(unused2), &iosabi);
+        if (ik != EXEC_ELF_DYNAMIC || (root[0] && iosabi != ELFOSABI_FREEBSD_)) {
+            BSD_TRACE("rewrite_freebsd_execve: script interpreter '%s' is not a dynamic ELF, leaving to kernel", interp);
+            return 0;
+        }
+    } else if (kind != EXEC_ELF_DYNAMIC || (root[0] && osabi != ELFOSABI_FREEBSD_)) {
+        BSD_TRACE("rewrite_freebsd_execve: '%s' is not a dynamic ELF, leaving to kernel", path_buf);
         return 0;
     }
-    
-    /* Get registers to find stack space */
+
+    /* Count the original argv */
+    uint64_t orig_argv = args[1];
+    size_t orig_argc = 0;
+    while (orig_argv && orig_argc < JAILED_MAX_ARGS) {
+        errno = 0;
+        long p = ptrace(PTRACE_PEEKDATA, pid, (void *)(orig_argv + orig_argc * 8), NULL);
+        if (errno != 0) {
+            BSD_WARN("rewrite_freebsd_execve: failed to read argv[%zu]", orig_argc);
+            return -1;
+        }
+        if (p == 0) break;
+        orig_argc++;
+    }
+    if (orig_argc >= JAILED_MAX_ARGS) {
+        BSD_WARN("rewrite_freebsd_execve: too many arguments");
+        return -1;
+    }
+
+    /*
+     * Build the new strings and argv in one local buffer, then copy it
+     * below the child's stack pointer (the address space is replaced by
+     * the exec, so that memory is free to use).
+     *   ld-elf -b <exe> -- <argv0> [script args] argv[1..] NULL
+     */
+    char *scratch = malloc(JAILED_SCRATCH_MAX);
+    if (!scratch) return -1;
+    size_t used = 0;
+    long off_ldelf = scratch_add(scratch, &used, ldelf);
+    long off_b = scratch_add(scratch, &used, "-b");
+    long off_dash = scratch_add(scratch, &used, "--");
+    long off_path = scratch_add(scratch, &used, path_buf);
+    long off_interp = -1, off_iarg = -1;
+    if (kind == EXEC_SCRIPT) {
+        off_interp = scratch_add(scratch, &used, interp);
+        if (iarg[0]) off_iarg = scratch_add(scratch, &used, iarg);
+    }
+    if (off_ldelf < 0 || off_b < 0 || off_dash < 0 || off_path < 0 ||
+        (kind == EXEC_SCRIPT && off_interp < 0) ||
+        (iarg[0] && kind == EXEC_SCRIPT && off_iarg < 0)) {
+        free(scratch);
+        return -1;
+    }
+    used = (used + 7) & ~(size_t)7;
+
+    size_t new_argc = 3 /* ld-elf -b exe */ + 1 /* -- */ + 1 /* argv0 */ +
+                      (kind == EXEC_SCRIPT ? (off_iarg >= 0 ? 2 : 1) : 0) +
+                      (orig_argc > 0 ? orig_argc - 1 : 0) + 1 /* NULL */;
+    size_t argv_bytes = new_argc * 8;
+    if (used + argv_bytes > JAILED_SCRATCH_MAX) {
+        free(scratch);
+        return -1;
+    }
+
     struct user_regs_struct regs;
     if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) < 0) {
-        BSD_ERROR("rewrite_jailed_execve: failed to get regs");
+        BSD_ERROR("rewrite_freebsd_execve: failed to get regs");
+        free(scratch);
         return -1;
     }
-    
-    /* We need to:
-     * 1. Write "/libexec/ld-elf.so.1" to child's stack
-     * 2. Build new argv array: [ld-elf, original_path, original_argv[1:], NULL]
-     * 3. Update args[0] to point to ld-elf path
-     * 4. Update args[1] to point to new argv array
-     */
-    
-    const char *ldelf = "/libexec/ld-elf.so.1";
-    size_t ldelf_len = strlen(ldelf) + 1;
-    
-    /* Allocate stack space for new strings and argv */
-    uint64_t stack_top = (regs.rsp - 4096) & ~0xFULL;  /* Leave lots of room */
-    uint64_t ldelf_addr = stack_top;
-    uint64_t orig_path_addr = ldelf_addr + ldelf_len;
-    uint64_t new_argv_addr = (orig_path_addr + path_len + 1 + 15) & ~0x7ULL;  /* Align for pointers */
-    
-    /* Write ld-elf path */
-    if (interceptor_write_mem(pid, ldelf, (void *)ldelf_addr, ldelf_len) < 0) {
-        BSD_ERROR("rewrite_jailed_execve: failed to write ldelf path");
-        return -1;
-    }
-    
-    /* Write original path */
-    if (interceptor_write_mem(pid, path_buf, (void *)orig_path_addr, path_len + 1) < 0) {
-        BSD_ERROR("rewrite_jailed_execve: failed to write orig path");
-        return -1;
-    }
-    
-    /* Read original argv to copy remaining arguments */
-    uint64_t orig_argv = args[1];
-    uint64_t new_argv[32];  /* Max 32 args should be plenty */
-    int new_argc = 0;
-    
-    /* First two entries: ld-elf and original path */
-    new_argv[new_argc++] = ldelf_addr;
-    new_argv[new_argc++] = orig_path_addr;
-    
-    /* Copy remaining original argv entries (skip argv[0]) */
-    uint64_t argv_ptr;
-    int orig_idx = 1;  /* Start from argv[1] */
-    while (new_argc < 31) {
-        errno = 0;
-        argv_ptr = ptrace(PTRACE_PEEKDATA, pid, (void *)(orig_argv + orig_idx * 8), NULL);
-        if (errno != 0) {
-            BSD_WARN("rewrite_jailed_execve: failed to read argv[%d]", orig_idx);
-            break;
+    size_t total = used + argv_bytes;
+    uint64_t base = (regs.rsp - 4096 - total) & ~0xFULL;
+
+    uint64_t *nargv = (uint64_t *)(scratch + used);
+    size_t k = 0;
+    nargv[k++] = base + (uint64_t)off_ldelf;
+    nargv[k++] = base + (uint64_t)off_b;
+    if (kind == EXEC_SCRIPT) {
+        /* Load the interpreter; it sees [interp, arg?, script, argv[1..]] */
+        nargv[k++] = base + (uint64_t)off_interp;
+        nargv[k++] = base + (uint64_t)off_dash;
+        nargv[k++] = base + (uint64_t)off_interp;
+        if (off_iarg >= 0) nargv[k++] = base + (uint64_t)off_iarg;
+        nargv[k++] = base + (uint64_t)off_path;
+    } else {
+        /* Load the program; it sees its original argv[0] */
+        nargv[k++] = base + (uint64_t)off_path;
+        nargv[k++] = base + (uint64_t)off_dash;
+        if (orig_argc > 0) {
+            errno = 0;
+            long a0 = ptrace(PTRACE_PEEKDATA, pid, (void *)orig_argv, NULL);
+            nargv[k++] = errno == 0 ? (uint64_t)a0 : base + (uint64_t)off_path;
+        } else {
+            nargv[k++] = base + (uint64_t)off_path;
         }
-        new_argv[new_argc++] = argv_ptr;
-        if (argv_ptr == 0) break;  /* NULL terminator */
-        orig_idx++;
     }
-    
-    /* Ensure NULL terminator */
-    if (new_argc > 0 && new_argv[new_argc - 1] != 0) {
-        new_argv[new_argc++] = 0;
+    for (size_t i = 1; i < orig_argc; i++) {
+        errno = 0;
+        long a = ptrace(PTRACE_PEEKDATA, pid, (void *)(orig_argv + i * 8), NULL);
+        if (errno != 0) {
+            free(scratch);
+            return -1;
+        }
+        nargv[k++] = (uint64_t)a;
     }
-    
-    /* Write new argv array */
-    if (interceptor_write_mem(pid, new_argv, (void *)new_argv_addr, new_argc * 8) < 0) {
-        BSD_ERROR("rewrite_jailed_execve: failed to write new argv");
+    nargv[k++] = 0;
+
+    if (interceptor_write_mem(pid, scratch, (void *)base, used + k * 8) < 0) {
+        BSD_ERROR("rewrite_freebsd_execve: failed to write new argv");
+        free(scratch);
         return -1;
     }
-    
-    /* Update execve arguments */
-    args[0] = ldelf_addr;      /* path = /libexec/ld-elf.so.1 */
-    args[1] = new_argv_addr;   /* argv = [ld-elf, orig_path, ...] */
+    free(scratch);
+
+    args[0] = base + (uint64_t)off_ldelf;  /* path = /libexec/ld-elf.so.1 */
+    args[1] = base + used;                 /* argv = [ld-elf, -b, exe, --, ...] */
     /* args[2] (envp) stays the same */
-    
-    BSD_INFO("rewrite_jailed_execve: rewrote to: %s %s", ldelf, path_buf);
-    
+
+    if (kind == EXEC_SCRIPT)
+        BSD_INFO("rewrite_freebsd_execve: script '%s' -> %s -b %s", path_buf, ldelf, interp);
+    else
+        BSD_INFO("rewrite_freebsd_execve: rewrote to: %s -b %s", ldelf, path_buf);
     return 1;
 }
 
@@ -1448,14 +1700,14 @@ static int translate_freebsd_path(pid_t pid, int syscall_nr, uint64_t *args) {
         return -1;
     }
 
-    /*
-     * CRITICAL: If the path already exists on the real filesystem,
-     * do NOT translate it. This handles cases where we're running
-     * binaries from /var/lib/lochs/images/ or other real paths.
-     */
-    if (access(path_buf, F_OK) == 0) {
-        BSD_TRACE("Path '%s' exists on real filesystem, skipping translation", path_buf);
-        return -1;
+    /* Already inside the FreeBSD root (e.g. the -r path itself) */
+    {
+        size_t rl = strlen(freebsd_root);
+        while (rl > 1 && freebsd_root[rl - 1] == '/') rl--;
+        if (strncmp(path_buf, freebsd_root, rl) == 0 &&
+            (path_buf[rl] == '/' || path_buf[rl] == '\0')) {
+            return -1;
+        }
     }
 
     /* Check if it's a path we should translate */
@@ -1490,7 +1742,23 @@ static int translate_freebsd_path(pid_t pid, int syscall_nr, uint64_t *args) {
     }
     
     snprintf(new_path, sizeof(new_path), "%.*s%s", (int)root_len, freebsd_root, path_buf);
-    
+
+    /*
+     * A FreeBSD program means the FreeBSD root's file. Fall back to the
+     * host's file only when the root has none and the host does (say,
+     * /etc/resolv.conf). Checking the host first made a FreeBSD shell
+     * searching PATH find host Linux programs such as /usr/bin/cat.
+     */
+    /* Program and library directories always mean the FreeBSD root: a
+     * host Linux binary or library cannot run under the FreeBSD layer. */
+    int host_fallback = strncmp(path_buf, "/etc/", 5) == 0 ||
+                        strncmp(path_buf, "/usr/share/", 11) == 0 ||
+                        strncmp(path_buf, "/tmp/", 5) == 0;
+    if (host_fallback && access(new_path, F_OK) != 0 && access(path_buf, F_OK) == 0) {
+        BSD_TRACE("Path '%s' is not in the FreeBSD root but exists on the host; using the host's", path_buf);
+        return -1;
+    }
+
     BSD_WARN("Path translation: '%s' -> '%s'", path_buf, new_path);
 
     /* Write the new path to the child's stack */
@@ -1531,6 +1799,13 @@ typedef struct {
     int active;          /* 1 = alive, 0 = exited */
     int in_syscall;      /* Toggle for syscall entry/exit */
     int skip_post_exec;  /* Skip phantom syscall stop after exec (per-process!) */
+    /* The syscall this process is inside (saved at entry, used at exit) */
+    int sc_valid;
+    uint64_t sc_nr;
+    uint64_t sc_args[6];
+    size_t mmap_alignment;
+    size_t mmap_orig_size;
+    uint64_t mmap_alloc_size;
 } process_entry_t;
 
 static process_entry_t process_table[64];
@@ -1552,15 +1827,46 @@ static process_entry_t* add_process(pid_t pid) {
         entry->active = 1;
         return entry;
     }
-    if (process_count < 64) {
+    /* Reuse the slot of an exited process, so long-running jails that
+     * start many processes (shell loops, forking servers) never run out. */
+    for (int i = 0; i < process_count; i++) {
+        if (!process_table[i].active) {
+            entry = &process_table[i];
+            break;
+        }
+    }
+    if (!entry && process_count < 64) {
         entry = &process_table[process_count++];
+    }
+    if (entry) {
         entry->pid = pid;
         entry->active = 1;
         entry->in_syscall = 0;
+        entry->skip_post_exec = 0;
+        entry->sc_valid = 0;
         BSD_TRACE("Added process %d to table (count=%d)", pid, process_count);
         return entry;
     }
     return NULL;
+}
+
+/*
+ * The process a new task belongs to: its thread-group leader for a thread,
+ * else its parent (both from /proc/<pid>/status). Returns 0 if unknown.
+ */
+static pid_t parent_of(pid_t pid) {
+    char path[64], line[128];
+    snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    pid_t tgid = 0, ppid = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "Tgid:", 5) == 0) tgid = (pid_t)atoi(line + 5);
+        else if (strncmp(line, "PPid:", 5) == 0) ppid = (pid_t)atoi(line + 5);
+    }
+    fclose(f);
+    if (tgid > 0 && tgid != pid) return tgid;
+    return ppid;
 }
 
 /* Mark a process as exited */
@@ -1570,6 +1876,9 @@ static void remove_process(pid_t pid) {
         entry->active = 0;
         BSD_TRACE("Marked process %d as exited", pid);
     }
+    /* Forget its jail membership too: the PID can be reused later by a
+     * process that is not in the jail. */
+    jail_forget_process(pid);
 }
 
 /* Count active processes */
@@ -1635,6 +1944,10 @@ int interceptor_wait(interceptor_state_t *state) {
         /* Auto-add to process table if not already there */
         if (!find_process(result)) {
             add_process(result);
+            /* A new child can stop before its parent's fork event is
+             * seen; take its jail from the parent now. */
+            pid_t parent = parent_of(result);
+            if (parent > 0) jail_inherit_process(parent, result);
         }
         
         /* Check if this is a newly forked child needing TLS setup */
@@ -1777,6 +2090,7 @@ int interceptor_wait(interceptor_state_t *state) {
                     
                     /* Add child to process table */
                     add_process((pid_t)child_pid);
+                    jail_inherit_process(state->pid, (pid_t)child_pid);
                     
                     if (pending_count < 32) { 
                         pending_children[pending_count++] = child_pid; 
@@ -1795,6 +2109,7 @@ int interceptor_wait(interceptor_state_t *state) {
                     
                     /* Add child to process table */
                     add_process((pid_t)child_pid);
+                    jail_inherit_process(state->pid, (pid_t)child_pid);
                     
                     if (pending_count < 32) { 
                         pending_children[pending_count++] = child_pid; 
@@ -1811,6 +2126,7 @@ int interceptor_wait(interceptor_state_t *state) {
                     
                     /* Add child to process table */
                     add_process((pid_t)clone_child_pid);
+                    jail_inherit_process(state->pid, (pid_t)clone_child_pid);
                     
                     if (pending_count < 32) { 
                         pending_children[pending_count++] = clone_child_pid; 
@@ -1962,6 +2278,36 @@ static size_t pending_mmap_orig_size = 0;
 static uint64_t pending_mmap_alloc_size = 0;
 
 /*
+ * Several traced processes can be inside syscalls at once (a pipeline, a
+ * forking server), and their stops arrive interleaved. state->syscall_nr,
+ * state->args and the pending mmap fixup describe the last syscall ENTRY
+ * seen, of whichever process. Save them per process at entry and restore
+ * them at that process's exit, so exit handling (stat translation, mmap
+ * alignment, return translation) uses the right syscall.
+ */
+static void save_syscall_state(const interceptor_state_t *state) {
+    process_entry_t *e = find_process(state->pid);
+    if (!e) return;
+    e->sc_valid = 1;
+    e->sc_nr = state->syscall_nr;
+    memcpy(e->sc_args, state->args, sizeof(e->sc_args));
+    e->mmap_alignment = pending_mmap_alignment;
+    e->mmap_orig_size = pending_mmap_orig_size;
+    e->mmap_alloc_size = pending_mmap_alloc_size;
+}
+
+static void restore_syscall_state(interceptor_state_t *state) {
+    process_entry_t *e = find_process(state->pid);
+    if (!e || !e->sc_valid) return;
+    state->syscall_nr = e->sc_nr;
+    memcpy(state->args, e->sc_args, sizeof(e->sc_args));
+    pending_mmap_alignment = e->mmap_alignment;
+    pending_mmap_orig_size = e->mmap_orig_size;
+    pending_mmap_alloc_size = e->mmap_alloc_size;
+    e->sc_valid = 0;
+}
+
+/*
  * Fix mmap alignment after syscall returns.
  * FreeBSD MAP_ALIGNED(n) requests 2^n byte alignment.
  * Linux doesn't support this, so we over-allocate and carve out an aligned region.
@@ -2111,12 +2457,11 @@ int interceptor_run(interceptor_state_t *state) {
                 }
                 
                 /*
-                 * Special handling for execve in jailed processes:
-                 * Rewrite execve to go through the dynamic linker because
-                 * Linux can't find the FreeBSD interpreter inside the chroot.
+                 * Start FreeBSD programs through ld-elf.so.1, the way the
+                 * first program was started (see rewrite_freebsd_execve).
                  */
                 if ((int)state->syscall_nr == FBSD_SYS_execve) {
-                    int rewritten = rewrite_jailed_execve(state->pid, state->args);
+                    int rewritten = rewrite_freebsd_execve(state->pid, state->args);
                     if (rewritten > 0) {
                         /* Execve was rewritten, update args in child */
                         if (interceptor_set_args(state->pid, state->args) < 0) {
@@ -2236,10 +2581,15 @@ int interceptor_run(interceptor_state_t *state) {
                         interceptor_skip_syscall(state->pid, 0);
                         break;
                 }
+                save_syscall_state(state);
                 break;
             }
-            
+
             case EVENT_SYSCALL_EXIT: {
+                /* Another process may have entered a syscall since this
+                 * one did: handle the exit with this process's own syscall
+                 * number, arguments and pending mmap fixup. */
+                restore_syscall_state(state);
                 BSD_TRACE("EXIT syscall %llu = %lld (0x%llx)",
                           (unsigned long long)state->syscall_nr,
                           (long long)state->retval,
@@ -2573,6 +2923,29 @@ int interceptor_run(interceptor_state_t *state) {
                     }
                 }
 
+                /*
+                 * A syscall interrupted by a signal returns one of the
+                 * kernel-internal ERESTART* codes. The kernel restarts it
+                 * (or turns it into EINTR) after the signal, using
+                 * orig_rax, which holds the Linux number we substituted at
+                 * entry; the restart would then be read as a FreeBSD
+                 * syscall number. Leave the code alone and put the FreeBSD
+                 * number back, so the restart is translated like a new
+                 * call. Translating the code itself leaked "error 513".
+                 */
+                if (state->retval == -512 /* ERESTARTSYS */ ||
+                    state->retval == -513 /* ERESTARTNOINTR */ ||
+                    state->retval == -514 /* ERESTARTNOHAND */) {
+                    interceptor_set_syscall(state->pid, state->syscall_nr);
+                    break;
+                }
+                if (state->retval == -516 /* ERESTART_RESTARTBLOCK */) {
+                    /* Would restart as Linux restart_syscall; report EINTR
+                     * (same number on FreeBSD), which callers retry. */
+                    interceptor_set_return(state->pid, -EINTR);
+                    break;
+                }
+
                 long new_ret = syscall_translate_return((int)state->syscall_nr, state->retval);
                 if (new_ret != state->retval || (state->retval < 0 && state->retval > -4096)) {
                     interceptor_set_return(state->pid, new_ret);
@@ -2590,10 +2963,16 @@ int interceptor_run(interceptor_state_t *state) {
                     continue;
                 }
                 
-                {
-                    int sig = abi_translate_signal_to_freebsd(state->signal);
-                    interceptor_continue_signal(state, sig);
-                }
+                /*
+                 * Re-inject the signal unchanged. The kernel delivers it
+                 * with Linux numbering, so passing the FreeBSD number here
+                 * turned SIGCHLD (Linux 17) into Linux 20, SIGTSTP.
+                 * FreeBSD handlers are not installed in the traced process
+                 * yet (sigaction is emulated in the tracer), so this gives
+                 * the default action, which matches FreeBSD for the
+                 * common signals.
+                 */
+                interceptor_continue_signal(state, state->signal);
                 continue;
                 
             case EVENT_FORK:

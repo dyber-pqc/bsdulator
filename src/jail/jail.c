@@ -580,7 +580,17 @@ int jail_attach_process(pid_t pid, int jid) {
         return -EINVAL;
     }
     
-    /* Record the mapping */
+    /* Record the mapping (a process already in a jail moves to this one) */
+    for (int i = 0; i < jailed_proc_count; i++) {
+        if (jailed_procs[i].pid == pid) {
+            bsd_jail_t *old = jail_find_by_id(jailed_procs[i].jid);
+            if (old && old->attached_count > 0) old->attached_count--;
+            jailed_procs[i].jid = jid;
+            jail->attached_count++;
+            BSD_INFO("Attached pid %d to jail %d (%s)", pid, jid, jail->name);
+            return 0;
+        }
+    }
     if (jailed_proc_count < MAX_JAILED_PROCS) {
         jailed_procs[jailed_proc_count].pid = pid;
         jailed_procs[jailed_proc_count].jid = jid;
@@ -612,6 +622,26 @@ int jail_get_process_jid(pid_t pid) {
         }
     }
     return 0;  /* Not in a jail */
+}
+
+void jail_inherit_process(pid_t parent, pid_t child) {
+    int jid = jail_get_process_jid(parent);
+    if (jid <= 0 || child <= 0) return;
+    if (jail_get_process_jid(child) == jid) return;
+    if (jail_attach_process(child, jid) == 0) {
+        BSD_INFO("pid %d inherits jail %d from parent %d", child, jid, parent);
+    }
+}
+
+void jail_forget_process(pid_t pid) {
+    for (int i = 0; i < jailed_proc_count; i++) {
+        if (jailed_procs[i].pid == pid) {
+            bsd_jail_t *jail = jail_find_by_id(jailed_procs[i].jid);
+            if (jail && jail->attached_count > 0) jail->attached_count--;
+            jailed_procs[i] = jailed_procs[--jailed_proc_count];
+            return;
+        }
+    }
 }
 
 /*
