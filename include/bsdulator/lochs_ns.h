@@ -48,6 +48,20 @@ int lochs_idshift_tree(const char *dir, uid_t from, uid_t to);
 int lochs_image_ids(const char *image_path, uid_t want);
 void lochs_image_ids_forget(const char *image_path);
 
+/* The same for any shared tree, under a state key ("volume.<name>") */
+int lochs_tree_ids(const char *key, const char *path, uid_t want);
+void lochs_tree_ids_forget(const char *key);
+
+/* Make lochs storage (images, containers, volumes) root-only: it holds
+ * files owned by host ids 0.. that host users must not reach */
+void lochs_storage_lockdown(void);
+
+/* Bind src at dst idmapped: on-disk ids uid_first../gid_first.. (count of
+ * each) become host ids host.. Optionally read-only, nosuid and nodev.
+ * Returns 0, or -1 with errno (the filesystem may not support it). */
+int lochs_idmap_bind(const char *src, const char *dst, uid_t uid_first, gid_t gid_first,
+                     uid_t host, unsigned count, int readonly, int nosuid);
+
 /* Can this kernel mount an overlay over idmapped layers? */
 int lochs_idmap_supported(void);
 

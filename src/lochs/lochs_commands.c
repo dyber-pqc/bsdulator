@@ -17,6 +17,7 @@
 
 #define _GNU_SOURCE
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -910,6 +911,7 @@ int lochs_cmd_start(int argc, char **argv) {
      * otherwise all share LOCHS_ID_BASE and the layers are chown-shifted
      * into it (see lochs_ns.c).
      */
+    lochs_storage_lockdown();
     int layered = jail->image_path[0] && jail->merged_path[0];
     int overlay = layered && jail->storage_backend != LOCHS_STORAGE_ZFS;
     int idmapped = overlay && lochs_idmap_supported();
@@ -1018,25 +1020,66 @@ int lochs_cmd_start(int argc, char **argv) {
             const char *mkdir_argv[] = { "mkdir", "-p", mount_point, NULL };
             lochs_run(mkdir_argv, LOCHS_RUN_AS_CROOT);
 
-            /* Bind mount the host path */
-            const char *bind_argv[] = { "mount", "--bind", v->host_path, mount_point, NULL };
-            if (lochs_run(bind_argv, 0) == 0) {
-                if (v->volume_name[0]) {
-                    printf("  %s (%s) -> %s%s\n", v->volume_name, v->host_path,
-                           v->container_path, v->readonly ? " (ro)" : "");
+            /*
+             * Ownership (see lochs_ns.c). A named volume keeps container
+             * ids on disk, like the layers, and is mounted idmapped into
+             * the container's range. A host directory is mapped to its
+             * owner only: that host user is container root there, so the
+             * container gets no more than the owner's rights (nosuid,
+             * nodev). One owned by host root keeps host ids: mapping it
+             * would make container root host root in it.
+             */
+            const char *how = "";
+            int done = 0;
+            if (v->volume_name[0]) {
+                char key[160];
+                snprintf(key, sizeof(key), "volume.%s", v->volume_name);
+                if (idmapped) {
+                    lochs_tree_ids(key, v->host_path, 0);
+                    done = lochs_idmap_bind(v->host_path, mount_point, 0, 0, ids,
+                                            LOCHS_ID_COUNT, v->readonly, 0) == 0;
+                    if (!done)
+                        fprintf(stderr, "  Warning: cannot idmap volume '%s' (%s)\n",
+                                v->volume_name, strerror(errno));
                 } else {
-                    printf("  %s -> %s%s\n", v->host_path, v->container_path,
-                           v->readonly ? " (ro)" : "");
+                    lochs_tree_ids(key, v->host_path, LOCHS_ID_BASE);
                 }
+            } else {
+                struct stat vst;
+                if (stat(v->host_path, &vst) != 0) {
+                    fprintf(stderr, "  Warning: %s: %s\n", v->host_path, strerror(errno));
+                } else if (idmapped && vst.st_uid != 0) {
+                    done = lochs_idmap_bind(v->host_path, mount_point, vst.st_uid, vst.st_gid,
+                                            ids, 1, v->readonly, 1) == 0;
+                    if (done)
+                        how = " (its owner is container root)";
+                    else
+                        how = " (host ids: the filesystem cannot be idmapped)";
+                } else if (idmapped) {
+                    how = " (host ids: owned by host root)";
+                }
+            }
 
+            if (!done) {
+                const char *bind_argv[] = { "mount", "--bind", v->host_path, mount_point, NULL };
+                if (lochs_run(bind_argv, 0) != 0) {
+                    fprintf(stderr, "  Warning: Failed to mount %s\n", v->host_path);
+                    continue;
+                }
                 /* Make read-only if requested */
                 if (v->readonly) {
                     const char *ro_argv[] = { "mount", "-o", "remount,ro,bind",
                                               mount_point, NULL };
                     lochs_run(ro_argv, 0);
                 }
+                done = 1;
+            }
+            if (v->volume_name[0]) {
+                printf("  %s (%s) -> %s%s\n", v->volume_name, v->host_path,
+                       v->container_path, v->readonly ? " (ro)" : "");
             } else {
-                fprintf(stderr, "  Warning: Failed to mount %s\n", v->host_path);
+                printf("  %s -> %s%s%s\n", v->host_path, v->container_path,
+                       v->readonly ? " (ro)" : "", how);
             }
         }
     }
@@ -1291,6 +1334,13 @@ int lochs_cmd_stop(int argc, char **argv) {
 
     /* Ends every process still in the container */
     lochs_ns_stop(jail->name);
+
+    /* Volumes are mounts inside the overlay: off before it */
+    for (int i = 0; i < jail->volume_count; i++) {
+        char mp[2048];
+        snprintf(mp, sizeof(mp), "%s%s", jail->path, jail->volumes[i].container_path);
+        umount2(mp, MNT_DETACH);
+    }
     if (!jail->network[0] && strncmp(jail->netns, "lochs-", 6) == 0) {
         lochs_ns_net_down(jail->name);
         jail->netns[0] = '\0';

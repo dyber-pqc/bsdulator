@@ -18,6 +18,7 @@
 #include <errno.h>
 #include "bsdulator/lochs.h"
 #include "bsdulator/lochs_exec.h"
+#include "bsdulator/lochs_ns.h"
 
 /* Global named volume list */
 static lochs_named_volume_t volumes[LOCHS_MAX_NAMED_VOLUMES];
@@ -248,6 +249,9 @@ int lochs_volume_remove(const char *name) {
         lochs_zfs_volume_destroy(name);
     } else {
         /* Remove directory */
+        char key[160];
+        snprintf(key, sizeof(key), "volume.%s", name);
+        lochs_tree_ids_forget(key);
         const char *argv[] = { "rm", "-rf", "--", vol->path, NULL };
         lochs_run(argv, 0);
     }

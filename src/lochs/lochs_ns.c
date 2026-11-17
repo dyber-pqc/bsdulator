@@ -110,23 +110,37 @@ static void private_proc(const char *root) {
     }
 }
 
+#ifndef SYS_open_tree
+#define SYS_open_tree 428
+#endif
+#ifndef SYS_move_mount
+#define SYS_move_mount 429
+#endif
+
 /*
- * Make root the mount namespace's "/" and detach the host's filesystem
- * from the namespace, so nothing outside the container exists there (with
- * chroot alone it stays reachable). Returns 0 on success,
- * 1 when pivot_root is unavailable and the namespace is unchanged, -1 when
- * it failed half-way and the namespace must not be used.
+ * Make the current directory (the container root) the mount namespace's
+ * "/" and detach the host's filesystem from the namespace, so nothing
+ * outside the container exists there (with chroot alone it stays
+ * reachable). Works from "." only: the paths above the root are not
+ * reachable from the container's user namespace (lochs storage is 0700).
+ * Returns 0 on success, 1 when it is unavailable and the namespace is
+ * unchanged, -1 when it failed half-way and the namespace must not be used.
  */
-static int pivot_into(const char *root) {
-    if (!root || !root[0]) return 1;
-    /* pivot_root needs a mount point this namespace created itself */
-    if (mount(root, root, NULL, MS_BIND | MS_REC, NULL) < 0) return 1;
-    if (chdir(root) < 0) return 1;
-    /* Old root is stacked on "." and then detached: no directory needed */
-    if (syscall(SYS_pivot_root, ".", ".") < 0) {
-        if (chdir("/") < 0) return -1;
+static int pivot_into(void) {
+    /* pivot_root needs a mount point this namespace created itself: a
+     * recursive bind of "." attached on top of "." */
+    int t = (int)syscall(SYS_open_tree, AT_FDCWD, ".", 1 /* OPEN_TREE_CLONE */ |
+                         0x8000 /* AT_RECURSIVE */ | O_CLOEXEC);
+    if (t < 0) return 1;
+    if (syscall(SYS_move_mount, t, "", AT_FDCWD, ".", 0x4 /* MOVE_MOUNT_F_EMPTY_PATH */) < 0) {
+        close(t);
         return 1;
     }
+    int r = fchdir(t);   /* into the new mount */
+    close(t);
+    if (r < 0) return -1;
+    /* Old root is stacked on "." and then detached: no directory needed */
+    if (syscall(SYS_pivot_root, ".", ".") < 0) return -1;
     if (umount2(".", MNT_DETACH) < 0) return -1;
     if (chdir("/") < 0) return -1;
     return 0;
@@ -158,6 +172,10 @@ pid_t lochs_ns_start(const char *name, const char *root) {
         close(up[0]);
         close(go[1]);
         setsid();
+        /* Into the root while still host root: unsharing the mount
+         * namespace moves the working directory onto its copy there, and
+         * the root is then set up from "." */
+        int have_root = root && root[0] && chdir(root) == 0;
         char userns = unshare(CLONE_NEWUSER) == 0;
         ssize_t w = write(up[1], &userns, 1);
         char ok = 0;
@@ -176,8 +194,8 @@ pid_t lochs_ns_start(const char *name, const char *root) {
                 init = fork();
                 if (init == 0) {
                     close(rp[0]);
-                    if (root && root[0]) private_proc(root);
-                    int pv = pivot_into(root);
+                    if (have_root) private_proc(".");
+                    int pv = have_root ? pivot_into() : 1;
                     if (pv > 0 && root && root[0])
                         fprintf(stderr, "Warning: pivot_root failed for '%s' (%s); the host filesystem stays in its mount namespace\n",
                                 name, strerror(errno));
@@ -390,33 +408,62 @@ int lochs_idshift_tree(const char *dir, uid_t from, uid_t to) {
     return nftw(dir, shift_one, 64, FTW_PHYS | FTW_MOUNT) < 0 ? -1 : 0;
 }
 
-/* An image's layer is shared by containers: its current shift is kept in
- * IDS_DIR/image.<dir name>. Older lochs marked a shifted image with a
- * .lochs-idmap-100000 file in its root. */
-int lochs_image_ids(const char *image_path, uid_t want) {
+/* A tree shared by containers (an image layer, a named volume) keeps its
+ * current shift in IDS_DIR/<key>. Older lochs marked a shifted image with
+ * a .lochs-idmap-100000 file in its root. */
+int lochs_tree_ids(const char *key, const char *path, uid_t want) {
     char state[600], marker[1100];
-    const char *b = strrchr(image_path, '/');
-    b = b ? b + 1 : image_path;
     mkdir("/var/lib/lochs", 0755);
     mkdir(IDS_DIR, 0700);
-    snprintf(state, sizeof(state), IDS_DIR "/image.%s", b);
-    snprintf(marker, sizeof(marker), "%s/.lochs-idmap-%d", image_path, LOCHS_ID_BASE);
+    snprintf(state, sizeof(state), IDS_DIR "/%s", key);
+    snprintf(marker, sizeof(marker), "%s/.lochs-idmap-%d", path, LOCHS_ID_BASE);
     long cur = read_long(state);
     if (cur < 0) cur = access(marker, F_OK) == 0 ? LOCHS_ID_BASE : 0;
     if ((uid_t)cur != want) {
-        printf("  Ids: shifting image files to %s ids (once)\n", want ? "host" : "container");
-        if (lochs_idshift_tree(image_path, (uid_t)cur, want) < 0) return -1;
+        printf("  Ids: shifting %s files to %s ids (once)\n", key, want ? "host" : "container");
+        if (lochs_idshift_tree(path, (uid_t)cur, want) < 0) return -1;
     }
     unlink(marker);
     return write_long(state, (long)want);
 }
 
-void lochs_image_ids_forget(const char *image_path) {
+void lochs_tree_ids_forget(const char *key) {
     char state[600];
-    const char *b = strrchr(image_path, '/');
-    b = b ? b + 1 : image_path;
-    snprintf(state, sizeof(state), IDS_DIR "/image.%s", b);
+    snprintf(state, sizeof(state), IDS_DIR "/%s", key);
     unlink(state);
+}
+
+static void image_key(const char *image_path, char *out, size_t sz) {
+    const char *b = strrchr(image_path, '/');
+    snprintf(out, sz, "image.%s", b ? b + 1 : image_path);
+}
+
+int lochs_image_ids(const char *image_path, uid_t want) {
+    char key[300];
+    image_key(image_path, key, sizeof(key));
+    return lochs_tree_ids(key, image_path, want);
+}
+
+void lochs_image_ids_forget(const char *image_path) {
+    char key[300];
+    image_key(image_path, key, sizeof(key));
+    lochs_tree_ids_forget(key);
+}
+
+/*
+ * Lochs storage holds files owned by container ids, on disk host ids 0..
+ * (setuid root among them) and container-made files. Host users must not
+ * reach them: the directories are root-only. Containers never walk these
+ * paths (each is pivoted into its own root, set up from inside it).
+ */
+void lochs_storage_lockdown(void) {
+    static const char *dirs[] = { "/var/lib/lochs/images", "/var/lib/lochs/containers",
+                                  "/var/lib/lochs/volumes", IDS_DIR, IDMNT_DIR };
+    mkdir("/var/lib/lochs", 0755);
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        mkdir(dirs[i], 0700);
+        chmod(dirs[i], 0700);
+    }
 }
 
 /* --- idmapped layers ------------------------------------------------ */
@@ -439,9 +486,10 @@ void lochs_image_ids_forget(const char *image_path) {
 #endif
 struct l_mount_attr { unsigned long long attr_set, attr_clr, propagation, userns_fd; };
 
-/* A user namespace mapping container ids to base.., for idmapped mounts.
- * Its helper process is gone on return; the fd keeps it alive. */
-static int userns_for(uid_t base) {
+/* A user namespace mapping ids uid_first.. and gid_first.. (count of
+ * each) to host ids host.., for idmapped mounts. Its helper process is gone
+ * on return; the fd keeps it alive. */
+static int userns_map(uid_t uid_first, gid_t gid_first, uid_t host, unsigned count) {
     int p[2];
     if (pipe(p) < 0) return -1;
     pid_t c = fork();
@@ -460,14 +508,16 @@ static int userns_for(uid_t base) {
     close(p[0]);
     int fd = -1;
     if (ok) {
-        char path[64], map[64];
-        snprintf(map, sizeof(map), "0 %u %d\n", (unsigned)base, LOCHS_ID_COUNT);
+        char path[64], map[2][64];
+        snprintf(map[0], sizeof(map[0]), "%u %u %u\n", (unsigned)uid_first, (unsigned)host, count);
+        snprintf(map[1], sizeof(map[1]), "%u %u %u\n", (unsigned)gid_first, (unsigned)host, count);
         const char *files[2] = { "uid_map", "gid_map" };
         int good = 1;
         for (int i = 0; i < 2 && good; i++) {
+            const char *m = map[i];
             snprintf(path, sizeof(path), "/proc/%d/%s", (int)c, files[i]);
             int mfd = open(path, O_WRONLY | O_CLOEXEC);
-            if (mfd < 0 || write(mfd, map, strlen(map)) != (ssize_t)strlen(map)) good = 0;
+            if (mfd < 0 || write(mfd, m, strlen(m)) != (ssize_t)strlen(m)) good = 0;
             if (mfd >= 0) close(mfd);
         }
         snprintf(path, sizeof(path), "/proc/%d/ns/user", (int)c);
@@ -478,11 +528,15 @@ static int userns_for(uid_t base) {
     return fd;
 }
 
-/* Attach an idmapped copy of src at dst */
-static int idmap_mount(const char *src, const char *dst, int ufd) {
+static int userns_for(uid_t base) {
+    return userns_map(0, 0, base, LOCHS_ID_COUNT);
+}
+
+/* Attach an idmapped copy of src at dst, with MOUNT_ATTR_* attrs too */
+static int idmap_mount_attr(const char *src, const char *dst, int ufd, unsigned long long attrs) {
     int t = (int)syscall(SYS_open_tree, AT_FDCWD, src, L_OPEN_TREE_CLONE | L_OPEN_TREE_CLOEXEC);
     if (t < 0) return -1;
-    struct l_mount_attr a = { L_MOUNT_ATTR_IDMAP, 0, 0, (unsigned long long)ufd };
+    struct l_mount_attr a = { L_MOUNT_ATTR_IDMAP | attrs, 0, 0, (unsigned long long)ufd };
     int r = (int)syscall(SYS_mount_setattr, t, "", AT_EMPTY_PATH, &a, sizeof(a));
     if (r == 0) {
         mkdir(dst, 0700);
@@ -490,6 +544,29 @@ static int idmap_mount(const char *src, const char *dst, int ufd) {
     }
     int e = errno;
     close(t);
+    errno = e;
+    return r;
+}
+
+static int idmap_mount(const char *src, const char *dst, int ufd) {
+    return idmap_mount_attr(src, dst, ufd, 0);
+}
+
+/*
+ * Volumes: bind src at dst idmapped so that on-disk ids uid_first../
+ * gid_first.. (count) belong to the container's ids host.. Returns 0, or
+ * -1 with errno (the filesystem may not support idmapped mounts).
+ */
+int lochs_idmap_bind(const char *src, const char *dst, uid_t uid_first, gid_t gid_first,
+                     uid_t host, unsigned count, int readonly, int nosuid) {
+    int ufd = userns_map(uid_first, gid_first, host, count);
+    if (ufd < 0) return -1;
+    unsigned long long attrs = 0;
+    if (readonly) attrs |= 0x1;              /* MOUNT_ATTR_RDONLY */
+    if (nosuid) attrs |= 0x2 | 0x4;          /* MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV */
+    int r = idmap_mount_attr(src, dst, ufd, attrs);
+    int e = errno;
+    close(ufd);
     errno = e;
     return r;
 }
@@ -507,7 +584,9 @@ int lochs_idmap_supported(void) {
     static int cached = -1;
     if (cached >= 0) return cached;
     cached = 0;
-    /* LOCHS_NO_IDMAP=1 forces the shared-range fallback (for testing it) */
+    /* LOCHS_NO_IDMAP=1 forces the shared-range fallback, for testing it.
+     * Only with no other container running: it shifts the shared image
+     * files, which idmapped containers still use. */
     const char *no = getenv("LOCHS_NO_IDMAP");
     if (no && no[0] == '1') return 0;
     /* Overlay over idmapped layers needs 5.19 */
